@@ -190,29 +190,54 @@ async fn main() -> anyhow::Result<()> {
                 .join("plugins"),
             PathBuf::from(".dirge").join("plugins"),
         ];
+        let mut loaded = 0u32;
+        let mut registered = 0u32;
         for dir in &search_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "janet") {
-                        let mut mgr = plugin_manager.lock().unwrap();
-                        if mgr.load_file(&path).is_ok() {
-                            let stem = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("unknown");
-                            for hook in &hook_names {
-                                let fn_name = format!("{}-{}", stem, hook);
-                                // Only register if function exists in Janet VM
-                                let check = format!("(bound? '{})", fn_name);
-                                if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
-                                    mgr.register(hook, &fn_name);
+            match std::fs::read_dir(dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |e| e == "janet") {
+                            let mut mgr = plugin_manager.lock().unwrap();
+                            match mgr.load_file(&path) {
+                                Ok(()) => {
+                                    loaded += 1;
+                                    let stem = path
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("unknown");
+                                    for hook in &hook_names {
+                                        let fn_name = format!("{}-{}", stem, hook);
+                                        let check =
+                                            format!("(bound? '{})", fn_name);
+                                        if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
+                                            mgr.register(hook, &fn_name);
+                                            registered += 1;
+                                        } else {
+                                            tracing::debug!(
+                                                "plugin {}: hook fn {} not found",
+                                                path.display(),
+                                                fn_name
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("warning: failed to load plugin {}: {}", path.display(), e);
                                 }
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!("warning: plugin dir not readable ({}): {}", dir.display(), e);
+                    }
+                }
             }
+        }
+        if loaded > 0 {
+            eprintln!("loaded {} plugin(s), {} hook(s) registered", loaded, registered);
         }
     }
 
