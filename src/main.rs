@@ -172,6 +172,41 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "plugin")]
     {
+        let mut mgr = plugin_manager.lock().unwrap();
+
+        // Always load the bundled workflow plugin
+        let builtin = include_str!("../plugins/workflow.janet");
+        match mgr.eval(builtin) {
+            Ok(_) => {
+                let hook_names = [
+                    "on-init",
+                    "on-prompt",
+                    "on-response",
+                    "on-tool-start",
+                    "on-tool-end",
+                    "on-error",
+                    "on-complete",
+                ];
+                let mut registered = 0u32;
+                for hook in &hook_names {
+                    let fn_name = format!("workflow-{}", hook);
+                    let check = format!("(bound? '{})", fn_name);
+                    if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
+                        mgr.register(hook, &fn_name);
+                        registered += 1;
+                    }
+                }
+                eprintln!(
+                    "loaded builtin workflow plugin, {} hook(s) registered",
+                    registered
+                );
+            }
+            Err(e) => {
+                eprintln!("warning: failed to load builtin workflow plugin: {}", e);
+            }
+        }
+
+        // Also load user plugins from filesystem
         use std::path::PathBuf;
         let hook_names = [
             "on-init",
@@ -198,7 +233,6 @@ async fn main() -> anyhow::Result<()> {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.extension().map_or(false, |e| e == "janet") {
-                            let mut mgr = plugin_manager.lock().unwrap();
                             match mgr.load_file(&path) {
                                 Ok(()) => {
                                     loaded += 1;
@@ -208,22 +242,19 @@ async fn main() -> anyhow::Result<()> {
                                         .unwrap_or("unknown");
                                     for hook in &hook_names {
                                         let fn_name = format!("{}-{}", stem, hook);
-                                        let check =
-                                            format!("(bound? '{})", fn_name);
+                                        let check = format!("(bound? '{})", fn_name);
                                         if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
                                             mgr.register(hook, &fn_name);
                                             registered += 1;
-                                        } else {
-                                            tracing::debug!(
-                                                "plugin {}: hook fn {} not found",
-                                                path.display(),
-                                                fn_name
-                                            );
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("warning: failed to load plugin {}: {}", path.display(), e);
+                                    eprintln!(
+                                        "warning: failed to load plugin {}: {}",
+                                        path.display(),
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -231,13 +262,20 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("warning: plugin dir not readable ({}): {}", dir.display(), e);
+                        eprintln!(
+                            "warning: plugin dir not readable ({}): {}",
+                            dir.display(),
+                            e
+                        );
                     }
                 }
             }
         }
         if loaded > 0 {
-            eprintln!("loaded {} plugin(s), {} hook(s) registered", loaded, registered);
+            eprintln!(
+                "loaded {} user plugin(s), {} hook(s) registered",
+                loaded, registered
+            );
         }
     }
 
