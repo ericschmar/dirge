@@ -6,7 +6,6 @@ mod event;
 mod extras;
 mod image_util;
 mod permission;
-#[cfg(feature = "plugin")]
 mod plugin;
 mod provider;
 mod sandbox;
@@ -168,10 +167,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     #[cfg(feature = "plugin")]
-    let plugin_manager = std::sync::Arc::new(std::sync::Mutex::new(plugin::PluginManager::new()));
+    let plugin_manager = match plugin::PluginManager::try_new() {
+        Ok(pm) => Some(std::sync::Arc::new(std::sync::Mutex::new(pm))),
+        Err(e) => {
+            eprintln!("warning: plugin support disabled ({e})");
+            None
+        }
+    };
 
     #[cfg(feature = "plugin")]
-    {
+    if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
         let hook_names = [
             "on-init",
@@ -182,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
             "on-error",
             "on-complete",
         ];
-        let search_dirs: Vec<PathBuf> = vec![
+        let candidate_dirs: Vec<PathBuf> = vec![
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".config")
@@ -190,14 +195,12 @@ async fn main() -> anyhow::Result<()> {
                 .join("plugins"),
             PathBuf::from(".dirge").join("plugins"),
         ];
+        // Silently drop missing default dirs; only surface real errors below.
+        let search_dirs = plugin::filter_existing_dirs(&candidate_dirs);
 
         for dir in &search_dirs {
             let entries = match std::fs::read_dir(dir) {
                 Ok(e) => e,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("plugin dir not found: {}", dir.display());
-                    continue;
-                }
                 Err(e) => {
                     eprintln!("warning: cannot read plugin dir {}: {}", dir.display(), e);
                     continue;
@@ -208,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 let path = entry.path();
                 if path.extension().map_or(false, |e| e == "janet") {
                     eprintln!("loading plugin: {}", path.display());
-                    let mut mgr = plugin_manager.lock().unwrap();
+                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
                     match mgr.load_file(&path) {
                         Ok(()) => {
                             let stem = path
@@ -217,9 +220,6 @@ async fn main() -> anyhow::Result<()> {
                                 .unwrap_or("unknown");
                             for hook in &hook_names {
                                 let fn_name = format!("{}-{}", stem, hook);
-                                // Check binding via harness/has-symbol? so
-                                // missing hooks don't trigger Janet's
-                                // compile-error stderr output.
                                 if mgr.has_symbol(&fn_name) {
                                     mgr.register(hook, &fn_name);
                                     eprintln!("  registered hook: {} -> {}", hook, fn_name);
@@ -317,14 +317,14 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
         #[cfg(feature = "plugin")]
-        {
+        if let Some(pm_arc) = plugin_manager.as_ref() {
             use crate::plugin::escape_janet_string;
             let cwd = std::env::current_dir()
                 .unwrap_or_else(|_| ".".into())
                 .display()
                 .to_string();
-            let mut pm = plugin_manager.lock().unwrap();
-            let _ = pm.dispatch(
+            let mut pm = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = pm.dispatch(
                 "on-init",
                 &format!(
                     "@{{:model \"{}\" :cwd \"{}\" :provider \"{}\"}}",
@@ -332,7 +332,9 @@ async fn main() -> anyhow::Result<()> {
                     escape_janet_string(&cwd),
                     escape_janet_string(&provider),
                 ),
-            );
+            ) {
+                eprintln!("warning: plugin on-init dispatch failed: {e}");
+            }
         }
 
         if !cli.resolve_no_tools(&cfg)
@@ -364,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
             #[cfg(feature = "plugin")]
-            Some(&plugin_manager),
+            plugin_manager.as_ref(),
         )
         .await?;
     }

@@ -809,24 +809,33 @@ pub async fn run_interactive(
                                 let mut plugin_hint: Option<String> = None;
                                 #[cfg(feature = "plugin")]
                                 if let Some(pm) = plugin_manager {
-                                    let mut mgr = pm.lock().unwrap();
-                                    if let Ok(result) = mgr.dispatch(
+                                    let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                    match mgr.dispatch(
                                         "on-prompt",
                                         &format!(
                                             "@{{:prompt \"{}\"}}",
                                             crate::plugin::escape_janet_string(&text)
                                         ),
                                     ) {
-                                        if !result.is_empty() {
+                                        Ok(results) if !results.is_empty() => {
+                                            for line in &results {
+                                                renderer.write_line(
+                                                    &format!("[plugin] {}", line),
+                                                    Color::DarkGrey,
+                                                )?;
+                                            }
+                                            plugin_hint = Some(results.join("\n"));
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
                                             renderer.write_line(
-                                                &format!("[plugin] {}", result),
-                                                Color::DarkGrey,
+                                                &format!("[plugin] on-prompt error: {e}"),
+                                                C_ERROR,
                                             )?;
-                                            plugin_hint = Some(result);
                                         }
                                     }
-                                    // Drive workflow: sync phase and check for pending prompts
-                                    mgr.sync_phase();
+                                    // A plugin hook may queue a follow-up prompt via
+                                    // harness/request-prompt; pick it up here.
                                     if let Some(pending) = mgr.take_pending_prompt() {
                                         plugin_hint = Some(pending);
                                     }
@@ -928,15 +937,20 @@ pub async fn run_interactive(
                             // parser never has to interpret arbitrary
                             // JSON tokens (`:`, `,`, `null`).
                             let args_json = args.to_string();
-                            let mut mgr = pm.lock().unwrap();
-                            let _ = mgr.dispatch(
+                            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Err(e) = mgr.dispatch(
                                 "on-tool-start",
                                 &format!(
                                     "@{{:tool \"{}\" :args \"{}\"}}",
                                     crate::plugin::escape_janet_string(&name),
                                     crate::plugin::escape_janet_string(&args_json),
                                 ),
-                            );
+                            ) {
+                                renderer.write_line(
+                                    &format!("[plugin] on-tool-start error: {e}"),
+                                    C_ERROR,
+                                )?;
+                            }
                         }
                     }
                     AgentEvent::ToolResult { output } => {
@@ -944,14 +958,19 @@ pub async fn run_interactive(
 
                         #[cfg(feature = "plugin")]
                         if let Some(pm) = plugin_manager {
-                            let mut mgr = pm.lock().unwrap();
-                            let _ = mgr.dispatch(
+                            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Err(e) = mgr.dispatch(
                                 "on-tool-end",
                                 &format!(
                                     "@{{:output \"{}\"}}",
                                     crate::plugin::escape_janet_string(&output)
                                 ),
-                            );
+                            ) {
+                                renderer.write_line(
+                                    &format!("[plugin] on-tool-end error: {e}"),
+                                    C_ERROR,
+                                )?;
+                            }
                         }
                         if show_details {
                             let sanitized = sanitize_output(&output);
@@ -977,20 +996,29 @@ pub async fn run_interactive(
                         let mut plugin_followup: Option<String> = None;
                         #[cfg(feature = "plugin")]
                         if let Some(pm) = plugin_manager {
-                            let mut mgr = pm.lock().unwrap();
-                            if let Ok(result) = mgr.dispatch(
+                            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                            match mgr.dispatch(
                                 "on-response",
                                 &format!(
                                     "@{{:response \"{}\"}}",
                                     crate::plugin::escape_janet_string(&response)
                                 ),
                             ) {
-                                if !result.is_empty() {
+                                Ok(results) if !results.is_empty() => {
+                                    for line in &results {
+                                        renderer.write_line(
+                                            &format!("[plugin] {}", line),
+                                            Color::DarkGrey,
+                                        )?;
+                                    }
+                                    plugin_followup = Some(results.join("\n"));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
                                     renderer.write_line(
-                                        &format!("[plugin] {}", result),
-                                        Color::DarkGrey,
+                                        &format!("[plugin] on-response error: {e}"),
+                                        C_ERROR,
                                     )?;
-                                    plugin_followup = Some(result);
                                 }
                             }
                             // Check for pending prompts queued by on-response
@@ -1062,41 +1090,66 @@ pub async fn run_interactive(
                         agent_rx = None;
 
                         #[cfg(feature = "plugin")]
-                        if let Some(followup) = plugin_followup {
-                            let followup_prompt = followup + "\n\nContinue.";
-                            let runner = agent.clone().spawn_runner(followup_prompt, crate::agent::runner::convert_history(session));
-                            agent_rx = Some(runner.event_rx);
-                            is_running = true;
-                        }
+                        let followup_for_decision = plugin_followup.clone();
+                        #[cfg(not(feature = "plugin"))]
+                        let followup_for_decision: Option<String> = None;
 
                         #[cfg(feature = "loop")]
-                        if let Some(ref mut ls) = loop_state
-                            && ls.active
-                        {
-                            if ls.should_stop() {
-                                renderer.write_line(
-                                    &format!(
-                                        "[loop] max iterations ({}) reached, stopping",
-                                        ls.iteration
-                                    ),
-                                    C_AGENT,
-                                )?;
-                                ls.active = false;
-                                loop_label = None;
-                            } else {
-                                let summary: String = response.chars().take(200).collect();
-                                ls.last_summary = Some(summary);
-                                ls.iteration += 1;
-                                let prompt = ls.build_prompt();
-                                let runner = agent.clone().spawn_runner(prompt, Vec::new());
+                        let (loop_active, loop_should_stop) = loop_state
+                            .as_ref()
+                            .map(|ls| (ls.active, ls.active && ls.should_stop()))
+                            .unwrap_or((false, false));
+                        #[cfg(not(feature = "loop"))]
+                        let (loop_active, loop_should_stop) = (false, false);
+
+                        let action = crate::plugin::decide_post_done_action(
+                            followup_for_decision,
+                            loop_active,
+                            loop_should_stop,
+                        );
+
+                        match action {
+                            crate::plugin::PostDoneAction::Followup(text) => {
+                                let followup_prompt = text + "\n\nContinue.";
+                                let runner = agent.clone().spawn_runner(
+                                    followup_prompt,
+                                    crate::agent::runner::convert_history(session),
+                                );
                                 agent_rx = Some(runner.event_rx);
                                 is_running = true;
-                                loop_label = Some(ls.iteration_label());
-                                renderer.write_line(
-                                    &format!("[loop] launching {}", ls.iteration_label()),
-                                    C_AGENT,
-                                )?;
                             }
+                            crate::plugin::PostDoneAction::LoopStop => {
+                                #[cfg(feature = "loop")]
+                                if let Some(ref mut ls) = loop_state {
+                                    renderer.write_line(
+                                        &format!(
+                                            "[loop] max iterations ({}) reached, stopping",
+                                            ls.iteration
+                                        ),
+                                        C_AGENT,
+                                    )?;
+                                    ls.active = false;
+                                    loop_label = None;
+                                }
+                            }
+                            crate::plugin::PostDoneAction::LoopIter => {
+                                #[cfg(feature = "loop")]
+                                if let Some(ref mut ls) = loop_state {
+                                    let summary: String = response.chars().take(200).collect();
+                                    ls.last_summary = Some(summary);
+                                    ls.iteration += 1;
+                                    let prompt = ls.build_prompt();
+                                    let runner = agent.clone().spawn_runner(prompt, Vec::new());
+                                    agent_rx = Some(runner.event_rx);
+                                    is_running = true;
+                                    loop_label = Some(ls.iteration_label());
+                                    renderer.write_line(
+                                        &format!("[loop] launching {}", ls.iteration_label()),
+                                        C_AGENT,
+                                    )?;
+                                }
+                            }
+                            crate::plugin::PostDoneAction::Idle => {}
                         }
 
                         #[cfg(feature = "git-worktree")]
@@ -1139,14 +1192,19 @@ pub async fn run_interactive(
 
                         #[cfg(feature = "plugin")]
                         if let Some(pm) = plugin_manager {
-                            let mut mgr = pm.lock().unwrap();
-                            let _ = mgr.dispatch(
+                            let mut mgr = pm.lock().unwrap_or_else(|err| err.into_inner());
+                            if let Err(dispatch_err) = mgr.dispatch(
                                 "on-error",
                                 &format!(
                                     "@{{:error \"{}\"}}",
                                     crate::plugin::escape_janet_string(&e)
                                 ),
-                            );
+                            ) {
+                                renderer.write_line(
+                                    &format!("[plugin] on-error error: {dispatch_err}"),
+                                    C_ERROR,
+                                )?;
+                            }
                         }
 
                         is_running = false;
