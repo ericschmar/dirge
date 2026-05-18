@@ -814,9 +814,7 @@ pub async fn run_interactive(
                                         "on-prompt",
                                         &format!(
                                             "@{{:prompt \"{}\"}}",
-                                            text.replace('\\', "\\\\")
-                                                .replace('"', "\\\"")
-                                                .replace('\n', "\\n")
+                                            crate::plugin::escape_janet_string(&text)
                                         ),
                                     ) {
                                         if !result.is_empty() {
@@ -926,10 +924,18 @@ pub async fn run_interactive(
 
                         #[cfg(feature = "plugin")]
                         if let Some(pm) = plugin_manager {
+                            // Pass args as a JSON string so the Janet
+                            // parser never has to interpret arbitrary
+                            // JSON tokens (`:`, `,`, `null`).
+                            let args_json = args.to_string();
                             let mut mgr = pm.lock().unwrap();
                             let _ = mgr.dispatch(
                                 "on-tool-start",
-                                &format!("@{{:tool \"{}\" :args {}}}", name, args),
+                                &format!(
+                                    "@{{:tool \"{}\" :args \"{}\"}}",
+                                    crate::plugin::escape_janet_string(&name),
+                                    crate::plugin::escape_janet_string(&args_json),
+                                ),
                             );
                         }
                     }
@@ -941,7 +947,10 @@ pub async fn run_interactive(
                             let mut mgr = pm.lock().unwrap();
                             let _ = mgr.dispatch(
                                 "on-tool-end",
-                                &format!("@{{:output \"{}\"}}", output.replace('"', "\\\"")),
+                                &format!(
+                                    "@{{:output \"{}\"}}",
+                                    crate::plugin::escape_janet_string(&output)
+                                ),
                             );
                         }
                         if show_details {
@@ -973,10 +982,7 @@ pub async fn run_interactive(
                                 "on-response",
                                 &format!(
                                     "@{{:response \"{}\"}}",
-                                    response
-                                        .replace('\\', "\\\\")
-                                        .replace('"', "\\\"")
-                                        .replace('\n', "\\n")
+                                    crate::plugin::escape_janet_string(&response)
                                 ),
                             ) {
                                 if !result.is_empty() {
@@ -1136,7 +1142,10 @@ pub async fn run_interactive(
                             let mut mgr = pm.lock().unwrap();
                             let _ = mgr.dispatch(
                                 "on-error",
-                                &format!("@{{:error \"{}\"}}", e.replace('"', "\\\"")),
+                                &format!(
+                                    "@{{:error \"{}\"}}",
+                                    crate::plugin::escape_janet_string(&e)
+                                ),
                             );
                         }
 

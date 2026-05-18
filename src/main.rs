@@ -217,9 +217,10 @@ async fn main() -> anyhow::Result<()> {
                                 .unwrap_or("unknown");
                             for hook in &hook_names {
                                 let fn_name = format!("{}-{}", stem, hook);
-                                // Try to evaluate the symbol to check if bound
-                                let is_bound = mgr.eval(&fn_name).is_ok();
-                                if is_bound {
+                                // Check binding via harness/has-symbol? so
+                                // missing hooks don't trigger Janet's
+                                // compile-error stderr output.
+                                if mgr.has_symbol(&fn_name) {
                                     mgr.register(hook, &fn_name);
                                     eprintln!("  registered hook: {} -> {}", hook, fn_name);
                                 }
@@ -317,16 +318,19 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "plugin")]
         {
+            use crate::plugin::escape_janet_string;
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| ".".into())
+                .display()
+                .to_string();
             let mut pm = plugin_manager.lock().unwrap();
             let _ = pm.dispatch(
                 "on-init",
                 &format!(
                     "@{{:model \"{}\" :cwd \"{}\" :provider \"{}\"}}",
-                    model,
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| ".".into())
-                        .display(),
-                    provider,
+                    escape_janet_string(&model),
+                    escape_janet_string(&cwd),
+                    escape_janet_string(&provider),
                 ),
             );
         }
