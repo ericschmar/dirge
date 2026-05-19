@@ -731,3 +731,160 @@ fn meta_enter_with_picker_active_inserts_newline() {
     let result = editor.handle_key(meta_enter());
     assert!(result.is_none());
 }
+
+// ── Paste collapse ──────────────────────────────────────────
+
+#[test]
+fn short_paste_inserts_raw() {
+    // Single-line paste — should go in as plain text, no placeholder.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("hello world");
+    assert_eq!(editor.buffer.as_str(), "hello world");
+    assert_eq!(editor.cursor, "hello world".len());
+}
+
+#[test]
+fn three_line_paste_still_raw() {
+    // Threshold is 4 lines — three lines should not collapse.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\nb\nc");
+    assert_eq!(editor.buffer.as_str(), "a\nb\nc");
+}
+
+#[test]
+fn four_line_paste_collapses_to_placeholder() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\nb\nc\nd");
+    // Buffer holds a marker block; render_line should show "[4 lines pasted]".
+    assert!(editor.buffer.contains('\u{0001}'));
+    let raw_line = editor.buffer.as_str();
+    let (display, _) = editor.render_line(raw_line, editor.cursor);
+    assert_eq!(display, "[4 lines pasted]");
+    // Expanded text is the original paste.
+    assert_eq!(editor.expanded().as_str(), "a\nb\nc\nd");
+}
+
+#[test]
+fn submit_expands_placeholders() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "before ");
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    type_str(&mut editor, " after");
+    let submitted = editor.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(submitted.as_str(), "before L1\nL2\nL3\nL4 after");
+    // Buffer and pastes both cleared after submit.
+    assert!(editor.buffer.is_empty());
+}
+
+#[test]
+fn left_right_skip_placeholder_as_unit() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "x");
+    editor.handle_paste("a\nb\nc\nd");
+    type_str(&mut editor, "y");
+    // Buffer now: "x" + marker + "y"
+    let end = editor.cursor;
+    // One Left should jump from after 'y' to between marker close and 'y'.
+    editor.handle_key(press(KeyCode::Left));
+    assert!(editor.cursor < end);
+    // Next Left should skip the entire marker block, landing just after 'x'.
+    let after_first = editor.cursor;
+    editor.handle_key(press(KeyCode::Left));
+    assert_eq!(editor.cursor, 1); // just after 'x'
+    assert!(editor.cursor < after_first);
+}
+
+#[test]
+fn backspace_deletes_whole_placeholder() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "a");
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    type_str(&mut editor, "b");
+    let len_with_marker = editor.buffer.len();
+    // Move left past 'b', so cursor sits just after the marker.
+    editor.handle_key(press(KeyCode::Left));
+    // Backspace removes the whole marker block in one go.
+    editor.handle_key(press(KeyCode::Backspace));
+    assert!(editor.buffer.len() < len_with_marker);
+    assert_eq!(editor.buffer.as_str(), "ab");
+}
+
+#[test]
+fn second_paste_of_same_content_expands_inline() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\nb\nc\nd");
+    // After first paste: buffer holds a marker; expanded length matches input.
+    assert!(editor.buffer.contains('\u{0001}'));
+    // Second paste of identical content expands the existing placeholder.
+    editor.handle_paste("a\nb\nc\nd");
+    assert_eq!(editor.buffer.as_str(), "a\nb\nc\nd");
+    assert!(!editor.buffer.contains('\u{0001}'));
+}
+
+#[test]
+fn second_paste_of_different_content_creates_new_placeholder() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\nb\nc\nd");
+    editor.handle_paste("X\nY\nZ\nW");
+    // Two distinct placeholder markers in the buffer.
+    let marker_count = editor.buffer.matches('\u{0001}').count();
+    assert_eq!(marker_count, 4); // two open + two close
+    // Expanded contains both bodies in order.
+    assert_eq!(editor.expanded().as_str(), "a\nb\nc\ndX\nY\nZ\nW");
+}
+
+#[test]
+fn paste_mark_chars_stripped_from_input() {
+    // A malicious paste containing PASTE_MARK shouldn't break the parser.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\nb\n\u{0001}\nc\nd");
+    // PASTE_MARK chars are stripped before storage; line count after strip is 5
+    // (still >= 4) so it should collapse.
+    assert_eq!(editor.expanded().as_str(), "a\nb\n\nc\nd");
+}
+
+#[test]
+fn ctrl_w_does_not_split_paste_marker() {
+    // Regression: word-skip-back from position past a paste marker used
+    // prev_word_boundary directly, which treats \x01 as punctuation and
+    // would happily land mid-marker — corrupting it.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "before ");
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    type_str(&mut editor, " after");
+    // Cursor at end of buffer. Ctrl+W should kill "after"; the marker stays.
+    editor.handle_key(ctrl(KeyCode::Char('w')));
+    // Buffer should still contain the paste marker intact.
+    let mark_count = editor.buffer.matches('\u{0001}').count();
+    assert_eq!(mark_count, 2, "marker bytes corrupted by Ctrl+W");
+    assert_eq!(editor.expanded().as_str(), "before L1\nL2\nL3\nL4 ");
+}
+
+#[test]
+fn meta_b_skips_past_paste_marker() {
+    // Meta+B from after the marker should land before the marker, not inside.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    type_str(&mut editor, " trailing");
+    // Meta+B once: lands at the start of "trailing".
+    editor.handle_key(meta(KeyCode::Char('b')));
+    // Meta+B again: should jump past the entire marker block.
+    let before = editor.cursor;
+    editor.handle_key(meta(KeyCode::Char('b')));
+    // Now cursor should be at byte 0 (before the marker).
+    assert_eq!(editor.cursor, 0);
+    assert!(editor.cursor < before);
+    // Marker still intact.
+    assert_eq!(editor.buffer.matches('\u{0001}').count(), 2);
+}
+
+#[test]
+fn paste_during_picker_is_ignored() {
+    // When the picker is active, paste should not insert marker bytes into
+    // the buffer (the picker doesn't know about them, would render badly).
+    let mut editor = InputEditor::new();
+    editor.handle_key(press(KeyCode::Char('@')));
+    let buffer_before = editor.buffer.to_string();
+    editor.handle_paste("a\nb\nc\nd");
+    assert_eq!(editor.buffer.as_str(), buffer_before);
+}
