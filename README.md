@@ -13,7 +13,9 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Bash permissions** (tree-sitter): parses shell commands to split `&&`/`;`/`|` into individual segments, detects command substitution and complex constructs
 - **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
 - **Session management**: save/load/resume sessions, auto-compaction to stay within context windows
-- **Terminal UI**: crossterm-based, markdown rendering, mouse selection/copy, scrollback, reasoning visibility toggle
+- **Terminal UI**: crossterm-based, markdown rendering, soft-wrapping input box, mouse selection/copy, scrollback, reasoning visibility toggle
+- **Info panel**: optional right-hand sidebar showing cwd, MCP/LSP server status, pending todos, and recently-modified files. Auto-shown at ≥100 cols; toggle via `/panel`
+- **Mid-execution interjection**: type while the agent is running to queue a follow-up message — the runner stops at the next tool-result boundary so it's picked up promptly instead of waiting for the whole multi-turn run. `Ctrl+X` drops queued messages, `Ctrl+C` cancels both the run and the queue
 - **Prompts system**: switch between system prompt modes at runtime (`code`, `plan`, `review`, `debug`, etc.)
 - **Plan mode**: write restriction — when a plan/review prompt is active, writes and edits are restricted to `PLAN.md` only
 - **Subagent support**: `task` tool spawns a subagent for research or general analysis subtasks
