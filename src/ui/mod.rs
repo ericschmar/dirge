@@ -657,7 +657,26 @@ pub async fn run_interactive(
     let (user_tx, mut user_rx) = mpsc::channel::<UserEvent>(64);
     let user_tx_clone = user_tx.clone();
     std::thread::spawn(move || {
+        // Poll-based loop so `TerminalGuard::drop` can signal a
+        // cooperative shutdown via `EVENT_READER_SHUTDOWN`. Previously
+        // this thread blocked in `event::read()` indefinitely; on
+        // teardown the guard's drain pass and this `read()` both held
+        // crossterm's internal mutex, racing for terminal-response
+        // bytes (OSC 11, primary DA, CPR). With the flag + 50ms
+        // poll-tick, the reader exits within ~50ms of the guard
+        // signalling, the mutex is released, and the drain runs
+        // uncontended.
         loop {
+            if crate::ui::terminal::EVENT_READER_SHUTDOWN
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            match event::poll(std::time::Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
             match event::read() {
                 Ok(event::Event::Key(key)) => {
                     if user_tx_clone.blocking_send(UserEvent::Key(key)).is_err() {
@@ -1799,7 +1818,27 @@ pub async fn run_interactive(
                         // on-tool-end is also fired by HookedToolDyn so the
                         // host doesn't re-dispatch it here.
 
-                        if show_details {
+                        // Permission-deny path: the ALERT handler
+                        // already closed the chamber (and the dim
+                        // `↳ denied: …` trailer printed there). The
+                        // tool still returns an error to the agent
+                        // which surfaces here as a ToolResult — but
+                        // painting chamber rows + a chamber bottom
+                        // now would produce orphan borders for a
+                        // chamber whose top no longer exists. Emit
+                        // a single dim line with the error body
+                        // instead and skip the chamber paint.
+                        if show_details && last_tool_name.is_none() {
+                            let trimmed = output.trim();
+                            if !trimmed.is_empty() {
+                                let first_line = trimmed.lines().next().unwrap_or("");
+                                renderer.write_line(
+                                    &format!("  ↳ {}", sanitize_output(first_line)),
+                                    theme::dim(),
+                                )?;
+                            }
+                        }
+                        if show_details && last_tool_name.is_some() {
                             let is_edit =
                                 last_tool_name.as_deref() == Some("edit") && show_diff;
 
@@ -2581,8 +2620,20 @@ pub async fn run_interactive(
                     &format!("{}{}╮", pre, "─".repeat(top_fill)),
                     c_perm(),
                 )?;
-                renderer.write_line(&row(&format!("tool : {}", ask_req.tool)), c_perm())?;
-                renderer.write_line(&row(&format!("args : {}", ask_req.input)), c_perm())?;
+                // ASNI/control-char sanitize the tool name + args
+                // before painting. These fields can carry attacker-
+                // shaped content (MCP tool name, plugin-injected
+                // call, pathological filename), and the ALERT row
+                // is the single moment the user is being asked to
+                // make a security decision — a raw escape here
+                // could recolor the row, blank the prompt, or move
+                // the cursor. The sibling reopen path at the bottom
+                // of this handler already sanitizes; do the same
+                // here for symmetry.
+                let safe_tool = sanitize_output(&ask_req.tool);
+                let safe_input = sanitize_output(&ask_req.input);
+                renderer.write_line(&row(&format!("tool : {}", safe_tool)), c_perm())?;
+                renderer.write_line(&row(&format!("args : {}", safe_input)), c_perm())?;
                 renderer.write_line(&format!("├{}┤", bot_bar), c_perm())?;
                 renderer.write_line(
                     &row("[y] allow once  [a] allow always  [n] deny  [ESC] abort"),
@@ -2634,7 +2685,10 @@ pub async fn run_interactive(
                                             break UserDecision::AllowOnce;
                                         }
                                         renderer.write_line(
-                                            &format!("  -> will allow: {}", pattern),
+                                            &format!(
+                                                "  -> will allow: {}",
+                                                sanitize_output(&pattern),
+                                            ),
                                             Color::Green,
                                         )?;
                                         break UserDecision::AllowAlways(pattern);
@@ -2689,8 +2743,16 @@ pub async fn run_interactive(
                     // line which reads as continuous output.
                     renderer.write_line("", Color::White)?;
                     if was_denied {
+                        // Same sanitization as the ALERT rows above:
+                        // tool name + args can carry attacker-shaped
+                        // bytes; don't paint them raw even on the
+                        // deny path.
                         renderer.write_line(
-                            &format!("  ↳ denied: {} {}", ask_req.tool, ask_req.input),
+                            &format!(
+                                "  ↳ denied: {} {}",
+                                sanitize_output(&ask_req.tool),
+                                sanitize_output(&ask_req.input),
+                            ),
                             theme::dim(),
                         )?;
                     } else {
@@ -2731,7 +2793,11 @@ pub async fn run_interactive(
                         }
                     }
                     renderer.write_line(
-                        &format!("  allowed {} {} (saved to session)", ask_req.tool, pattern),
+                        &format!(
+                            "  allowed {} {} (saved to session)",
+                            sanitize_output(&ask_req.tool),
+                            pattern,
+                        ),
                         Color::Green,
                     )?;
                 }
@@ -3418,18 +3484,38 @@ fn chamber_bottom(frame_w: usize) -> String {
 }
 
 /// `│ content (truncated/padded to inner) │` row of a tool chamber.
+///
+/// Sizing is by *display width* (`UnicodeWidthStr`), not `char` count,
+/// so CJK / emoji / other wide glyphs from tool output don't push the
+/// right `│` past the chamber column. Truncation walks chars from the
+/// front, summing display widths until adding the next would exceed
+/// `inner - 1` cells (1 cell reserved for the `…` marker).
 fn chamber_row(content: &str, inner: usize) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let trimmed: String = if chars.len() <= inner {
-        chars.iter().collect()
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+    let total_w = UnicodeWidthStr::width(content);
+    let (trimmed, trimmed_w): (String, usize) = if total_w <= inner {
+        (content.to_string(), total_w)
     } else if inner == 0 {
-        String::new()
+        (String::new(), 0)
     } else {
-        let mut out: String = chars[..inner.saturating_sub(1)].iter().collect();
+        // Reserve 1 cell for `…`. Pull chars from the start until
+        // adding the next one would overflow the remaining budget.
+        let budget = inner.saturating_sub(1);
+        let mut out = String::with_capacity(content.len());
+        let mut used = 0;
+        for ch in content.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            out.push(ch);
+            used += w;
+        }
         out.push('…');
-        out
+        (out, used + 1)
     };
-    let pad = inner.saturating_sub(trimmed.chars().count());
+    let pad = inner.saturating_sub(trimmed_w);
     format!("│ {}{} │", trimmed, " ".repeat(pad))
 }
 
@@ -3806,6 +3892,42 @@ mod tests {
         assert!(
             row.ends_with(" │"),
             "right border missing or padded wrong: {row:?}"
+        );
+    }
+
+    /// `chamber_row` must align by display width too, not `char` count.
+    /// Tool output rows (`render_tool_output`) flow through this, so
+    /// any CJK/emoji in a `read`/`bash`/`grep` result would push the
+    /// right `│` past the chamber's column. Sibling
+    /// `chamber_row_centered` was already fixed; this is the same
+    /// bug in the asymmetric helper.
+    #[test]
+    fn chamber_row_handles_wide_emoji() {
+        // Short content with one wide char: must pad to exactly
+        // inner+4 cells. "ok ✅" = 2+1+2 = 5 cells (4 chars).
+        let row = chamber_row("ok ✅", 40);
+        let row_width = UnicodeWidthStr::width(row.as_str());
+        assert_eq!(
+            row_width, 44,
+            "row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
+        );
+        assert!(
+            row.ends_with(" │"),
+            "right border missing: {row:?}"
+        );
+
+        // Long content with mixed wide chars: must truncate by
+        // display width and still land at exactly inner+4 cells.
+        let long = "日本語日本語日本語日本語日本語日本語日本語日本語日本語日本語";
+        let row = chamber_row(long, 20);
+        let row_width = UnicodeWidthStr::width(row.as_str());
+        assert_eq!(
+            row_width, 24,
+            "wide-char row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
+        );
+        assert!(
+            row.ends_with(" │"),
+            "right border missing on truncated wide-char row: {row:?}"
         );
     }
 

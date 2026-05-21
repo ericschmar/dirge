@@ -169,12 +169,24 @@ impl Renderer {
         crossterm::terminal::size().unwrap_or((80, 24))
     }
 
+    /// Width chat text wraps to before pushing into the buffer. Uses
+    /// the *capped* `content_width()` (120 cols max) so wide terminals
+    /// don't grow scrollback past the centered band into the
+    /// divider/panel margin. Previously aliased `line_width()` which
+    /// returns the raw band width and ignored the 120-col cap —
+    /// chat overflowed the documented content area on wide terminals.
     fn max_line_width(&self) -> usize {
-        self.content_cols().saturating_sub(1) as usize
+        self.content_width()
     }
 
+    /// Raw width of the chat band (terminal minus panel reserve,
+    /// minus 1 col for the rightmost gutter). Used for *positioning*
+    /// math (`content_indent`, panel divider layout) where the actual
+    /// available column count matters; chat text wrapping should go
+    /// through `max_line_width` / `content_width` instead so it
+    /// honors the 120-col cap.
     pub fn line_width(&self) -> usize {
-        self.max_line_width()
+        self.content_cols().saturating_sub(1) as usize
     }
 
     /// Target width for chat content. Caps at 120 cols so wide
