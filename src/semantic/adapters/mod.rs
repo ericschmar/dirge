@@ -1,15 +1,27 @@
 pub mod bash;
 #[cfg(feature = "semantic-clojure")]
 mod clojure;
+#[cfg(feature = "semantic-go")]
+mod go;
 #[cfg(feature = "semantic-python")]
 mod python;
+#[cfg(feature = "semantic-ruby")]
+mod ruby;
+#[cfg(feature = "semantic-rust")]
+mod rust;
 #[cfg(feature = "semantic-ts")]
 mod typescript;
 
 #[cfg(feature = "semantic-clojure")]
 pub use clojure::ClojureAdapter;
+#[cfg(feature = "semantic-go")]
+pub use go::GoAdapter;
 #[cfg(feature = "semantic-python")]
 pub use python::PythonAdapter;
+#[cfg(feature = "semantic-ruby")]
+pub use ruby::RubyAdapter;
+#[cfg(feature = "semantic-rust")]
+pub use rust::RustAdapter;
 #[cfg(feature = "semantic-ts")]
 pub use typescript::TypescriptAdapter;
 

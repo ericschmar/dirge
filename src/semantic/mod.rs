@@ -35,6 +35,15 @@ impl SemanticManager {
         #[cfg(feature = "semantic-clojure")]
         adapters.push(Box::new(adapters::ClojureAdapter));
 
+        #[cfg(feature = "semantic-go")]
+        adapters.push(Box::new(adapters::GoAdapter));
+
+        #[cfg(feature = "semantic-ruby")]
+        adapters.push(Box::new(adapters::RubyAdapter));
+
+        #[cfg(feature = "semantic-rust")]
+        adapters.push(Box::new(adapters::RustAdapter));
+
         let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
         let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));
 

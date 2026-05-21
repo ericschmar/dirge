@@ -8,7 +8,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Standard tools**: read, write, edit, bash, grep, find_files, glob, list_dir, write_todo_list, apply_patch
 - **Line-numbered read output**: `read` tool prefixes each line with right-aligned line numbers (`123: content`)
 - **Environment-aware**: system prompt includes OS, shell, working directory, and git branch for context
-- **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX, Python, and Clojure (clj/cljs/cljc/edn/bb)
+- **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX, Python, Clojure (clj/cljs/cljc/edn/bb), Go, Ruby, and Rust
 - **Claude-compatible skills**: discover skills from `.claude/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
 - **Bash permissions** (tree-sitter): parses shell commands to split `&&`/`;`/`|` into individual segments, detects command substitution and complex constructs
 - **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
@@ -50,14 +50,14 @@ Transient API errors (network, rate limits, Anthropic `overloaded_error`) are au
 # Default — MCP, loop, and git-worktree included
 cargo install dirge
 
-# With semantic code tools (tree-sitter: TS/TSX/Python/Bash/Clojure)
-cargo install dirge --features "semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure"
+# With semantic code tools (tree-sitter)
+cargo install dirge --features "semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust"
 
 # With ACP (Agent Communication Protocol) support for editor integration
 cargo install dirge --features acp
 
 # All features
-cargo install dirge --features "acp,loop,git-worktree,mcp,semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,plugin"
+cargo install dirge --features "acp,loop,git-worktree,mcp,semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,plugin"
 ```
 
 ### Optional: sandbox mode
@@ -292,7 +292,16 @@ When built with `--features "semantic,semantic-ts,semantic-python"`, dirge gains
 | `find_callers` | Find all call sites of a function/method via the tree-sitter symbol index (word-boundary semantics, excludes the definition site). |
 | `find_callees` | Extract all function/method calls made within a symbol's body (tree-sitter query). |
 
-Supports TypeScript/TSX, Python, and Clojure (`.clj`, `.cljs`, `.cljc`, `.edn`, `.bb`). Index is built lazily on first use and cached by file mtime. Clojure surfaces `defn`/`defn-`/`defmacro`/`defmulti`/`defmethod` as functions/methods, `def` as variables, `defrecord`/`deftype` as classes, and `defprotocol`/`definterface` (plus their method declarations) as interfaces. `defn-` is treated as private; everything else is exported.
+Supports TypeScript/TSX, Python, Clojure (`.clj`/`.cljs`/`.cljc`/`.edn`/`.bb`), Go, Ruby (`.rb`/`.rake`/`.gemspec`), and Rust. Index is built lazily on first use and cached by file mtime.
+
+| Language | Exports detected from | Maps to dirge SymbolKinds |
+|---|---|---|
+| TypeScript/TSX | `export` keyword + index re-exports | function/class/interface/method/type alias |
+| Python | leading underscore convention; `__dunder__` treated as public | function/class/method |
+| Clojure | `defn-` is private; everything else exported | function/variable/class (defrecord/deftype) /interface (defprotocol) /method (defmethod, defprotocol body) |
+| Go | uppercase-first-letter convention | function/method (receiver type as `parent_class`) /class (struct) /interface (with methods) /type alias |
+| Ruby | not detected (visibility is keyword-scoped) | class/interface (module) /method (instance + `def self.`) /function (top-level) |
+| Rust | `pub` / `pub(crate)` / `pub(super)` visibility modifier | function/class (struct/enum) /interface (trait + methods) /method (impl block, attached to receiving type) /type alias /variable (const/static) |
 
 Adding a new language requires writing a Rust `LanguageAdapter` impl (see `src/semantic/adapters/clojure.rs` for a 60-line reference covering the full lifecycle) and gating it behind a new `semantic-<lang>` cargo feature. Tree-sitter Rust bindings don't load grammars dynamically today, so the per-language adapters need to ship in the binary — but users who want their own language can add an adapter in a fork without touching anything outside `src/semantic/`. For runtime-pluggable language intelligence, register an LSP server in `config.json` instead (see the LSP section below) — that's the supported path for languages dirge doesn't bake in.
 
