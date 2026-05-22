@@ -3180,6 +3180,37 @@ pub async fn run_interactive(
                 // - **Deny**: chamber stayed closed; render a
                 //   single dim "(denied)" trailer line so it's
                 //   clear no result is coming.
+                // The "allowed … (saved to session)" confirmation
+                // line MUST be emitted before any chamber-reopen
+                // below, otherwise it lands inside the freshly-
+                // painted chamber TOP and reads as if it's part of
+                // the tool's output. Same shape of bug as the
+                // earlier alert-inside-chamber fix — visible
+                // affordance order: confirmation → blank → chamber
+                // TOP → (incoming tool result body) → chamber bottom.
+                if let Some(pattern) = allow_pattern {
+                    session.permission_allowlist.push(PermissionAllowEntry {
+                        tool: ask_req.tool.clone(),
+                        pattern: pattern.clone(),
+                    });
+                    if !cli.no_session {
+                        if let Err(e) = crate::session::storage::save_session(session) {
+                            renderer.write_line(
+                                &format!("warning: failed to save session: {}", e),
+                                c_error(),
+                            )?;
+                        }
+                    }
+                    renderer.write_line(
+                        &format!(
+                            "  allowed {} {} (saved to session)",
+                            sanitize_output(&ask_req.tool),
+                            pattern,
+                        ),
+                        Color::Green,
+                    )?;
+                }
+
                 if let Some(reopen_name) = pending_chamber_tool {
                     // Visual breathing room between the alert box's
                     // bottom border and whatever follows (reopened
@@ -3223,29 +3254,6 @@ pub async fn run_interactive(
                         last_tool_name = Some(reopen_name);
                         tool_chamber_open = true;
                     }
-                }
-
-                if let Some(pattern) = allow_pattern {
-                    session.permission_allowlist.push(PermissionAllowEntry {
-                        tool: ask_req.tool.clone(),
-                        pattern: pattern.clone(),
-                    });
-                    if !cli.no_session {
-                        if let Err(e) = crate::session::storage::save_session(session) {
-                            renderer.write_line(
-                                &format!("warning: failed to save session: {}", e),
-                                c_error(),
-                            )?;
-                        }
-                    }
-                    renderer.write_line(
-                        &format!(
-                            "  allowed {} {} (saved to session)",
-                            sanitize_output(&ask_req.tool),
-                            pattern,
-                        ),
-                        Color::Green,
-                    )?;
                 }
 
                 renderer.render_viewport()?;
