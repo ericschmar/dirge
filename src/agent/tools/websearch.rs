@@ -113,18 +113,111 @@ impl Tool for WebSearchTool {
             .build()
             .map_err(|e| ToolError::Msg(format!("http client init failed: {e}")))?;
 
-        // Primary: hit Exa's hosted MCP endpoint — same approach
-        // opencode uses. Works without auth (free tier) and
-        // accepts an optional `?exaApiKey=…` for higher rate
-        // limits. Falls back to DuckDuckGo HTML scraping if the
-        // MCP call errors out (network issue, rate-limited, etc.)
-        // so websearch stays useful when Exa is down.
-        match exa_mcp_search(&client, self.api_key.as_deref(), &args).await {
+        // Provider selection mirrors opencode: random 50/50 per
+        // process (rather than per-session, since we don't pipe a
+        // session ID here). Overridable via DIRGE_WEBSEARCH_PROVIDER
+        // = "exa" | "parallel" if a user wants to pin one. Once
+        // picked, the choice sticks for the process lifetime so a
+        // user gets consistent behavior across turns.
+        let primary = selected_provider();
+        let secondary = match primary {
+            Provider::Exa => Provider::Parallel,
+            Provider::Parallel => Provider::Exa,
+        };
+
+        // Try primary → secondary → DDG fallback. The two
+        // upstream MCP endpoints sometimes rate-limit or have
+        // brief outages; rotating to the other one usually works.
+        // DDG is the last-resort defensive fallback so websearch
+        // never silently breaks.
+        let exa_key = self.api_key.as_deref();
+        let parallel_key = std::env::var("PARALLEL_API_KEY").ok();
+        let parallel_key = parallel_key.as_deref().filter(|k| !k.is_empty());
+
+        let primary_result = call_provider(&client, primary, exa_key, parallel_key, &args).await;
+        if let Ok(text) = primary_result {
+            return Ok(text);
+        }
+        let primary_err = primary_result.unwrap_err();
+
+        let secondary_result =
+            call_provider(&client, secondary, exa_key, parallel_key, &args).await;
+        if let Ok(text) = secondary_result {
+            return Ok(text);
+        }
+
+        // Both upstreams failed → DDG. If even DDG errors, return
+        // the original primary failure for diagnosis.
+        match duckduckgo_search(&client, &args).await {
             Ok(text) => Ok(text),
-            Err(primary_err) => match duckduckgo_search(&client, &args).await {
-                Ok(text) => Ok(text),
-                Err(_) => Err(primary_err),
-            },
+            Err(_) => Err(primary_err),
+        }
+    }
+}
+
+/// Backend provider for a single websearch call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Exa,
+    Parallel,
+}
+
+/// One-shot dispatch: pick the right MCP endpoint + tool name + args
+/// shape for the chosen provider. Centralises the per-call branch so
+/// the primary/secondary retry in `call()` doesn't duplicate logic.
+async fn call_provider(
+    client: &reqwest::Client,
+    provider: Provider,
+    exa_key: Option<&str>,
+    parallel_key: Option<&str>,
+    args: &WebSearchArgs,
+) -> Result<String, ToolError> {
+    match provider {
+        Provider::Exa => exa_mcp_search(client, exa_key, args).await,
+        Provider::Parallel => parallel_mcp_search(client, parallel_key, args).await,
+    }
+}
+
+/// Pick a primary provider for this process. Honours
+/// `DIRGE_WEBSEARCH_PROVIDER=exa|parallel` env override; otherwise
+/// initialises ONCE per process with a 50/50 random choice. The
+/// once-init avoids flipping providers between turns — a user
+/// observing consistent results across queries reads cleaner than
+/// silent alternation.
+fn selected_provider() -> Provider {
+    if let Ok(env) = std::env::var("DIRGE_WEBSEARCH_PROVIDER") {
+        match env.to_ascii_lowercase().as_str() {
+            "exa" => return Provider::Exa,
+            "parallel" => return Provider::Parallel,
+            _ => {} // unknown value — fall through to random
+        }
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CHOSEN: AtomicU8 = AtomicU8::new(0); // 0 = uninit, 1 = exa, 2 = parallel
+    match CHOSEN.load(Ordering::Acquire) {
+        1 => Provider::Exa,
+        2 => Provider::Parallel,
+        _ => {
+            // Pick using process+time-derived entropy. We don't pull
+            // in `rand` for this — a one-shot 50/50 from the nanos
+            // is sufficient and zero-dep.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let pick = if nanos & 1 == 0 {
+                Provider::Exa
+            } else {
+                Provider::Parallel
+            };
+            CHOSEN.store(
+                match pick {
+                    Provider::Exa => 1,
+                    Provider::Parallel => 2,
+                },
+                Ordering::Release,
+            );
+            pick
         }
     }
 }
@@ -192,6 +285,67 @@ async fn exa_mcp_search(
 
     parse_mcp_response(&body)
         .ok_or_else(|| ToolError::Msg("websearch: no parseable result in MCP response".to_string()))
+}
+
+/// Hit Parallel.ai's hosted MCP endpoint over plain HTTP. Mirrors
+/// the second backend opencode rotates to. POSTs a JSON-RPC
+/// `tools/call` envelope for `web_search` to
+/// `https://search.parallel.ai/mcp`. Accepts an optional
+/// `PARALLEL_API_KEY` as a Bearer auth header for higher rate
+/// limits; unauthenticated calls are accepted at a lower rate.
+///
+/// Argument shape is DIFFERENT from Exa — Parallel wants
+/// `objective` + `search_queries[]` rather than `query`. We pass
+/// the same string for both fields so the call is equivalent.
+async fn parallel_mcp_search(
+    client: &reqwest::Client,
+    api_key: Option<&str>,
+    args: &WebSearchArgs,
+) -> Result<String, ToolError> {
+    let envelope = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "web_search",
+            "arguments": {
+                "objective": args.query,
+                "search_queries": [args.query],
+            }
+        }
+    });
+
+    let mut req = client
+        .post("https://search.parallel.ai/mcp")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "dirge-agent/1.0")
+        .json(&envelope);
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch (parallel) request failed: {}", e)))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch (parallel) read failed: {}", e)))?;
+    if !status.is_success() {
+        return Err(ToolError::Msg(format!(
+            "websearch (parallel) returned {}: {}",
+            status.as_u16(),
+            &body.chars().take(300).collect::<String>()
+        )));
+    }
+
+    parse_mcp_response(&body).ok_or_else(|| {
+        ToolError::Msg("websearch (parallel): no parseable result in MCP response".to_string())
+    })
 }
 
 /// Parse an MCP `tools/call` response. The server may return:
