@@ -31,6 +31,7 @@ pub mod result;
 pub mod rig_stream;
 pub mod rig_tool;
 pub mod run;
+pub mod steering;
 pub mod stream;
 pub mod tool;
 pub mod tools;
@@ -52,6 +53,7 @@ pub use result::{AfterToolCallResult, BeforeToolCallResult, LoopToolResult};
 pub use rig_stream::{wrap_rig_stream, wrap_streamed_assistant};
 pub use rig_tool::RigToolAdapter;
 pub use run::{LoopError, run_agent_loop, run_agent_loop_continue, run_loop};
+pub use steering::{steering_from_queue, steering_from_queue_with_sanitizer};
 pub use stream::{LlmContext, StreamFn, stream_assistant_response};
 pub use tool::LoopTool;
 pub use tools::{
