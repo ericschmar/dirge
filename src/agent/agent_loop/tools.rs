@@ -279,10 +279,48 @@ async fn execute_prepared_tool_call(
         });
     });
 
-    match tool
-        .execute(&tool_call.id, args.clone(), signal.clone(), on_update)
-        .await
-    {
+    // Phase 6 — make the tool dispatch responsive to
+    // `AbortSignal` even when the underlying tool doesn't
+    // poll the signal itself. We race the tool's execute()
+    // against a signal-poll loop:
+    //   - If the tool finishes first → use its result.
+    //   - If the signal fires first → return an aborted
+    //     result. The tool's future is dropped, which
+    //     stops further poll progress. Side effects already
+    //     run (e.g. an in-flight bash process) are NOT
+    //     killed — the rig::Tool surface doesn't expose
+    //     cancellation, and forcing a kill would risk
+    //     orphaned state. The dropped future may continue
+    //     scheduling work in the background; consumers
+    //     should not rely on its absence.
+    //
+    // This gives the loop UX responsive to Ctrl+C even with
+    // legacy tools that don't poll the signal. Tools that
+    // DO poll it (a future generation of LoopTool impls)
+    // get cleaner cancellation since they finish quickly
+    // when cancelled.
+    let exec_future = tool.execute(&tool_call.id, args.clone(), signal.clone(), on_update);
+    let signal_check = wait_for_cancel(signal.clone());
+
+    let outcome = tokio::select! {
+        biased;  // Prefer the cancel branch when both are ready
+                 // — so a cancel that fires during a fast tool
+                 // doesn't get masked by the tool's completion.
+        _ = signal_check => {
+            // Signal fired before the tool finished. Return an
+            // aborted result; the loop's next signal check at
+            // its turn boundary will exit cleanly.
+            return ExecutedOutcome {
+                result: create_error_tool_result(
+                    "tool execution aborted by cancellation signal",
+                ),
+                is_error: true,
+            };
+        }
+        result = exec_future => result,
+    };
+
+    match outcome {
         Ok(result) => ExecutedOutcome {
             result,
             is_error: false,
@@ -357,6 +395,25 @@ fn should_terminate_tool_batch(finalized: &[FinalizedOutcome]) -> bool {
         && finalized
             .iter()
             .all(|f| f.result.terminate.unwrap_or(false))
+}
+
+/// Wait for an `AbortSignal` to fire. Polls at 50ms intervals
+/// since `AbortSignal` doesn't expose an async-await primitive
+/// (it's an `Arc<AtomicBool>` wrapper). 50ms gives a snappy UX
+/// (user-perceptible Ctrl+C response) without busy-looping.
+///
+/// Returns when the signal is cancelled. The caller races this
+/// future against the tool's execute() in a `tokio::select!`.
+/// Cancellation of the wait future is automatic when the
+/// select arm doesn't win — `tokio::time::sleep` is
+/// abort-on-drop, and the `is_cancelled()` check is cheap.
+async fn wait_for_cancel(signal: AbortSignal) {
+    loop {
+        if signal.is_cancelled() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Build the "tool not found" / "operation aborted" / "blocked"
@@ -1592,5 +1649,118 @@ mod tests {
             tool_result_ids,
             vec!["tool-1".to_string(), "tool-2".to_string()]
         );
+    }
+
+    // ============================================================
+    // Phase 6 — abort signal awareness during tool execution
+    // ============================================================
+
+    /// A `LoopTool` that blocks for a configurable duration
+    /// without polling the signal. Simulates a legacy tool
+    /// (e.g. bash, web fetch) that the agent_loop wraps via
+    /// `RigToolAdapter` and that doesn't natively support
+    /// cancellation.
+    #[derive(Debug)]
+    struct BlockingTool {
+        delay: std::time::Duration,
+    }
+
+    impl LoopTool for BlockingTool {
+        fn name(&self) -> &str {
+            "block"
+        }
+        fn description(&self) -> &str {
+            "Blocks for a fixed duration without polling signal."
+        }
+        fn label(&self) -> &str {
+            "Block"
+        }
+        fn parameters(&self) -> &Value {
+            static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            _args: Value,
+            _signal: AbortSignal, // intentionally NOT polled
+            _on_update: LoopToolUpdate,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>>
+        {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(LoopToolResult {
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": "completed",
+                    })],
+                    details: Value::Null,
+                    terminate: None,
+                })
+            })
+        }
+    }
+
+    /// Phase 6 regression: a tool that doesn't poll the abort
+    /// signal STILL gets cancelled when the dispatcher's
+    /// `tokio::select!` observes the signal first. The tool's
+    /// future is dropped; the dispatched returns an "aborted"
+    /// error result so the loop can continue (or exit) cleanly.
+    ///
+    /// Without the select wrap, a long-running tool would block
+    /// the loop until completion regardless of signal state —
+    /// Ctrl+C would feel unresponsive.
+    #[tokio::test]
+    async fn aborted_tool_returns_aborted_error_promptly() {
+        let blocking = Arc::new(BlockingTool {
+            // 10s — far longer than the test should take if abort
+            // works. If select doesn't honor the signal, the test
+            // either hangs or finishes in 10s.
+            delay: std::time::Duration::from_secs(10),
+        });
+        let mut ctx = Context::default();
+        ctx.tools.push(blocking.clone());
+        let signal = AbortSignal::new();
+        // Cancel BEFORE the dispatch starts — the select's
+        // signal-poll arm should win immediately.
+        signal.cancel();
+        let calls = vec![ToolCall {
+            id: "tc-1".to_string(),
+            name: "block".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let assistant = AssistantMessage::new(
+            calls
+                .iter()
+                .map(|c| ContentBlock::ToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                })
+                .collect(),
+            StopReason::ToolUse,
+        );
+        let cfg = build_config();
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+        let started = std::time::Instant::now();
+        let batch =
+            execute_tool_calls_sequential(&ctx, &assistant, &calls, &cfg, &signal, &tx).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "expected near-instant abort; elapsed {elapsed:?}"
+        );
+        assert_eq!(batch.messages.len(), 1);
+        let block = &batch.messages[0].content[0];
+        let text = match block {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected Text block; got {other:?}"),
+        };
+        assert!(
+            text.contains("aborted"),
+            "expected aborted message; got: {text:?}"
+        );
+        assert!(batch.messages[0].is_error);
     }
 }

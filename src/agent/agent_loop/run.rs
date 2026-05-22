@@ -1104,4 +1104,217 @@ mod tests {
             .count();
         assert_eq!(user_message_ends, 0);
     }
+
+    // ============================================================
+    // Phase 6 — regression tests for hardening paths
+    // ============================================================
+
+    use crate::agent::agent_loop::result::LoopToolResult as PhaseSixToolResult;
+    use std::sync::Arc as PhaseSixArc;
+
+    /// Phase 6: a multi-turn run with a network error in turn 2
+    /// preserves the FULL history (user prompt, turn 1's
+    /// assistant + tool-result) across the retry. The retry
+    /// wrapper isn't directly invoked here (we use mock
+    /// StreamFn), but the LOOP's context.messages survival
+    /// across turn errors is the invariant.
+    ///
+    /// We verify by counting context.messages entries the
+    /// second LLM call observes. The mock StreamFn captures
+    /// what each call sees.
+    #[tokio::test]
+    async fn loop_preserves_history_across_turns() {
+        use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let observed_lens: PhaseSixArc<Mutex<Vec<usize>>> =
+            PhaseSixArc::new(Mutex::new(Vec::new()));
+        let observed_clone = observed_lens.clone();
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Inline echo tool — needed for the tool-result turn
+        // that grows the history.
+        #[derive(Debug)]
+        struct LocalEcho;
+        impl LoopTool for LocalEcho {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "Echo"
+            }
+            fn label(&self) -> &str {
+                "Echo"
+            }
+            fn parameters(&self) -> &Value {
+                static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _id: &'a str,
+                _args: Value,
+                _signal: AbortSignal,
+                _on_update: super::super::tool::LoopToolUpdate,
+            ) -> Pin<Box<dyn Future<Output = Result<PhaseSixToolResult, String>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    Ok(PhaseSixToolResult {
+                        content: vec![serde_json::json!({
+                            "type": "text",
+                            "text": "ok",
+                        })],
+                        details: Value::Null,
+                        terminate: None,
+                    })
+                })
+            }
+        }
+
+        let factory: StreamFn = std::sync::Arc::new(move |ctx: LlmContext, _opts| {
+            observed_clone.lock().unwrap().push(ctx.messages.len());
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let msg = if n == 0 {
+                tool_use_response("call-1", "echo", serde_json::json!({}))
+            } else {
+                text_response("done")
+            };
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![
+                crate::agent::agent_loop::message::StreamEvent::Done {
+                    reason,
+                    message: msg,
+                },
+            ]))
+        });
+
+        let mut ctx = empty_context();
+        ctx.tools.push(PhaseSixArc::new(LocalEcho));
+        let mut cfg = build_config();
+        cfg.tool_execution = ToolExecutionMode::Sequential;
+
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+        let _ = run_agent_loop(
+            vec![user("start")],
+            ctx,
+            cfg,
+            AbortSignal::new(),
+            &tx,
+            &factory,
+        )
+        .await;
+
+        let lens = observed_lens.lock().unwrap().clone();
+        assert_eq!(lens.len(), 2, "expected two LLM calls");
+        // First call sees: just user prompt → 1 message.
+        assert_eq!(lens[0], 1);
+        // Second call sees: user prompt + assistant (tool_use) +
+        // tool result → 3 messages. History preserved.
+        assert_eq!(
+            lens[1], 3,
+            "second LLM call should see prior turn's history; got {} messages",
+            lens[1],
+        );
+    }
+
+    /// Phase 6: full signal-chain regression. Cancel the signal
+    /// mid-tool; tool aborts; loop's next LLM call's stream
+    /// observes the same signal and exits via Error path; loop
+    /// exits cleanly with no infinite-loop or hung tools.
+    #[tokio::test]
+    async fn full_signal_chain_exits_cleanly() {
+        use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Mock tool that observes the signal during execution
+        // (immediate cancel since the test cancels signal right
+        // after spawn).
+        #[derive(Debug)]
+        struct CancellableTool;
+        impl LoopTool for CancellableTool {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn description(&self) -> &str {
+                "Cancellable"
+            }
+            fn label(&self) -> &str {
+                "Noop"
+            }
+            fn parameters(&self) -> &Value {
+                static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _id: &'a str,
+                _args: Value,
+                _signal: AbortSignal,
+                _on_update: super::super::tool::LoopToolUpdate,
+            ) -> Pin<Box<dyn Future<Output = Result<PhaseSixToolResult, String>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    Ok(PhaseSixToolResult {
+                        content: Vec::new(),
+                        details: Value::Null,
+                        terminate: None,
+                    })
+                })
+            }
+        }
+
+        // Factory that returns a tool_use response first,
+        // then would return a text response on retry (but
+        // shouldn't get there because signal is cancelled
+        // before turn 2).
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let factory: StreamFn = std::sync::Arc::new(move |_ctx: LlmContext, _opts| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let msg = if n == 0 {
+                tool_use_response("call-1", "noop", serde_json::json!({}))
+            } else {
+                text_response("should-not-reach")
+            };
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![
+                crate::agent::agent_loop::message::StreamEvent::Done {
+                    reason,
+                    message: msg,
+                },
+            ]))
+        });
+
+        let mut ctx = empty_context();
+        ctx.tools.push(PhaseSixArc::new(CancellableTool));
+        let mut cfg = build_config();
+        cfg.tool_execution = ToolExecutionMode::Sequential;
+
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+        let signal = AbortSignal::new();
+        let signal_clone = signal.clone();
+
+        // Spawn the loop in a task; cancel signal after a small
+        // yield so the tool has started.
+        let task = tokio::spawn(async move {
+            run_agent_loop(vec![user("start")], ctx, cfg, signal_clone, &tx, &factory).await
+        });
+        // Yield twice so the loop reaches the tool dispatch
+        // before we cancel.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        signal.cancel();
+
+        // Bound the test: loop must complete in <2s. Without
+        // the tool-abort wrap, the 30s blocking tool would
+        // exceed this. R3 ensures the next LLM call (if any)
+        // also exits promptly via its pre-poll signal check.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        assert!(
+            result.is_ok(),
+            "loop should exit within 2s after signal cancel"
+        );
+    }
 }
