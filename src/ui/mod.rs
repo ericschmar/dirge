@@ -3520,6 +3520,20 @@ pub async fn run_interactive(
                     renderer.write_line("", Color::White)?;
                     agent_line_started = false;
                 }
+                // Close any open tool chamber FIRST so the lifecycle
+                // trailer doesn't land between the chamber TOP and
+                // its body — the same shape of bug fixed earlier
+                // for permission alerts + `allowed …` confirmation
+                // lines. A `task` ToolCall paints the chamber TOP,
+                // the background runner fires `LifecycleEvent::
+                // Started` almost immediately, and without this
+                // close the `[task abcd1234 started]` row appeared
+                // INSIDE the open chamber rather than after it.
+                close_tool_chamber_if_open(
+                    &mut renderer,
+                    &mut last_tool_name,
+                    &mut tool_chamber_open,
+                )?;
                 renderer.write_line(&label, resolve_color(color, cli.no_color))?;
                 renderer.render_viewport()?;
                 renderer.draw_bottom(
