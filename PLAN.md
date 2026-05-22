@@ -308,22 +308,153 @@ phase 4.5 (separate commit) after baking.
 
 ---
 
-### Phase 4.5 — Flip default to new-loop
+### Phase 4.5 — Integration: rig + dirge consumers → ported loop
 
-**Goal**: remove the feature gate; new-loop is the only path. Delete
-the old rig-multi-turn consumer code.
+**SCOPE CORRECTION**: The original 4.5 was wildly underscoped as
+"delete the old path." Flipping the default is actually a multi-
+commit integration project — the new loop currently works only
+with mock streams + mock tools. Sub-divided below.
+
+Each sub-phase ships green builds + green tests + a concrete
+integration validation. Order is roughly dependency-ordered;
+later ones can interleave once their inputs land.
+
+#### 4.5a — rig → StreamFn adapter
+
+**Goal**: build a `StreamFn` that wraps rig's single-turn API
+(`agent.prompt(history)` or equivalent) so the loop can drive a
+real LLM. This is the "physical layer" — without it the loop is
+a beautiful algorithm with nothing to talk to.
 
 **Files**:
-- `src/agent/runner.rs` — strip the old path; rename
-  `run_stream_with_retries` to call the new path unconditionally
-- `Cargo.toml` — remove the `new-loop` feature
+- `src/agent/agent_loop/rig_stream.rs` (new) — `rig_stream_fn`
+  factory taking a rig agent and producing a `StreamFn`
 
-**Tests**: the whole existing test suite still passes through the new
-path. No new tests; this is a deletion commit.
+**Tests**: integration test that calls a stubbed rig provider
+through the adapter. Doesn't need a real network — rig has its
+own mock fixtures.
 
-**Risk**: medium. Anything subtle the existing path handled (recovery
-edge cases, plugin-hook timing) must already work under new-loop.
-Phase 6 is the hardening pass.
+**Risk**: medium. Rig's stream-event vocabulary needs mapping
+to our `StreamEvent` enum. Tool-call extraction is subtle.
+
+#### 4.5b — rig::Tool → LoopTool adapter
+
+**Goal**: a generic wrapper that takes any `Box<dyn rig::Tool>` and
+implements `LoopTool` on it. Every dirge tool (read / write / edit /
+bash / grep / find_files / list_dir / apply_patch / semantic_* /
+mcp_* / skill) gets a LoopTool surface for free.
+
+**Files**:
+- `src/agent/agent_loop/rig_tool.rs` (new) — `RigToolAdapter` struct
+  + impl
+- `src/agent/builder.rs` — alongside the existing `Vec<Box<dyn
+  rig::ToolDyn>>` build, also produce `Vec<Arc<dyn LoopTool>>`
+  via the adapter
+
+**Tests**: wrap a real dirge tool (e.g. `read`), execute through
+the LoopTool surface, verify identical output to the rig path.
+
+**Risk**: medium. rig::Tool's args/output types are generic;
+LoopTool uses `Value`. The adapter does the serde round-trip.
+
+#### 4.5c — LoopEvent → AgentEvent translation
+
+**Goal**: bridge the loop's event vocabulary to dirge's existing
+`AgentEvent`. The UI and ACP consume `AgentEvent`; until we
+replace those, we translate at the boundary.
+
+**Files**:
+- `src/agent/agent_loop/bridge.rs` (new) — `translate_event(LoopEvent)
+  -> Vec<AgentEvent>` (Vec because some pi events split into multiple
+  dirge events — `MessageUpdate` with `phase=TextDelta` → `Token`)
+
+**Tests**: round-trip every LoopEvent variant; assert the
+AgentEvent stream matches what the old runner emits for an
+equivalent algorithmic input.
+
+**Risk**: low. Pure data translation. Easy to verify.
+
+#### 4.5d — Plugin slots → before/after tool hooks
+
+**Goal**: dirge's existing plugin hooks (`harness/block`,
+`harness/mutate-input`, `harness/replace-result`) become
+`BeforeToolCallFn` / `AfterToolCallFn` closures consumed by the loop.
+
+**Files**:
+- `src/agent/agent_loop/plugin_hooks.rs` (new) — factory functions
+  `before_hook_from_plugin_manager(&PluginManager) -> BeforeToolCallFn`
+  etc.
+
+**Tests**: install a Janet plugin that mutates args; verify the
+tool sees mutated args end-to-end through the loop.
+
+**Risk**: medium. Plugin hooks fire from async closures; the
+PluginManager's locking pattern needs verification.
+
+#### 4.5e — interjection_queue → getSteeringMessages
+
+**Goal**: dirge's existing `interjection_queue` (in `ui/mod.rs`)
+becomes the source for `GetSteeringMessagesFn`.
+
+**Files**:
+- `src/agent/agent_loop/steering.rs` (new) — factory that takes a
+  shared `Arc<Mutex<VecDeque<String>>>` and produces a
+  `GetSteeringMessagesFn`
+
+**Tests**: enqueue messages, run a loop, verify they're injected at
+the next turn boundary.
+
+**Risk**: low.
+
+#### 4.5f — runner.rs replacement (BEHIND a flag)
+
+**Goal**: add a `--use-agent-loop` CLI flag (or config option) that
+routes a run through the new loop instead of the rig multi-turn
+stream. Both paths coexist; default is still the old path.
+
+**Files**:
+- `src/agent/runner.rs` — branch on the flag; dispatch to either
+  `spawn_runner` (existing) or a new `spawn_runner_via_loop` that
+  composes 4.5a + 4.5b + 4.5c + 4.5d + 4.5e
+
+**Tests**: integration test that runs a multi-turn session through
+the new path; assert identical observable behavior (event stream
+matches) for a canned scenario.
+
+**Risk**: high. First time the new loop touches real dirge state.
+Expected edge cases: agent_line_started state, chamber rendering,
+permission check signal threading.
+
+#### 4.5g — Recovery / retry under the new path
+
+**Goal**: wrap each `stream_assistant_response` call with the existing
+`recovery::classify_error` + Retry-After backoff. Verify auto-compact
+on `ContextOverflow` works.
+
+**Files**:
+- `src/agent/agent_loop/retry.rs` (new) — `retrying_stream_fn` wrapper
+  that intercepts errors and retries with the recovery policy
+
+**Tests**: simulate a network error mid-turn; verify retry happens.
+
+**Risk**: medium.
+
+#### 4.5h — Flip default; delete old path
+
+**Goal**: make the new loop the only path. Delete the old
+rig-multi-turn consumer code. This is the ORIGINAL 4.5 description
+— but it now lands AFTER everything above proves the new path works.
+
+**Files**:
+- `src/agent/runner.rs` — strip the rig multi-turn path
+- `Cargo.toml` — remove the `agent-loop` feature flag
+- `src/agent/agent_loop/mod.rs` — remove the `#![allow(dead_code)]`
+  + `#![allow(unused_imports)]` module-level allows
+
+**Tests**: all 724+ default tests still pass.
+
+**Risk**: medium. Deletion. Anything subtle that survived 4.5a-g
+should now be the ONLY behavior.
 
 ---
 
