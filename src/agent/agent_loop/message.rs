@@ -1,0 +1,320 @@
+//! Assistant message + stream event types.
+//!
+//! Ports of pi's message + stream-event vocabulary at the boundary
+//! between the LLM stream function and the agent loop. Faithful
+//! to pi's discriminated unions; field names follow Rust conventions
+//! (snake_case) with serde `rename_all = "camelCase"` where the wire
+//! format is pi's TypeScript camelCase.
+//!
+//! Pi references:
+//!   - `AssistantMessage` / `Message` shape from `@earendil-works/pi-ai`
+//!     (used throughout agent-loop.ts)
+//!   - `AssistantMessageEvent` discriminated union (consumed in
+//!     agent-loop.ts:313-356 switch)
+//!
+//! Phase 1 ports the MINIMAL surface needed for the three tests at
+//! pi/test/agent-loop.test.ts:84,131,186. Fields irrelevant to
+//! those tests (usage, api, provider, timestamp metadata) are
+//! deferred to later phases that actually consume them.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Why the assistant turn ended. Port of pi's
+/// `AssistantMessage.stopReason` literal union. Pi's exact
+/// vocabulary (`"stop" | "toolUse" | "length" | "error" |
+/// "aborted"`) preserved as Rust enum variants with camelCase
+/// serde rename to match pi's wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopReason {
+    /// Natural end of the assistant response (no tool calls
+    /// pending, no length cap hit).
+    Stop,
+    /// Model requested one or more tool calls; the loop will
+    /// dispatch them and continue.
+    ToolUse,
+    /// Hit `maxTokens` mid-response.
+    Length,
+    /// Provider-side error.
+    Error,
+    /// User-side abort signal (Ctrl+C, /quit, Esc-Esc).
+    Aborted,
+}
+
+/// One block of content in an `AssistantMessage`. Port of pi's
+/// `AssistantMessage.content` block types — text, thinking, and
+/// toolCall are the three pi recognizes (`agent-loop.ts:203`).
+///
+/// `arguments` on the ToolCall variant is `serde_json::Value`
+/// rather than pi's typed `Static<TParameters>` because the loop
+/// handles tools generically — schema validation happens at
+/// dispatch time (`prepareToolCall` / `validateToolArguments`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+}
+
+/// Final assistant message returned by `stream_assistant_response`.
+///
+/// Port of pi `AssistantMessage` (used throughout agent-loop.ts).
+/// Phase 1 keeps only the fields the three ported tests touch:
+/// `content`, `stop_reason`, `error_message`. Later phases will
+/// add usage/provider/timestamp metadata as they're needed.
+///
+/// `role` is implicit (always `"assistant"` in pi's typed union);
+/// no need for a Rust field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssistantMessage {
+    pub content: Vec<ContentBlock>,
+    pub stop_reason: StopReason,
+    /// Set when `stop_reason == Error` or `Aborted`. None
+    /// otherwise.
+    pub error_message: Option<String>,
+}
+
+impl AssistantMessage {
+    pub fn new(content: Vec<ContentBlock>, stop_reason: StopReason) -> Self {
+        Self {
+            content,
+            stop_reason,
+            error_message: None,
+        }
+    }
+
+    /// Iterate just the toolCall blocks. Used by the loop's
+    /// `executeToolCalls` site (agent-loop.ts:203:
+    /// `message.content.filter((c) => c.type === "toolCall")`).
+    pub fn tool_calls(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
+        self.content.iter().filter_map(|b| match b {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id.as_str(), name.as_str(), arguments)),
+            _ => None,
+        })
+    }
+}
+
+/// One event from the LLM stream function. Port of pi's
+/// `AssistantMessageEvent` discriminated union (consumed in
+/// agent-loop.ts:313-356).
+///
+/// Each non-terminal variant (`*Start`/`*Delta`/`*End`) carries
+/// the running `partial` message — pi pushes the partial into
+/// `context.messages` at `Start` and replaces the last context
+/// entry on each subsequent variant. We carry the partial by
+/// value (clones on each emission); in the hot path a future
+/// optimization could box it.
+///
+/// `Done` and `Error` are terminal — the stream emits one and
+/// then closes. `streamAssistantResponse` returns the final
+/// message on either.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Stream opened; `partial` is the empty-content starting
+    /// shape with role/api/provider metadata already populated
+    /// by the provider adapter.
+    Start { partial: AssistantMessage },
+
+    /// One of the streaming-content lifecycle ticks. Pi has 9
+    /// variants in three families (text/thinking/toolcall) ×
+    /// (start/delta/end). We collapse those to one variant
+    /// carrying a `phase` discriminator so the consumer's match
+    /// is flat. The dispatcher in `stream_assistant_response`
+    /// treats all 9 identically anyway (just updates the partial
+    /// and emits a `MessageUpdate` event).
+    Delta {
+        partial: AssistantMessage,
+        phase: DeltaPhase,
+    },
+
+    /// Terminal: stream ended naturally with a final assistant
+    /// message. Pi field `{ reason, message }`.
+    Done {
+        reason: StopReason,
+        message: AssistantMessage,
+    },
+
+    /// Terminal: stream ended with a provider-side error.
+    Error { error: String },
+}
+
+/// Sub-discriminator for `StreamEvent::Delta`. Mirrors pi's nine
+/// individual variants in a compact form. The pi-faithful order
+/// (text → thinking → toolcall, each in start/delta/end order)
+/// is preserved so a side-by-side reader can spot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaPhase {
+    TextStart,
+    TextDelta,
+    TextEnd,
+    ThinkingStart,
+    ThinkingDelta,
+    ThinkingEnd,
+    ToolCallStart,
+    ToolCallDelta,
+    ToolCallEnd,
+}
+
+/// Events the agent loop emits to consumers. Port of pi's
+/// `AgentEvent` (types.ts:403). Phase 1 introduces only the
+/// `message_*` family that `stream_assistant_response` produces;
+/// turn / agent / tool-execution events come in later phases.
+///
+/// Naming: pi uses `message_start` / `message_end` / `message_update`
+/// — those map to `MessageStart` / `MessageEnd` / `MessageUpdate`
+/// here, with serde rename for wire-format parity.
+/// Pi's `AgentEvent` is plain JSON-serializable in TypeScript;
+/// here we keep `LoopEvent` as a Rust-only enum. The fields hold
+/// in-memory `AssistantMessage` instances, not their JSON form,
+/// so consumers (UI / ACP) get the structured types directly.
+/// Wire-format serialization isn't needed yet — phase 6 will add
+/// it if cross-process loop hosting becomes a thing.
+#[derive(Debug, Clone)]
+pub enum LoopEvent {
+    /// A new message has appeared in the transcript. Pi field
+    /// `{ message: AgentMessage }`.
+    MessageStart { message: AssistantMessage },
+
+    /// A streaming message has advanced. Pi carries the stream
+    /// event alongside the updated message; phase 1 carries the
+    /// `phase` discriminator instead (the consumer rarely needs
+    /// the raw stream event).
+    MessageUpdate {
+        message: AssistantMessage,
+        phase: DeltaPhase,
+    },
+
+    /// A message has finalized (stream emitted `done` or `error`).
+    MessageEnd { message: AssistantMessage },
+}
+
+impl LoopEvent {
+    /// Quick discriminant string for tests (`"message_start"`,
+    /// etc.) without going through serde. Lets the phase-1
+    /// ported tests assert event sequences cheaply.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            LoopEvent::MessageStart { .. } => "message_start",
+            LoopEvent::MessageUpdate { .. } => "message_update",
+            LoopEvent::MessageEnd { .. } => "message_end",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `StopReason` round-trips at pi's exact wire format.
+    /// `ToolUse` is camelCase (one word in wire form). Caught
+    /// here so a future enum reshuffle can't break ACP / external
+    /// consumers.
+    #[test]
+    fn stop_reason_wire_format() {
+        for (variant, wire) in [
+            (StopReason::Stop, "\"stop\""),
+            (StopReason::ToolUse, "\"toolUse\""),
+            (StopReason::Length, "\"length\""),
+            (StopReason::Error, "\"error\""),
+            (StopReason::Aborted, "\"aborted\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<StopReason>(wire).unwrap(), variant);
+        }
+    }
+
+    /// `ContentBlock` uses `type` discriminator + camelCase. A
+    /// toolCall has fields nested under the variant.
+    #[test]
+    fn content_block_wire_format() {
+        let text = ContentBlock::Text {
+            text: "hi".to_string(),
+        };
+        let encoded = serde_json::to_string(&text).unwrap();
+        assert!(encoded.contains("\"type\":\"text\""), "got: {encoded}");
+
+        let tool = ContentBlock::ToolCall {
+            id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "/tmp/x"}),
+        };
+        let encoded = serde_json::to_string(&tool).unwrap();
+        assert!(encoded.contains("\"type\":\"toolCall\""), "got: {encoded}");
+        assert!(encoded.contains("\"id\":\"call_1\""));
+        assert!(encoded.contains("\"name\":\"read\""));
+    }
+
+    /// `AssistantMessage::tool_calls()` filters the toolCall
+    /// blocks and yields (id, name, args) tuples. Matches pi's
+    /// `message.content.filter((c) => c.type === "toolCall")`
+    /// at agent-loop.ts:203.
+    #[test]
+    fn assistant_message_tool_calls_iterator() {
+        let msg = AssistantMessage::new(
+            vec![
+                ContentBlock::Text {
+                    text: "thinking…".to_string(),
+                },
+                ContentBlock::ToolCall {
+                    id: "c1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                ContentBlock::Text {
+                    text: "more text".to_string(),
+                },
+                ContentBlock::ToolCall {
+                    id: "c2".to_string(),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({"path": "x"}),
+                },
+            ],
+            StopReason::ToolUse,
+        );
+        let calls: Vec<_> = msg.tool_calls().map(|(id, name, _)| (id, name)).collect();
+        assert_eq!(calls, vec![("c1", "read"), ("c2", "write")]);
+    }
+
+    /// `LoopEvent::kind()` returns the snake_case discriminator
+    /// pi tests compare against.
+    #[test]
+    fn loop_event_kind_strings() {
+        let empty = AssistantMessage::new(vec![], StopReason::Stop);
+        assert_eq!(
+            LoopEvent::MessageStart {
+                message: empty.clone()
+            }
+            .kind(),
+            "message_start"
+        );
+        assert_eq!(
+            LoopEvent::MessageEnd {
+                message: empty.clone()
+            }
+            .kind(),
+            "message_end"
+        );
+        assert_eq!(
+            LoopEvent::MessageUpdate {
+                message: empty,
+                phase: DeltaPhase::TextDelta,
+            }
+            .kind(),
+            "message_update"
+        );
+    }
+}

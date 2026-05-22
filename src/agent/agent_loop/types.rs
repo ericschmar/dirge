@@ -123,6 +123,116 @@ pub struct TurnUpdate {
     pub thinking_level: Option<ThinkingLevel>,
 }
 
+/// Loop configuration. Port of pi `AgentLoopConfig` (types.ts:135).
+///
+/// Phase 1 lands the subset of hooks `stream_assistant_response`
+/// consumes: `convert_to_llm` (required), `transform_context`
+/// (optional), `get_api_key` (optional), `api_key` (fallback).
+///
+/// Subsequent phases extend this struct with `prepare_next_turn`,
+/// `should_stop_after_turn`, `get_steering_messages`,
+/// `get_followup_messages`, `before_tool_call`, `after_tool_call`.
+/// The struct is intentionally non-exhaustive at this stage —
+/// builders / constructors will land alongside the hooks that
+/// need them.
+///
+/// The hook closures are stored as `Arc<dyn Fn …>` so the struct
+/// stays `Clone` (loops re-clone the config across retry
+/// boundaries) and so the same hook can be installed in multiple
+/// places without ownership games. Async hooks return
+/// `Pin<Box<dyn Future>>` for the same dyn-compatibility reason
+/// `LoopTool` does (no `async_trait` dep).
+pub struct LoopConfig {
+    /// Required. Port of pi `convertToLlm` (types.ts:164).
+    /// Maps the agent-level transcript to the LLM-compatible
+    /// shape. Phase 1's placeholder type uses `Vec<Value>` →
+    /// `Vec<Value>`; phase 4 will substitute typed messages.
+    ///
+    /// Pi contract: "must not throw or reject. Return a safe
+    /// fallback value instead." We mirror this by NOT making the
+    /// hook fallible; callers convert their errors to a sentinel
+    /// value (e.g. empty Vec) themselves.
+    pub convert_to_llm: ConvertToLlmFn,
+
+    /// Optional. Port of pi `transformContext?` (types.ts:186).
+    /// Runs BEFORE `convertToLlm` to give the caller a chance
+    /// to prune / rewrite at the AgentMessage level (context
+    /// window management). Same no-throw contract as
+    /// `convertToLlm`.
+    pub transform_context: Option<TransformContextFn>,
+
+    /// Optional. Port of pi `getApiKey?` (types.ts:196).
+    /// Resolves an API key dynamically per request — useful for
+    /// short-lived OAuth tokens. `None` means "use `api_key`
+    /// fallback".
+    ///
+    /// Argument: provider name (pi: `config.model.provider`).
+    /// We pass the model identifier string for now;
+    /// phase 4 may substitute a richer model handle.
+    pub get_api_key: Option<GetApiKeyFn>,
+
+    /// Static API key fallback. Used when `get_api_key` is None
+    /// OR when `get_api_key` returns None. Pi field
+    /// `config.apiKey` (inherited from `SimpleStreamOptions`).
+    pub api_key: Option<String>,
+}
+
+/// `convertToLlm` signature. Synchronous in pi (returns
+/// `Message[] | Promise<Message[]>` — we narrow to sync here
+/// since the typical implementation is pure filter/map and the
+/// async case can be polyfilled by awaiting inside the closure
+/// before returning).
+///
+/// Phase 4 may relax to async once a real async caller emerges.
+pub type ConvertToLlmFn =
+    std::sync::Arc<dyn Fn(&[serde_json::Value]) -> Vec<serde_json::Value> + Send + Sync>;
+
+/// `transformContext` signature. Pi: `(messages, signal?) =>
+/// Promise<AgentMessage[]>`. We accept the signal but don't
+/// expose it to the closure in phase 1 — the signal-aware
+/// variant lands when a real transform implementation needs it.
+pub type TransformContextFn = std::sync::Arc<
+    dyn Fn(
+            Vec<serde_json::Value>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `getApiKey` signature. Pi: `(provider: string) =>
+/// Promise<string | undefined> | string | undefined`.
+pub type GetApiKeyFn = std::sync::Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for LoopConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopConfig")
+            .field("convert_to_llm", &"<fn>")
+            .field(
+                "transform_context",
+                &self.transform_context.as_ref().map(|_| "<fn>"),
+            )
+            .field("get_api_key", &self.get_api_key.as_ref().map(|_| "<fn>"))
+            .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+impl Clone for LoopConfig {
+    fn clone(&self) -> Self {
+        Self {
+            convert_to_llm: self.convert_to_llm.clone(),
+            transform_context: self.transform_context.clone(),
+            get_api_key: self.get_api_key.clone(),
+            api_key: self.api_key.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
