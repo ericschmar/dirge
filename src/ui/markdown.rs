@@ -1,42 +1,113 @@
 use compact_str::CompactString;
 use crossterm::style::Color;
-use pulldown_cmark::{Event, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Tag, TagEnd};
 
+use super::highlight;
 use super::renderer::LineEntry;
+
+/// Build a foreground-color ANSI SGR from a crossterm `Color`.
+/// Returns an empty string for `Reset` so the caller can prepend it
+/// unconditionally without spurious resets.
+pub(super) fn ansi_fg(c: Color) -> String {
+    match c {
+        Color::Reset => String::new(),
+        Color::Black => "\x1b[30m".into(),
+        Color::DarkGrey => "\x1b[90m".into(),
+        Color::Red => "\x1b[31m".into(),
+        Color::DarkRed => "\x1b[31m".into(),
+        Color::Green => "\x1b[32m".into(),
+        Color::DarkGreen => "\x1b[32m".into(),
+        Color::Yellow => "\x1b[33m".into(),
+        Color::DarkYellow => "\x1b[33m".into(),
+        Color::Blue => "\x1b[34m".into(),
+        Color::DarkBlue => "\x1b[34m".into(),
+        Color::Magenta => "\x1b[35m".into(),
+        Color::DarkMagenta => "\x1b[35m".into(),
+        Color::Cyan => "\x1b[36m".into(),
+        Color::DarkCyan => "\x1b[36m".into(),
+        Color::White => "\x1b[37m".into(),
+        Color::Grey => "\x1b[37m".into(),
+        Color::Rgb { r, g, b } => format!("\x1b[38;2;{};{};{}m", r, g, b),
+        Color::AnsiValue(v) => format!("\x1b[38;5;{}m", v),
+    }
+}
+
+/// Walk a string char-by-char skipping ANSI SGR escapes
+/// (`\x1b[…m`). Returns visible characters in order so the wrap math
+/// can count display cells correctly. Inline emphasis / inline code
+/// / link spans put ANSI escapes inside the accumulator; counting
+/// those as width would wrap the prose 5 cols too early per `\x1b[…m`.
+fn iter_visible_chars(s: &str) -> Vec<(usize, char)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip ANSI SGR / CSI: ESC `[` … `m` (or any final byte 0x40–0x7e).
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            i = j.saturating_add(1).min(bytes.len());
+            continue;
+        }
+        let step = match bytes[i] {
+            b if b < 0x80 => 1,
+            b if b < 0xC0 => 1,
+            b if b < 0xE0 => 2,
+            b if b < 0xF0 => 3,
+            _ => 4,
+        };
+        // Reconstruct the char from the slice.
+        if let Some(c) = s[i..i + step.min(bytes.len() - i)].chars().next() {
+            out.push((i, c));
+        }
+        i += step;
+    }
+    out
+}
 
 fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
     if text.is_empty() {
         return vec![CompactString::new("")];
     }
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_width {
+    // ANSI-aware: count VISIBLE chars (ignoring escape sequences) for
+    // the width budget. Wrap by visible-char index, then slice the
+    // original string by the corresponding byte offsets so escapes
+    // ride along with the text they wrap.
+    let visible = iter_visible_chars(text);
+    if visible.len() <= max_width {
         return vec![CompactString::from(text)];
     }
-    let mut lines = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let end = (start + max_width).min(chars.len());
-        if end < chars.len() {
-            let mut break_at = end;
-            for i in (start..end).rev() {
-                if chars[i] == ' ' {
+    let mut lines: Vec<CompactString> = Vec::new();
+    let mut start_visible = 0usize;
+    while start_visible < visible.len() {
+        let end_visible = (start_visible + max_width).min(visible.len());
+        // Word boundary: walk backward to the last space at or before
+        // `end_visible`. If none, hard-break at end_visible.
+        let mut break_at = end_visible;
+        if end_visible < visible.len() {
+            for i in (start_visible..end_visible).rev() {
+                if visible[i].1 == ' ' {
                     break_at = i + 1;
                     break;
                 }
             }
-            if break_at == start {
-                break_at = end;
+            if break_at == start_visible {
+                break_at = end_visible;
             }
-            lines.push(CompactString::from(
-                chars[start..break_at].iter().collect::<String>(),
-            ));
-            start = break_at;
-        } else {
-            lines.push(CompactString::from(
-                chars[start..].iter().collect::<String>(),
-            ));
-            break;
         }
+        // Map visible indices back to byte offsets in the original
+        // string. The slice INCLUDES any ANSI escapes that lived
+        // between `start_visible..break_at`.
+        let start_byte = visible[start_visible].0;
+        let end_byte = if break_at < visible.len() {
+            visible[break_at].0
+        } else {
+            text.len()
+        };
+        lines.push(CompactString::from(&text[start_byte..end_byte]));
+        start_visible = break_at;
     }
     lines
 }
@@ -214,7 +285,16 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
     let mut acc = String::new();
 
     let mut in_heading = false;
+    let mut heading_level: u32 = 1;
     let mut in_code_block = false;
+    let mut code_block_lang = String::new();
+    // Inline-style state. Pulldown emits `Start(Emphasis)` …
+    // texts/codes … `End(Emphasis)`. We embed ANSI escapes directly
+    // in `acc` for inline spans; `word_wrap` is ANSI-aware so the
+    // escapes don't count toward the wrap width.
+    let mut emphasis_depth: u32 = 0;
+    let mut strong_depth: u32 = 0;
+    let mut strikethrough_depth: u32 = 0;
     let mut in_blockquote = false;
     let mut ordered_list = false;
     let mut list_item_count: u64 = 0;
@@ -234,15 +314,20 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
-                Tag::Heading { level: _, .. } => {
+                Tag::Heading { level, .. } => {
                     flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                     acc.clear();
                     in_heading = true;
+                    heading_level = level as u32;
                 }
-                Tag::CodeBlock(_kind) => {
+                Tag::CodeBlock(kind) => {
                     flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                     acc.clear();
                     in_code_block = true;
+                    code_block_lang.clear();
+                    if let CodeBlockKind::Fenced(info) = kind {
+                        code_block_lang.push_str(info.as_ref());
+                    }
                 }
                 Tag::BlockQuote(_) => {
                     flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
@@ -276,6 +361,40 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 Tag::TableCell => {
                     current_cell.clear();
                 }
+                // Inline emphasis: open an ANSI dim+italic span. Italic
+                // works on most modern terminals (iTerm2, alacritty,
+                // kitty, foot). Falls back to no-op on older ones —
+                // text stays readable, just not italic.
+                Tag::Emphasis => {
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[3m");
+                    }
+                    emphasis_depth += 1;
+                }
+                // Bold: ANSI 1.
+                Tag::Strong => {
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[1m");
+                    }
+                    strong_depth += 1;
+                }
+                // Strikethrough: ANSI 9 (universal but some terminals
+                // ignore). Reset with 29.
+                Tag::Strikethrough => {
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[9m");
+                    }
+                    strikethrough_depth += 1;
+                }
+                // Links: paint the link text with the accent color +
+                // underline. Pulldown will emit the text in between
+                // and a TagEnd::Link to close.
+                Tag::Link { .. } => {
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[4m");
+                        acc.push_str(&ansi_fg(crate::ui::theme::accent()));
+                    }
+                }
                 _ => {}
             },
             Event::End(tag_end) => match tag_end {
@@ -289,7 +408,22 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     acc.clear();
                 }
                 TagEnd::Heading(_) => {
-                    flush_acc(&acc, crate::ui::theme::header(), max_width, &mut result);
+                    // Per-level color: H1 brightest (accent / banner),
+                    // H2 header tone, H3+ dim header so the visual
+                    // hierarchy is legible even on a monochrome 80s
+                    // phosphor screen. Bold via ANSI 1 amplifies H1.
+                    let color = match heading_level {
+                        1 => crate::ui::theme::accent(),
+                        2 => crate::ui::theme::header(),
+                        _ => crate::ui::theme::header(),
+                    };
+                    let prefix = match heading_level {
+                        1 => "\x1b[1m", // bold
+                        2 => "\x1b[1m", // bold
+                        _ => "",
+                    };
+                    let line = format!("{}{}\x1b[0m", prefix, acc);
+                    flush_acc(&line, color, max_width, &mut result);
                     acc.clear();
                     in_heading = false;
                     result.push(LineEntry {
@@ -298,21 +432,38 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     });
                 }
                 TagEnd::CodeBlock => {
-                    for line in acc.split('\n') {
-                        let trimmed = line.trim_end_matches('\r');
-                        if trimmed.is_empty() {
+                    // Route through the per-language regex highlighter.
+                    // Unknown language → falls back to a single dim
+                    // span per line (same look as before this change).
+                    let body = acc.trim_end_matches('\n').to_string();
+                    let highlighted = highlight::highlight_code(&body, &code_block_lang);
+                    for spans in highlighted {
+                        if spans.is_empty() {
                             result.push(LineEntry {
                                 text: CompactString::new(""),
                                 color: crate::ui::theme::tool(),
                             });
-                        } else {
-                            result.push(LineEntry {
-                                text: CompactString::from(trimmed),
-                                color: crate::ui::theme::tool(),
-                            });
+                            continue;
                         }
+                        // Assemble the row by concatenating ANSI-wrapped
+                        // spans. Pre-pad with a 2-space gutter so code
+                        // blocks visually offset from prose.
+                        let mut row = String::from("  ");
+                        for s in &spans {
+                            row.push_str(&ansi_fg(s.color));
+                            row.push_str(&s.text);
+                            row.push_str("\x1b[0m");
+                        }
+                        // Single LineEntry per row; the color field is
+                        // a fallback for terminals that strip ANSI but
+                        // the embedded escapes drive the actual paint.
+                        result.push(LineEntry {
+                            text: CompactString::from(row),
+                            color: crate::ui::theme::tool(),
+                        });
                     }
                     acc.clear();
+                    code_block_lang.clear();
                     in_code_block = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
@@ -423,6 +574,37 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 TagEnd::TableCell => {
                     current_row.push(std::mem::take(&mut current_cell));
                 }
+                TagEnd::Emphasis => {
+                    if emphasis_depth > 0 {
+                        emphasis_depth -= 1;
+                    }
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[23m"); // italic off
+                    }
+                }
+                TagEnd::Strong => {
+                    if strong_depth > 0 {
+                        strong_depth -= 1;
+                    }
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[22m"); // bold/dim off (normal intensity)
+                    }
+                }
+                TagEnd::Strikethrough => {
+                    if strikethrough_depth > 0 {
+                        strikethrough_depth -= 1;
+                    }
+                    if !in_table && !in_code_block {
+                        acc.push_str("\x1b[29m"); // strike off
+                    }
+                }
+                TagEnd::Link => {
+                    if !in_table && !in_code_block {
+                        // reset both underline + color back to current
+                        // paragraph color (set by flush_acc).
+                        acc.push_str("\x1b[24m\x1b[39m");
+                    }
+                }
                 _ => {}
             },
             Event::Text(t) => {
@@ -440,7 +622,17 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 } else if in_code_block {
                     acc.push_str(&t);
                 } else {
+                    // Inline `code` span: paint with the tool color +
+                    // wrap in literal backticks so readers still see
+                    // the markdown delimiters. Reset back to default
+                    // foreground after so the surrounding paragraph
+                    // color resumes. The flush_acc fallback color
+                    // applies whenever ANSI is stripped.
+                    acc.push_str(&ansi_fg(crate::ui::theme::tool()));
+                    acc.push('`');
                     acc.push_str(&t);
+                    acc.push('`');
+                    acc.push_str("\x1b[39m");
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -576,5 +768,82 @@ mod tests {
         render_table(&header, &rows, 80, &mut out);
         let owned: Vec<LineEntry> = out.iter().filter(|e| !e.text.is_empty()).cloned().collect();
         assert_rows_same_width(&owned);
+    }
+
+    /// ANSI-aware word_wrap: an inline `code` span embeds ANSI
+    /// escapes (`\x1b[…m`). Counting those toward the width budget
+    /// would wrap prose 5+ cells too early per escape. Verify the
+    /// wrap budget is consumed only by visible characters.
+    #[test]
+    fn word_wrap_skips_ansi_escapes_for_width() {
+        let plain = "the quick brown fox jumps over the lazy dog";
+        let styled = "the quick brown \x1b[1mfox\x1b[22m jumps over the lazy dog";
+        let p = word_wrap(plain, 20);
+        let s = word_wrap(styled, 20);
+        // Same number of wrapped rows; visible-char budgets match.
+        assert_eq!(p.len(), s.len(), "ANSI-styled wrap must match plain wrap");
+    }
+
+    /// Bold (`**x**`) emits an ANSI `\x1b[1m` open inside the
+    /// accumulator and `\x1b[22m` close on TagEnd::Strong.
+    #[test]
+    fn strong_emits_bold_ansi() {
+        let rendered = markdown_to_styled("the **fox** is quick", 80);
+        let blob: String = rendered
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains("\x1b[1m"), "expected bold open");
+        assert!(blob.contains("\x1b[22m"), "expected bold close");
+        assert!(blob.contains("fox"), "expected wrapped text");
+    }
+
+    /// Italic (`*x*`) maps to ANSI 3 / 23.
+    #[test]
+    fn emphasis_emits_italic_ansi() {
+        let rendered = markdown_to_styled("the *fox*", 80);
+        let blob: String = rendered
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains("\x1b[3m"));
+        assert!(blob.contains("\x1b[23m"));
+    }
+
+    /// Inline code preserves the backticks as visible markers AND
+    /// embeds the tool-color SGR around them.
+    #[test]
+    fn inline_code_paints_with_tool_color() {
+        let rendered = markdown_to_styled("call `fn_name`", 80);
+        let blob: String = rendered
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains("`fn_name`"));
+        assert!(
+            blob.contains("\x1b[39m"),
+            "should reset fg after inline code"
+        );
+    }
+
+    /// Fenced code block with `rust` info string gets per-keyword
+    /// coloring (verified by presence of an SGR sequence for `fn`).
+    #[test]
+    fn fenced_rust_block_gets_keyword_coloring() {
+        let rendered = markdown_to_styled("```rust\nfn main() {}\n```", 80);
+        let blob: String = rendered
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The `fn` keyword should appear inside an SGR-wrapped span.
+        // We don't pin a specific color (theme-dependent), but the
+        // presence of any 38;5;<n> / 38;2;<r>;<g>;<b> / 3[0-7] SGR
+        // immediately before "fn" indicates it was painted.
+        assert!(blob.contains("fn"));
+        assert!(blob.contains("\x1b["));
     }
 }

@@ -1,5 +1,6 @@
 pub(crate) mod avatar;
 mod events;
+mod highlight;
 pub(crate) mod input;
 mod markdown;
 pub(crate) mod picker;
