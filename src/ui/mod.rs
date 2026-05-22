@@ -1,4 +1,6 @@
+pub(crate) mod ansi;
 pub(crate) mod avatar;
+pub(crate) mod box_render;
 mod events;
 mod highlight;
 pub(crate) mod input;
@@ -4287,113 +4289,25 @@ fn chamber_widths(renderer: &Renderer) -> (usize, usize) {
     (frame_w, inner)
 }
 
-/// `╰────────────╯` footer of a tool chamber, sized to `frame_w`.
+/// `╰────────────╯` footer of a tool chamber. Thin wrapper around
+/// `box_render::bottom` so chamber + alert + panel sections all
+/// share one frame implementation.
 fn chamber_bottom(frame_w: usize) -> String {
-    format!("╰{}╯", "─".repeat(frame_w.saturating_sub(2)))
+    box_render::bottom(box_render::BoxStyle::Rounded, frame_w)
 }
 
-/// `│ content (truncated/padded to inner) │` row of a tool chamber.
-///
-/// Sizing is by *display width* (`UnicodeWidthStr`), not `char` count,
-/// so CJK / emoji / other wide glyphs from tool output don't push the
-/// right `│` past the chamber column. Truncation walks chars from the
-/// front, summing display widths until adding the next would exceed
-/// `inner - 1` cells (1 cell reserved for the `…` marker).
+/// `│ content │` row of a tool chamber. `inner` is the
+/// content cells (frame_w − 4 for the two borders + spaces). Thin
+/// wrapper around `box_render::row` which does the same display-
+/// width / tab-expansion / truncate-with-`…` logic.
 fn chamber_row(content: &str, inner: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    use unicode_width::UnicodeWidthStr;
-    // Expand tabs to spaces before measuring. `\t` has Unicode width
-    // 0 but the terminal renders it as advance-to-next-tabstop
-    // (typically 8 cells). The previous behavior under-counted the
-    // visible row width and the right `│` drifted right by the
-    // tab-expansion delta. Hardcode tab-stop at 4 (common in code
-    // display); the visual artifact is bounded.
-    let content_expanded = expand_tabs(content, 4);
-    let content = content_expanded.as_str();
-    let total_w = UnicodeWidthStr::width(content);
-    let (trimmed, trimmed_w): (String, usize) = if total_w <= inner {
-        (content.to_string(), total_w)
-    } else if inner == 0 {
-        (String::new(), 0)
-    } else {
-        // Reserve 1 cell for `…`. Pull chars from the start until
-        // adding the next one would overflow the remaining budget.
-        let budget = inner.saturating_sub(1);
-        let mut out = String::with_capacity(content.len());
-        let mut used = 0;
-        for ch in content.chars() {
-            let w = ch.width().unwrap_or(0);
-            if used + w > budget {
-                break;
-            }
-            out.push(ch);
-            used += w;
-        }
-        out.push('…');
-        (out, used + 1)
-    };
-    let pad = inner.saturating_sub(trimmed_w);
-    format!("│ {}{} │", trimmed, " ".repeat(pad))
+    box_render::row(box_render::BoxStyle::Rounded, content, inner + 4)
 }
 
-/// Expand `\t` to spaces honoring a fixed tab stop. Walks the string
-/// tracking the column so a tab N cells before the next stop expands
-/// to exactly `stop - (col % stop)` spaces — same shape as `expand(1)`
-/// or what most terminals do. Cheap and self-contained; callers use
-/// it before width measurement / chamber padding.
-fn expand_tabs(s: &str, tab_stop: usize) -> String {
-    if !s.contains('\t') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    let mut col = 0usize;
-    for ch in s.chars() {
-        if ch == '\t' {
-            let pad = tab_stop - (col % tab_stop);
-            for _ in 0..pad {
-                out.push(' ');
-            }
-            col += pad;
-        } else {
-            out.push(ch);
-            col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        }
-    }
-    out
-}
-
-/// Background-tinted chamber row for diff `+`/`-` lines. Emits raw
-/// SGR `48;5;{bg}` background sequence inside the row so the diff
-/// tint fills the inner width; the left + right border glyphs sit
-/// outside the bg span so they keep the chamber color.
-///
-/// Opencode uses subtly-tinted backgrounds (`tint(bg, green, 0.15)`
-/// etc.) to mark added/removed lines without overwhelming the
-/// scanability. We approximate that with the 256-color palette:
-/// dim green (22) for adds, dim red (52) for removes.
+/// Background-tinted chamber row for diff `+`/`-` lines. Thin
+/// wrapper around `box_render::row_with_bg`.
 fn chamber_row_with_bg(content: &str, inner: usize, bg_idx: u8) -> String {
-    // Same tab-expansion as `chamber_row` so diff `+`/`-` lines with
-    // leading tabs don't drift the right border. Bug surfaced in
-    // real-world C/C++ diffs where the source uses tab indentation.
-    let content_expanded = expand_tabs(content, 4);
-    let content = content_expanded.as_str();
-    let chars: Vec<char> = content.chars().collect();
-    let trimmed: String = if chars.len() <= inner {
-        chars.iter().collect()
-    } else if inner == 0 {
-        String::new()
-    } else {
-        let mut out: String = chars[..inner.saturating_sub(1)].iter().collect();
-        out.push('…');
-        out
-    };
-    let pad = inner.saturating_sub(trimmed.chars().count());
-    format!(
-        "│ \x1b[48;5;{}m{}{}\x1b[49m │",
-        bg_idx,
-        trimmed,
-        " ".repeat(pad),
-    )
+    box_render::row_with_bg(box_render::BoxStyle::Rounded, content, inner + 4, bg_idx)
 }
 
 fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, selected: &mut usize) {

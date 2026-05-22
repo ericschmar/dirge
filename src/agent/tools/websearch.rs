@@ -629,27 +629,16 @@ fn strip_tags_and_decode(s: &str) -> String {
             _ => {}
         }
     }
-    // Pass 2: decode entities + filter control bytes (#9). Search
-    // results occasionally carry literal ESC / CR / C1 controls
-    // (mojibake, malformed pages). Letting them flow verbatim into
-    // the LLM prompt is inconsistent with the MCP-stderr sanitizer
-    // and could repaint the agent's chat output.
-    decode_entities(no_tags.trim())
-        .chars()
-        .filter(|c| {
-            let cp = *c as u32;
-            // Allow tab, newline (the only formatting controls
-            // we want in snippets).
-            if cp == 0x09 || cp == 0x0a {
-                return true;
-            }
-            // Block C0 controls + DEL + C1 controls.
-            if cp < 0x20 || cp == 0x7f || (0x80..=0x9f).contains(&cp) {
-                return false;
-            }
-            true
-        })
-        .collect()
+    // Pass 2: decode entities + filter control bytes via the
+    // shared sanitizer in `ui::ansi`. Search results occasionally
+    // carry literal ESC / CR / C1 controls (mojibake, malformed
+    // pages). KEEP_BOTH preserves newlines + tabs since some
+    // snippets have legitimate multi-line content the LLM
+    // benefits from seeing.
+    crate::ui::ansi::strip_controls(
+        &decode_entities(no_tags.trim()),
+        crate::ui::ansi::StripPolicy::KEEP_BOTH,
+    )
 }
 
 fn decode_entities(s: &str) -> String {

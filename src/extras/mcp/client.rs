@@ -188,25 +188,15 @@ fn spawn_stderr_forwarder(server_name: String, stderr: ChildStderr) {
 /// (e.g. `[Lattice] session closed` overlapping a chamber).
 fn emit_mcp_line(server_name: &str, raw: &[u8]) {
     let s = String::from_utf8_lossy(raw);
-    let sanitized: String = s
-        .chars()
-        .filter(|c| {
-            let cp = *c as u32;
-            // Allow TAB explicitly.
-            if cp == 0x09 {
-                return true;
-            }
-            // Block C0 controls + DEL.
-            if cp < 0x20 || cp == 0x7f {
-                return false;
-            }
-            // Block C1 controls.
-            if (0x80..=0x9f).contains(&cp) {
-                return false;
-            }
-            true
-        })
-        .collect();
+    // Centralised sanitizer (`ui::ansi`) so MCP / websearch /
+    // chat consumers share one definition of "what's a control
+    // byte". Block ALL controls — MCP log lines are emitted
+    // one-per-row by the UI, so embedded newlines/tabs from a
+    // child would split into multiple notifications and rendering
+    // becomes inconsistent. Newlines are handled by our
+    // `read` loop seeing them as line delimiters; tabs become
+    // spaces upstream.
+    let sanitized = crate::ui::ansi::strip_controls(&s, crate::ui::ansi::StripPolicy::STRICT);
     if sanitized.trim().is_empty() {
         // Don't surface blank lines — children often emit \n
         // between log groups; we collapse those.
