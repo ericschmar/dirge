@@ -371,6 +371,16 @@ fn sanitize_single_line(s: &str, max_chars: usize) -> String {
 /// value to fill the available banner width (right side carries
 /// the meaningful info for paths — filename — so we cut from the
 /// left, not the right).
+/// Cached state for a collapsed tool result, so Ctrl+O can re-render
+/// it as a fresh chamber with the full body. We hold only the last
+/// one — older collapses live in chat history but aren't addressable.
+#[derive(Clone)]
+pub(crate) struct CollapsedToolResult {
+    pub tool_name: String,
+    pub banner_value: String,
+    pub full_output: String,
+}
+
 fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
     let obj = match args {
         serde_json::Value::Object(map) => map,
@@ -618,6 +628,14 @@ pub async fn run_interactive(
     // the alert handler can rely on a fact about the *screen* rather
     // than a fact about a name that has other clear sites.
     let mut tool_chamber_open: bool = false;
+
+    // Last collapsed tool result, re-printable by Ctrl+O. Each
+    // `render_tool_output` call that truncates the body stashes the
+    // (tool, args-banner, full-output) tuple here; Ctrl+O reprints
+    // it as a fresh chamber with the full body. Only the most
+    // recent collapse is retained — past collapses scroll away into
+    // chat history and are not addressable.
+    let mut last_collapsed: Option<CollapsedToolResult> = None;
     #[allow(unused_mut)]
     let mut loop_label: Option<String> = None;
     #[cfg(feature = "loop")]
@@ -1063,6 +1081,43 @@ pub async fn run_interactive(
                             renderer.draw_bottom(
                                 &input,
                                 &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
+                        // Ctrl+O — expand the most-recent collapsed
+                        // tool result. We re-print it as a fresh
+                        // chamber below the current chat so the user
+                        // sees the full body. Older collapsed results
+                        // are not addressable (they scroll into chat
+                        // history as collapsed); this matches the
+                        // "last one only" scope chosen during design.
+                        let ctrl_o = key.code == KeyCode::Char('o')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_o {
+                            if let Some(c) = last_collapsed.take() {
+                                let max_chars = cfg.resolve_tool_result_max_chars();
+                                render_collapsed_in_full(&mut renderer, &c, max_chars)?;
+                            } else {
+                                renderer.write_line(
+                                    "  ↳ nothing to expand (no collapsed tool result in this turn)",
+                                    theme::dim(),
+                                )?;
+                            }
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(
+                                    StatusLine::render(
+                                        session,
+                                        is_running,
+                                        0,
+                                        loop_label.as_deref(),
+                                        context.current_prompt_name.as_deref(),
+                                        perm_mode().as_deref(),
+                                    ),
+                                    interjection_queue.len(),
+                                ),
                                 is_running,
                             )?;
                             continue;
@@ -1890,6 +1945,35 @@ pub async fn run_interactive(
                             let is_edit =
                                 last_tool_name.as_deref() == Some("edit") && show_diff;
 
+                            // Resolve the tool name + banner for the
+                            // collapse store. Prefer the just-stored
+                            // `last_tool_name`; fall back to looking
+                            // up the call by id in `tool_calls_buf`
+                            // (covers paths where `last_tool_name`
+                            // was drained out from under us — same
+                            // shape as the alert-bug fix).
+                            let resolved_name: String = last_tool_name
+                                .clone()
+                                .or_else(|| {
+                                    tool_calls_buf
+                                        .iter()
+                                        .rev()
+                                        .find(|e| e.id == id.as_str())
+                                        .map(|e| e.name.to_string())
+                                })
+                                .unwrap_or_default();
+                            let resolved_args = tool_calls_buf
+                                .iter()
+                                .rev()
+                                .find(|e| e.id == id.as_str())
+                                .map(|e| e.args.clone())
+                                .unwrap_or(serde_json::Value::Null);
+                            let banner_value = format_tool_banner_value(
+                                &resolved_name,
+                                &resolved_args,
+                            );
+                            let max_lines = cfg.resolve_tool_result_max_lines();
+
                             if is_edit {
                                 // Colorized diff rendering. The edit tool emits
                                 // its diff block starting with "--- a/<path>" —
@@ -1965,13 +2049,25 @@ pub async fn run_interactive(
                                     tool_chamber_open = false;
                                 } else {
                                     // No diff section found, show normally
-                                    render_tool_output(
-                                        &mut renderer, &output, max_chars,
+                                    last_collapsed = render_tool_output(
+                                        &mut renderer,
+                                        &resolved_name,
+                                        &banner_value,
+                                        &output,
+                                        max_chars,
+                                        max_lines,
                                     )?;
                                     tool_chamber_open = false;
                                 }
                             } else {
-                                render_tool_output(&mut renderer, &output, max_chars)?;
+                                last_collapsed = render_tool_output(
+                                    &mut renderer,
+                                    &resolved_name,
+                                    &banner_value,
+                                    &output,
+                                    max_chars,
+                                    max_lines,
+                                )?;
                                 tool_chamber_open = false;
                             }
                         }
@@ -3662,34 +3758,110 @@ fn chamber_row_centered(content: &str, inner: usize) -> String {
     format!("│ {}{}{} │", " ".repeat(left), content, " ".repeat(right))
 }
 
+/// Tools whose result body is the WHOLE point — diff hunks, user-
+/// facing Q&A, subagent answers. Collapsing these to 4 lines hides
+/// the value the LLM/user just paid for; keep them fully expanded.
+fn tool_skips_collapse(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "edit" | "apply_patch" | "question" | "task" | "task_status"
+    )
+}
+
+/// Render a tool result chamber. Lines past `max_lines` collapse to a
+/// `↓ N more lines (Ctrl+O to expand)` footer; `max_chars` is a hard
+/// ceiling on the displayed slice. `max_lines = usize::MAX` (passed
+/// for tools in `tool_skips_collapse`) disables the line cap.
+/// Returns `Some(CollapsedToolResult)` if the body was actually
+/// truncated, so the caller can stash it for Ctrl+O.
 fn render_tool_output(
     renderer: &mut Renderer,
+    tool_name: &str,
+    banner_value: &str,
     output: &str,
     max_chars: usize,
-) -> anyhow::Result<()> {
+    max_lines: usize,
+) -> anyhow::Result<Option<CollapsedToolResult>> {
     let sanitized = sanitize_output(output);
-    let char_count = sanitized.chars().count();
-    let body: String = if char_count <= max_chars {
+    let total_chars = sanitized.chars().count();
+    // Hard char ceiling first — keeps a single pathological line
+    // from blowing the chamber even if the line count is fine.
+    let char_sliced: String = if total_chars <= max_chars {
         sanitized.into_string()
     } else {
         sanitized.chars().take(max_chars).collect()
     };
-    // Tool output renders inside a closed rounded chamber:
-    //   ╭─ READ ─ /path
-    //   │ contents ...                    │
-    //   ╰─────────────────────────────────╯
-    // Lines are padded/truncated to a fixed inner width so the right
-    // border stays aligned across the chamber.
+    let chars_truncated = total_chars.saturating_sub(char_sliced.chars().count());
+
+    // Apply the per-tool line cap (skipped for diff / Q&A / task
+    // results where the body IS the value).
+    let lines: Vec<&str> = char_sliced.lines().collect();
+    let total_lines = lines.len();
+    let line_cap = if tool_skips_collapse(tool_name) {
+        usize::MAX
+    } else {
+        max_lines
+    };
+    let shown_lines = total_lines.min(line_cap);
+    let hidden_lines = total_lines.saturating_sub(shown_lines);
+
     let (frame_w, inner) = chamber_widths(renderer);
-    for line in body.lines() {
+    for line in &lines[..shown_lines] {
         renderer.write_line(&chamber_row(line, inner), theme::result())?;
     }
-    if char_count > max_chars {
-        let remaining = char_count - max_chars;
-        let note = format!("░ +{} chars truncated", remaining);
+    if hidden_lines > 0 {
+        // The Ctrl+O hint inside the row — concise enough to fit the
+        // 120-col chamber without truncation on typical widths.
+        let note = format!(
+            "↓ {} more line{} (Ctrl+O to expand)",
+            hidden_lines,
+            if hidden_lines == 1 { "" } else { "s" }
+        );
+        renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
+    }
+    if chars_truncated > 0 {
+        // Char-ceiling hit BEFORE the line cap. Report separately so
+        // the user knows the char-truncated text has already been
+        // dropped (expanding via Ctrl+O won't bring it back).
+        let note = format!("░ +{} chars truncated (output too large)", chars_truncated);
         renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
     }
     renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+
+    if hidden_lines > 0 {
+        Ok(Some(CollapsedToolResult {
+            tool_name: tool_name.to_string(),
+            banner_value: banner_value.to_string(),
+            full_output: output.to_string(),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Re-render a previously-collapsed result with NO line cap, as a
+/// fresh chamber below the prior chat content. Char ceiling still
+/// applies so a multi-MB output doesn't take forever.
+fn render_collapsed_in_full(
+    renderer: &mut Renderer,
+    collapsed: &CollapsedToolResult,
+    max_chars: usize,
+) -> anyhow::Result<()> {
+    let upper = collapsed.tool_name.to_ascii_uppercase();
+    let (frame_w, _) = chamber_widths(renderer);
+    let header = fit_banner_header(&upper, &collapsed.banner_value, frame_w);
+    renderer.write_line("", Color::White)?;
+    renderer.write_line(&header, theme::tool())?;
+    // Skip-collapse semantics here so even a normally-collapsed tool
+    // (e.g. read) reprints its body in full when the user opts in.
+    let _ = render_tool_output(
+        renderer,
+        &collapsed.tool_name,
+        &collapsed.banner_value,
+        &collapsed.full_output,
+        max_chars,
+        usize::MAX,
+    )?;
     Ok(())
 }
 
@@ -4186,6 +4358,66 @@ mod tests {
         close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
         assert!(name.is_none());
         assert!(!open);
+    }
+
+    /// Tool-result body collapse: long output truncates at
+    /// `max_lines` and returns a `CollapsedToolResult` so Ctrl+O
+    /// can replay it. Tools in `tool_skips_collapse` bypass the
+    /// line cap (returns None).
+    #[test]
+    fn render_tool_output_collapses_past_max_lines() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let output = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collapsed = render_tool_output(&mut renderer, "read", "/tmp/foo", &output, 10_000, 4)
+            .expect("render ok");
+        let c = collapsed.expect("read should collapse past 4 lines");
+        assert_eq!(c.tool_name, "read");
+        assert_eq!(c.banner_value, "/tmp/foo");
+        assert!(c.full_output.contains("line 19"));
+    }
+
+    /// Exempt tools (edit/apply_patch/question/task/task_status)
+    /// pass the line cap through unchanged — `tool_skips_collapse`
+    /// forces `usize::MAX`. The render call returns None (no
+    /// collapse store) even when the output is 100 lines long.
+    #[test]
+    fn render_tool_output_does_not_collapse_exempt_tools() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let output = (0..20)
+            .map(|i| format!("+ added line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for tool in ["edit", "apply_patch", "question", "task", "task_status"] {
+            let collapsed = render_tool_output(&mut renderer, tool, "arg", &output, 10_000, 4)
+                .expect("render ok");
+            assert!(
+                collapsed.is_none(),
+                "exempt tool `{}` must not collapse",
+                tool,
+            );
+        }
+    }
+
+    /// Output that fits in `max_lines` returns None (no collapse
+    /// indicator) — no expand footer rendered, and no entry stashed
+    /// for Ctrl+O so the keybind correctly reports "nothing to
+    /// expand" if pressed.
+    #[test]
+    fn render_tool_output_returns_none_when_no_truncation() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let collapsed = render_tool_output(
+            &mut renderer,
+            "list_dir",
+            ".",
+            "1 entries (1 files):\n  [file]  foo.txt",
+            10_000,
+            4,
+        )
+        .expect("render ok");
+        assert!(collapsed.is_none());
     }
 
     /// Self-review bug 1: `apply_patch` arg is `operations`

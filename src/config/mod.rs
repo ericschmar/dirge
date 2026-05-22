@@ -113,6 +113,13 @@ pub struct Config {
     pub show_tool_details: Option<bool>,
     pub show_edit_diff: Option<bool>,
     pub tool_result_max_chars: Option<usize>,
+    /// Cap on tool-result body lines shown by default inside a tool
+    /// chamber. Anything past this collapses to a
+    /// `↓ N more lines (Ctrl+O to expand)` footer, and the user can
+    /// re-print the most recent collapsed result in full via Ctrl+O.
+    /// `tool_result_max_chars` still applies on top as a hard
+    /// character ceiling for the displayed slice.
+    pub tool_result_max_lines: Option<usize>,
     pub default_prompt: Option<String>,
     /// UI color theme. Known built-in values: `phosphor` (default,
     /// 80s CRT green) and `plain` (white/cyan).
@@ -164,6 +171,10 @@ impl Config {
 
     pub fn resolve_tool_result_max_chars(&self) -> usize {
         self.tool_result_max_chars.unwrap_or(500)
+    }
+
+    pub fn resolve_tool_result_max_lines(&self) -> usize {
+        self.tool_result_max_lines.unwrap_or(4)
     }
 
     pub fn resolve_show_edit_diff(&self) -> bool {

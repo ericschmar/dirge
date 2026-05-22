@@ -28,6 +28,7 @@ Example:
   "show_tool_details": true,
   "show_edit_diff": true,
   "tool_result_max_chars": 500,
+  "tool_result_max_lines": 4,
   "custom_providers": {
     "local-vllm": {
       "provider_type": "openai",
@@ -79,7 +80,8 @@ Accepted top-level keys:
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Use `standard`, `restrictive`, `accept`, or `yolo`.                                                                   |
 | `show_tool_details`       | boolean | Show tool-result output in the TUI. Default: `true`.                                                                                                                         |
 | `show_edit_diff`          | boolean | Show colorized diff output for `edit` tool results (`-` red, `+` green, `@@` cyan). Default: `true`.                                                                        |
-| `tool_result_max_chars`   | integer | Maximum characters to show before truncating tool output with `[N more chars]`. Default: `500`.                                                                              |
+| `tool_result_max_chars`   | integer | Hard ceiling on characters per tool result. Default: `500`. Combined with `tool_result_max_lines` (lines applied first; chars trim what's left).                                |
+| `tool_result_max_lines`   | integer | Body lines shown inside a tool chamber before collapsing to `↓ N more lines (Ctrl+O to expand)`. Default: `4`. Press `Ctrl+O` to re-print the most recent collapsed result in full. `edit`, `apply_patch`, `question`, `task`, and `task_status` are exempt (their body IS the value). |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`.                                                                                                                        |
 | `theme`                   | string  | UI color theme. `phosphor` (default — 80s CRT green-on-black), `plain` (pre-theme white/cyan), or any `<name>.theme.json` file in the config dir. See [docs/THEMES.md](docs/THEMES.md). |
 | `tools`                   | object  | Optional per-tool enable map. Currently honors `tools.websearch` and `tools.webfetch` (both `bool`, default `true`); set either to `false` to drop the tool from the registered set even when its env vars are present. |
