@@ -740,6 +740,13 @@ async fn main() -> anyhow::Result<()> {
             tokio::sync::mpsc::unbounded_channel::<crate::agent::tools::task::SubagentChatEvent>();
         crate::agent::tools::task::set_subagent_chat_sink(subagent_chat_tx);
 
+        // ui-redesign: spawn the system-load poller. The handle is
+        // a cheap Arc; cloning into run_interactive lets the panel
+        // painter read snapshots without crossing the channel.
+        let sysload = crate::ui::sysload::spawn_poller(
+            std::time::Duration::from_secs(2),
+        );
+
         ui::run_interactive(
             client,
             agent,
@@ -767,6 +774,7 @@ async fn main() -> anyhow::Result<()> {
             plugin_manager.as_ref(),
             dialog_rx,
             subagent_chat_rx,
+            sysload,
         )
         .await?;
 

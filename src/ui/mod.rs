@@ -403,6 +403,7 @@ fn panel_modified_cached(cwd: &std::path::Path) -> Vec<String> {
 /// own mutexes; safe to call from the UI loop tick.
 fn build_panel_data(
     session: &Session,
+    sysload: Option<&crate::ui::sysload::SharedSysLoad>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
 ) -> crate::ui::renderer::PanelData {
@@ -490,6 +491,7 @@ fn build_panel_data(
         lsp,
         todos,
         modified,
+        sysload: sysload.map(|s| s.snapshot()),
     }
 }
 
@@ -765,6 +767,9 @@ pub async fn run_interactive(
     mut subagent_chat_rx: tokio::sync::mpsc::UnboundedReceiver<
         crate::agent::tools::task::SubagentChatEvent,
     >,
+    // ui-redesign: shared system-load snapshot. Polled in the
+    // background; read at panel paint time. Cheap clone (Arc bump).
+    sysload: crate::ui::sysload::SharedSysLoad,
 ) -> anyhow::Result<()> {
     let _guard = TerminalGuard::new()?;
 
@@ -967,6 +972,7 @@ pub async fn run_interactive(
     // shows for every panel field until the user nudges any event.
     renderer.set_panel_data(build_panel_data(
         session,
+        Some(&sysload),
         #[cfg(feature = "mcp")]
         mcp_manager,
         #[cfg(feature = "lsp")]
@@ -1088,6 +1094,7 @@ pub async fn run_interactive(
         // the worst case, which is fine for ambient status.
         renderer.set_panel_data(build_panel_data(
             session,
+            Some(&sysload),
             #[cfg(feature = "mcp")]
             mcp_manager,
             #[cfg(feature = "lsp")]

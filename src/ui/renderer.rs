@@ -56,6 +56,11 @@ pub struct PanelData {
     pub todos: Vec<(String, String)>,
     /// Recent modified file paths, shortened relative to cwd when possible.
     pub modified: Vec<String>,
+    /// ui-redesign: latest system load snapshot for the
+    /// [SYSTEM LOAD] sub-panel. `None` when the polling task hasn't
+    /// produced a reading yet (very early startup) — painter skips
+    /// the section in that case.
+    pub sysload: Option<crate::ui::sysload::SysLoadSnapshot>,
 }
 
 /// dirge-gek: one row in the left-gutter subagent panel. Rendered as
@@ -1607,6 +1612,37 @@ impl Renderer {
                 }
                 out.push((bottom(), Color::Cyan));
             };
+
+        // ui-redesign [SYSTEM LOAD]: ASCII bar gauges for CPU + MEM
+        // sourced from the background sysinfo poller. Rendered as
+        // `CPU: [#####....] 68%` with a 10-cell bar so the gauges
+        // fit any panel width ≥ 22 inner cells. Skipped silently
+        // when no snapshot has landed yet (very early startup).
+        if let Some(snap) = &d.sysload {
+            let gauge = |label: &str, pct: f32| -> (String, Color) {
+                let pct_clamped = pct.clamp(0.0, 100.0);
+                let bar_width = 10usize;
+                let filled = ((pct_clamped / 100.0) * bar_width as f32).round() as usize;
+                let filled = filled.min(bar_width);
+                let bar: String = "#".repeat(filled) + &".".repeat(bar_width - filled);
+                let color = if pct_clamped >= 90.0 {
+                    Color::Red
+                } else if pct_clamped >= 75.0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                (
+                    format!("  {}: [{}] {:>3}%", label, bar, pct_clamped.round() as u8),
+                    color,
+                )
+            };
+            let load_items = vec![
+                gauge("CPU", snap.cpu_pct),
+                gauge("MEM", snap.mem_pct),
+            ];
+            push_section(&mut out, "SYSTEM LOAD", load_items);
+        }
 
         let mcp_items: Vec<(String, Color)> = d
             .mcp
