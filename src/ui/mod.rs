@@ -1036,6 +1036,14 @@ pub async fn run_interactive(
             }
             match event::read() {
                 Ok(event::Event::Key(key)) => {
+                    // Filter Release / Repeat events. Modern terminals
+                    // (kitty keyboard protocol, Windows 10+ ConPTY,
+                    // some iTerm2 modes) emit BOTH Press and Release
+                    // for every keystroke — without this filter every
+                    // typed char inserts twice ("ssuubb..." bug).
+                    if key.kind != event::KeyEventKind::Press {
+                        continue;
+                    }
                     if user_tx_clone.blocking_send(UserEvent::Key(key)).is_err() {
                         break;
                     }
@@ -3866,113 +3874,12 @@ pub async fn run_interactive(
                     is_running,
                 )?;
 
-                // Framed permission prompt. The double-bar border +
-                // ALERT wordmark visually arrests the eye — this is
-                // the single most important UX moment and the user
-                // must not miss it. Box width = 64 for a stable look
-                // independent of terminal width; the chat area
-                // requires at least 60 cols anyway.
-                const BOX_W: usize = 64;
-                let inner = BOX_W.saturating_sub(2);
-                let pre = "╭─ ⚠ ALERT · PERMISSION ";
-                let pre_len = pre.chars().count();
-                let top_fill = BOX_W.saturating_sub(pre_len + 1);
-                let bot_bar = "─".repeat(inner);
-                // Helper: pad / clamp one logical line of content into
-                // `│ content │` shape. Caller is responsible for
-                // wrapping long content into multiple logical lines
-                // BEFORE calling this — the helper itself only handles
-                // the chamber-border framing for a single row.
-                let row = |content: &str| -> String {
-                    // Display-width-aware padding so embedded emoji
-                    // / wide glyphs / sanitized control replacements
-                    // (`·`) don't drift the right `│`.
-                    let content_w = crate::ui::wrap::visible_width(content);
-                    let cap_w = inner.saturating_sub(1);
-                    let (trimmed, trimmed_w) = if content_w <= cap_w {
-                        (content.to_string(), content_w)
-                    } else if cap_w == 0 {
-                        (String::new(), 0)
-                    } else {
-                        // Hard fallback if a single token overflowed
-                        // a wrapped chunk (shouldn't happen given the
-                        // soft_wrap pre-pass below, but be defensive).
-                        let mut used = 0usize;
-                        let mut out = String::with_capacity(content.len());
-                        for ch in content.chars() {
-                            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                            if used + w > cap_w.saturating_sub(1) {
-                                break;
-                            }
-                            out.push(ch);
-                            used += w;
-                        }
-                        out.push('…');
-                        (out, used + 1)
-                    };
-                    let pad = inner.saturating_sub(trimmed_w + 1);
-                    format!("│ {}{}│", trimmed, " ".repeat(pad))
-                };
-
-                // Soft-wrap a labelled value (`label`: `value`) into a
-                // vec of chamber-row-ready strings. First row is
-                // `<label>: <value head>`, continuation rows indent
-                // under the colon so the wrapped tail visually lives
-                // beneath the value column rather than the label
-                // column. Width budget for the wrap = inner - 1 cell
-                // (the trailing right-border pad).
-                //
-                // This is the user-visible fix for the bug report:
-                // the previous alert hard-truncated args at ~50 cells
-                // with `…`, hiding the rest of the command — a
-                // user approving an obscured bash command is being
-                // asked to make a security decision blind.
-                let labelled_rows = |label: &str, value: &str| -> Vec<String> {
-                    let prefix = format!("{} : ", label);
-                    let prefix_w = crate::ui::wrap::visible_width(&prefix);
-                    let cont_indent = " ".repeat(prefix_w);
-                    let budget = inner.saturating_sub(1);
-                    let combined = format!("{}{}", prefix, value);
-                    crate::ui::wrap::soft_wrap(&combined, budget, &cont_indent)
-                        .into_iter()
-                        .map(|chunk| row(&chunk))
-                        .collect()
-                };
-                renderer.write_line(
-                    &format!("{}{}╮", pre, "─".repeat(top_fill)),
-                    c_perm(),
-                )?;
-                // ASNI/control-char sanitize the tool name + args
-                // before painting. These fields can carry attacker-
-                // shaped content (MCP tool name, plugin-injected
-                // call, pathological filename), and the ALERT row
-                // is the single moment the user is being asked to
-                // make a security decision — a raw escape here
-                // could recolor the row, blank the prompt, or move
-                // the cursor. The sibling reopen path at the bottom
-                // of this handler already sanitizes; do the same
-                // here for symmetry.
-                let safe_tool = sanitize_output(&ask_req.tool);
-                let safe_input = sanitize_output(&ask_req.input);
-                for line in labelled_rows("tool", &safe_tool) {
-                    renderer.write_line(&line, c_perm())?;
-                }
-                for line in labelled_rows("args", &safe_input) {
-                    renderer.write_line(&line, c_perm())?;
-                }
-                renderer.write_line(&format!("├{}┤", bot_bar), c_perm())?;
-                renderer.write_line(
-                    &row("[y] allow once  [a] allow always  [n] deny  [ESC] abort"),
-                    c_perm(),
-                )?;
-                renderer.write_line(&format!("╰{}╯", bot_bar), c_perm())?;
-
-                // ui-redesign Phase 6: push the same prompt content
-                // into the [ALERT] frame at the bottom of the
-                // screen so the user sees the decision needed
-                // without having to scroll. The scroll-area chamber
-                // above stays for audit/history; this overlay is
-                // the actionable inline view.
+                // Permission prompt is rendered ONLY as a bottom-
+                // strip overlay (set_alert_overlay below). The old
+                // in-scrollback ╭─ ⚠ ALERT · PERMISSION ─╮ chamber
+                // was a second visual representation of the same
+                // event — two boxes for one decision. Removed: the
+                // overlay is the single source of truth.
                 {
                     let safe_tool = sanitize_output(&ask_req.tool);
                     let safe_input = sanitize_output(&ask_req.input);
