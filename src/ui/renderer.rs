@@ -927,36 +927,40 @@ impl Renderer {
             }
         }
 
-        // ui-redesign: paint the chat frame around the visible chat
-        // area. Frame brackets the centered content_width band so
-        // the left subagent gutter + right panel stay outside.
-        // Skips when the content band sits flush against col 0
-        // (terminal too narrow for the frame) so the chat doesn't
-        // lose width unnecessarily.
+        // ui-redesign: unified top + bottom frame across the entire
+        // terminal width. The three panes share one horizontal line
+        // top + bottom; the chat's ╔ / ╗ / ╚ / ╝ corners double as
+        // visual dividers between the side panels and the chat. Side
+        // panels get NO outer corners or vertical borders — chat's
+        // ║ on each side IS their inner border, and the terminal
+        // edge serves as the outer.
         let chat_width = self.content_width();
         if indent >= 1 && chat_width > 0 {
             let frame_left = indent.saturating_sub(1) as u16;
             let frame_right = (indent + chat_width) as u16;
-            let frame_span = (frame_right - frame_left + 1) as usize; // inclusive
             let header_color = self.color(crate::ui::theme::header());
-            // Top border with centered `[AGENT LOG STREAM]` title.
-            let title = "[AGENT LOG STREAM]";
-            let title_w = title.chars().count();
-            let inner_span = frame_span.saturating_sub(2); // minus corners
-            let fill = inner_span.saturating_sub(title_w);
-            let l = fill / 2;
-            let r = fill - l;
-            stdout.execute(MoveTo(frame_left, 0))?;
+            // Section widths (in cols).
+            let left_w = frame_left as usize; // cols [0, frame_left-1]
+            let chat_outer_w = (frame_right - frame_left + 1) as usize;
+            let right_w = (cols - frame_right - 1) as usize; // cols [frame_right+1, cols-1]
+            let chat_inner_w = chat_outer_w.saturating_sub(2);
+
+            // ── top frame row ──
+            let mut top = String::new();
+            // Left section title.
+            top.push_str(&centered_title("[AGENT STATUS]", left_w));
+            // Chat corner + title + corner.
+            top.push('╔');
+            top.push_str(&centered_title("[AGENT LOG STREAM]", chat_inner_w));
+            top.push('╗');
+            // Right section title.
+            top.push_str(&centered_title("[SYSTEM]", right_w));
+            stdout.execute(MoveTo(0, 0))?;
             write!(stdout, "{}", SetForegroundColor(header_color))?;
-            write!(
-                stdout,
-                "╔{}{}{}╗",
-                "═".repeat(l),
-                title,
-                "═".repeat(r),
-            )?;
+            write!(stdout, "{}", top)?;
             write!(stdout, "{}", ResetColor)?;
-            // Side borders on every chat content row.
+
+            // ── side ║ on every chat row ──
             for i in 0..visible {
                 let row = chat_y0 + i as u16;
                 stdout.execute(MoveTo(frame_left, row))?;
@@ -968,15 +972,18 @@ impl Renderer {
                 }
                 write!(stdout, "{}", ResetColor)?;
             }
-            // Bottom border directly above the input frame.
+
+            // ── bottom frame row (chat closes, side panels continue) ──
             let bot_row = chat_y0 + visible as u16;
-            stdout.execute(MoveTo(frame_left, bot_row))?;
+            let mut bot = String::new();
+            bot.push_str(&"═".repeat(left_w));
+            bot.push('╚');
+            bot.push_str(&"═".repeat(chat_inner_w));
+            bot.push('╝');
+            bot.push_str(&"═".repeat(right_w));
+            stdout.execute(MoveTo(0, bot_row))?;
             write!(stdout, "{}", SetForegroundColor(header_color))?;
-            write!(
-                stdout,
-                "╚{}╝",
-                "═".repeat(inner_span),
-            )?;
+            write!(stdout, "{}", bot)?;
             write!(stdout, "{}", ResetColor)?;
         }
 
@@ -1043,19 +1050,11 @@ impl Renderer {
             return self.draw_left_panel_idle(stdout, indent, panel_bottom);
         }
         let dim = self.color(crate::ui::theme::dim());
-        let header_color = self.color(crate::ui::theme::header());
         let agent = self.color(crate::ui::theme::agent());
         let err = self.color(crate::ui::theme::system());
 
-        // Header row.
-        stdout.execute(MoveTo(0, 0))?;
-        write!(stdout, "{}", " ".repeat(indent.saturating_sub(1)))?;
-        stdout.execute(MoveTo(0, 0))?;
-        write!(stdout, "{}", SetForegroundColor(header_color))?;
-        write!(stdout, "SUBAGENTS")?;
-        write!(stdout, "{}", ResetColor)?;
-
-        // Rows. Cap at the available height; oldest entries drop off.
+        // Skip row 0 — owned by the unified top frame's
+        // [AGENT STATUS] label. Subagent rows start at row 1.
         let row_budget = (panel_bottom.saturating_sub(1)) as usize;
         let show = self.subagent_status.iter().take(row_budget);
         for (i, row) in show.enumerate() {
@@ -1102,53 +1101,29 @@ impl Renderer {
         panel_bottom: u16,
     ) -> io::Result<()> {
         let info = &self.left_panel_info;
-        let inner = indent.saturating_sub(2);
+        // Section is bounded by the terminal's left edge (no outer
+        // border) and the chat's left ║ on the right at col
+        // `indent - 1`; sub-content fits in cols [0, indent - 2].
+        let inner = indent.saturating_sub(1);
         if inner < 12 {
             return Ok(());
         }
-        let header_color = self.color(crate::ui::theme::header());
         let agent = self.color(crate::ui::theme::agent());
         let dim = self.color(crate::ui::theme::dim());
 
-        // ui-redesign: double-line frame, bracketed title centered.
-        let title = "[AGENT STATUS]";
-        let total_dashes = inner.saturating_sub(title.chars().count());
-        let left_dashes = total_dashes / 2;
-        let right_dashes = total_dashes - left_dashes;
-        let top = format!(
-            "╔{}{}{}╗",
-            "═".repeat(left_dashes),
-            title,
-            "═".repeat(right_dashes),
-        );
-        let bottom = format!("╚{}╝", "═".repeat(inner));
-        let wipe = " ".repeat(indent.saturating_sub(1));
-
-        // Center content inside the inner band so logo + metadata
-        // balance horizontally.
-        let row = |text: &str| -> String {
+        let wipe = " ".repeat(inner);
+        // Center text inside the gutter band.
+        let center = |text: &str| -> String {
             use unicode_width::UnicodeWidthStr;
             let dw = UnicodeWidthStr::width(text);
-            let fill = inner.saturating_sub(dw);
-            let left = fill / 2;
-            let right = fill - left;
-            format!("║{}{}{}║", " ".repeat(left), text, " ".repeat(right),)
+            let leading = inner.saturating_sub(dw) / 2;
+            let trailing = inner.saturating_sub(dw).saturating_sub(leading);
+            format!("{}{}{}", " ".repeat(leading), text, " ".repeat(trailing))
         };
 
-        // Wipe the gutter then paint top.
-        let mut y: u16 = 0;
-        stdout.execute(MoveTo(0, y))?;
-        write!(stdout, "{}", wipe)?;
-        stdout.execute(MoveTo(0, y))?;
-        write!(stdout, "{}", SetForegroundColor(header_color))?;
-        write!(stdout, "{}", top)?;
-        write!(stdout, "{}", ResetColor)?;
-        y += 1;
+        // Skip row 0 — the unified top frame owns it.
+        let mut y: u16 = 1;
 
-        // ui-redesign: dropped the face row + 3-char agent-id glyph
-        // per user feedback ("get rid of this in the top left
-        // pane"). Just the spaced D I R G E logo with vertical
-        // breathing room above + below.
         let logo_lines: [(&str, Color); 3] = [
             ("           ", dim),
             (" D I R G E ", agent),
@@ -1158,26 +1133,19 @@ impl Renderer {
             if y >= panel_bottom {
                 break;
             }
-            // Center text inside inner.
-            use unicode_width::UnicodeWidthStr;
-            let dw = UnicodeWidthStr::width(*text);
-            let leading = inner.saturating_sub(dw) / 2;
-            let trailing = inner.saturating_sub(dw).saturating_sub(leading);
-            let line = format!("║{}{}{}║", " ".repeat(leading), text, " ".repeat(trailing),);
             stdout.execute(MoveTo(0, y))?;
             write!(stdout, "{}", wipe)?;
             stdout.execute(MoveTo(0, y))?;
             write!(stdout, "{}", SetForegroundColor(*color))?;
-            write!(stdout, "{}", line)?;
+            write!(stdout, "{}", center(text))?;
             write!(stdout, "{}", ResetColor)?;
             y += 1;
         }
 
-        // Metadata rows.
         let meta = [
-            format!(" Agent ID: {}", info.agent_id),
-            format!(" Model:    {}", info.model),
-            format!(" Focus:    {}", info.focus),
+            format!("Agent ID: {}", info.agent_id),
+            format!("Model:    {}", info.model),
+            format!("Focus:    {}", info.focus),
         ];
         for line in &meta {
             if y >= panel_bottom {
@@ -1188,30 +1156,17 @@ impl Renderer {
             write!(stdout, "{}", wipe)?;
             stdout.execute(MoveTo(0, y))?;
             write!(stdout, "{}", SetForegroundColor(dim))?;
-            write!(stdout, "{}", row(&trimmed))?;
+            write!(stdout, "{}", center(&trimmed))?;
             write!(stdout, "{}", ResetColor)?;
             y += 1;
         }
 
-        // Fill remaining rows with empty card borders to keep the
-        // card visually closed even on tall terminals.
-        while y + 1 < panel_bottom {
+        // Wipe any remaining rows below the metadata up to the chat
+        // bottom frame so stale subagent lines don't bleed through.
+        while y < panel_bottom {
             stdout.execute(MoveTo(0, y))?;
             write!(stdout, "{}", wipe)?;
-            stdout.execute(MoveTo(0, y))?;
-            write!(stdout, "{}", SetForegroundColor(dim))?;
-            write!(stdout, "{}", row(""))?;
-            write!(stdout, "{}", ResetColor)?;
             y += 1;
-        }
-        // Bottom border.
-        if y < panel_bottom {
-            stdout.execute(MoveTo(0, y))?;
-            write!(stdout, "{}", wipe)?;
-            stdout.execute(MoveTo(0, y))?;
-            write!(stdout, "{}", SetForegroundColor(header_color))?;
-            write!(stdout, "{}", bottom)?;
-            write!(stdout, "{}", ResetColor)?;
         }
         Ok(())
     }
@@ -1550,47 +1505,72 @@ impl Renderer {
         let status_row = rows.saturating_sub(1);
         let input_top = rows.saturating_sub(self.input_rows + ALERT_FRAME_ROWS);
 
-        // ui-redesign: paint the light rounded bottom frame around
-        // the input area. Top border (row `input_top - 1`) carries
-        // the centered title (only when an overlay is active —
-        // idle input shows no title per the mockup). Bottom border
-        // (row `status_row - 1`) closes the frame. Side borders
-        // (│) on every input row are painted further down inside
-        // the per-row paint loop.
-        let cols_usize = cols as usize;
+        // ui-redesign: input frame's verticals align with the chat
+        // frame's ║ columns so the whole UI reads as one structure.
+        // Avatar lives in its own rounded box to the left of
+        // `inp_left`; the right region (col > inp_right) is left
+        // empty (matches the mockup — nothing on the bottom-right).
+        let indent = self.content_indent();
+        let chat_w = self.content_width();
+        let inp_left: u16 = indent.saturating_sub(1) as u16;
+        let inp_right: u16 = (indent + chat_w) as u16;
         let dim_color = self.color(crate::ui::theme::dim());
-        if ALERT_FRAME_ROWS >= 1 && input_top > 0 {
+
+        // ── input frame: top border ──
+        if ALERT_FRAME_ROWS >= 1 && input_top > 0 && inp_right > inp_left {
             let top_row = input_top - 1;
-            stdout.execute(MoveTo(0, top_row))?;
-            write!(stdout, "{}", " ".repeat(cols_usize))?;
-            stdout.execute(MoveTo(0, top_row))?;
+            let inner = (inp_right - inp_left).saturating_sub(1) as usize;
+            // Wipe the cols this frame owns so stale content is cleared.
+            stdout.execute(MoveTo(inp_left, top_row))?;
+            write!(stdout, "{}", " ".repeat((inp_right - inp_left + 1) as usize))?;
+            stdout.execute(MoveTo(inp_left, top_row))?;
             write!(stdout, "{}", SetForegroundColor(dim_color))?;
             if self.alert_overlay.is_some() && !self.alert_title.is_empty() {
                 let title = self.alert_title.as_str();
                 let title_w = title.chars().count();
-                let fill = cols_usize.saturating_sub(2).saturating_sub(title_w);
-                let left = fill / 2;
-                let right = fill - left;
+                let fill = inner.saturating_sub(title_w);
+                let l = fill / 2;
+                let r = fill - l;
                 write!(
                     stdout,
                     "╭{}{}{}╮",
-                    "─".repeat(left),
+                    "─".repeat(l),
                     title,
-                    "─".repeat(right),
+                    "─".repeat(r),
                 )?;
             } else {
-                write!(stdout, "╭{}╮", "─".repeat(cols_usize.saturating_sub(2)))?;
+                write!(stdout, "╭{}╮", "─".repeat(inner))?;
             }
             write!(stdout, "{}", ResetColor)?;
         }
-        if ALERT_FRAME_ROWS >= 2 && status_row > 0 {
+        // ── input frame: bottom border ──
+        if ALERT_FRAME_ROWS >= 2 && status_row > 0 && inp_right > inp_left {
             let bot_row = status_row - 1;
-            stdout.execute(MoveTo(0, bot_row))?;
-            write!(stdout, "{}", " ".repeat(cols_usize))?;
-            stdout.execute(MoveTo(0, bot_row))?;
+            let inner = (inp_right - inp_left).saturating_sub(1) as usize;
+            stdout.execute(MoveTo(inp_left, bot_row))?;
+            write!(stdout, "{}", " ".repeat((inp_right - inp_left + 1) as usize))?;
+            stdout.execute(MoveTo(inp_left, bot_row))?;
             write!(stdout, "{}", SetForegroundColor(dim_color))?;
-            write!(stdout, "╰{}╯", "─".repeat(cols_usize.saturating_sub(2)))?;
+            write!(stdout, "╰{}╯", "─".repeat(inner))?;
             write!(stdout, "{}", ResetColor)?;
+        }
+        // Wipe any leftover content in the side panel regions of the
+        // bottom strip so the previous full-width frame's pixels
+        // don't ghost.
+        if ALERT_FRAME_ROWS >= 1 && input_top > 0 {
+            let top_row = input_top - 1;
+            let bot_row = status_row.saturating_sub(1);
+            for r in [top_row, bot_row] {
+                // Clear left margin region (avatar's box overlays
+                // this in draw_avatar).
+                stdout.execute(MoveTo(0, r))?;
+                write!(stdout, "{}", " ".repeat(inp_left as usize))?;
+                // Clear right margin region.
+                if inp_right + 1 < cols {
+                    stdout.execute(MoveTo(inp_right + 1, r))?;
+                    write!(stdout, "{}", " ".repeat((cols - inp_right - 1) as usize))?;
+                }
+            }
         }
         // Heavy block prompt indicator. While running, we tick a 4-stage
         // gradient through the block characters to suggest a phosphor
@@ -1627,23 +1607,28 @@ impl Renderer {
         if let Some(overlay) = &self.alert_overlay {
             for row_offset in 0..visible_input_rows {
                 let row = input_top + row_offset as u16;
-                stdout.execute(MoveTo(0, row))?;
-                write!(stdout, "{}", " ".repeat(cols as usize))?;
-                // Side borders flush against the terminal edges.
-                stdout.execute(MoveTo(0, row))?;
+                // Wipe only the input frame band.
+                stdout.execute(MoveTo(inp_left, row))?;
+                write!(
+                    stdout,
+                    "{}",
+                    " ".repeat((inp_right - inp_left + 1) as usize)
+                )?;
+                // Side borders aligned with the chat frame's ║ cols.
+                stdout.execute(MoveTo(inp_left, row))?;
                 write!(stdout, "{}", SetForegroundColor(dim_color))?;
                 write!(stdout, "│")?;
-                stdout.execute(MoveTo(cols.saturating_sub(1), row))?;
+                stdout.execute(MoveTo(inp_right, row))?;
                 write!(stdout, "│")?;
                 write!(stdout, "{}", ResetColor)?;
                 // Overlay line for this row (if any).
                 if let Some((text, color)) = overlay.get(row_offset) {
-                    let inner_w = (cols as usize).saturating_sub(4);
+                    let inner_w = (inp_right - inp_left).saturating_sub(2) as usize;
                     use unicode_width::UnicodeWidthStr;
                     let dw = UnicodeWidthStr::width(text.as_str()).min(inner_w);
                     let fill = inner_w.saturating_sub(dw);
                     let left = fill / 2;
-                    stdout.execute(MoveTo(2 + left as u16, row))?;
+                    stdout.execute(MoveTo(inp_left + 2 + left as u16, row))?;
                     write!(stdout, "{}", SetForegroundColor(self.color(*color)))?;
                     // Truncate text to inner_w by char-walking
                     // display widths.
@@ -1690,19 +1675,23 @@ impl Renderer {
         for row_offset in 0..visible_input_rows {
             let row = input_top + row_offset as u16;
             let vr_idx = first_visible_visual + row_offset;
-            stdout.execute(MoveTo(0, row))?;
-            write!(stdout, "{}", " ".repeat(cols as usize))?;
-            // ui-redesign: paint │ side borders on every input row
-            // so the bottom frame reads as a closed card. Borders
-            // are painted in theme dim so they recede behind the
-            // input text (theme accent / bold-glowed).
-            stdout.execute(MoveTo(0, row))?;
+            // Wipe only the input frame band so the avatar's box on
+            // the left isn't stomped each redraw.
+            stdout.execute(MoveTo(inp_left, row))?;
+            write!(
+                stdout,
+                "{}",
+                " ".repeat((inp_right - inp_left + 1) as usize)
+            )?;
+            // ui-redesign: │ side borders aligned with the chat
+            // frame's ║ columns so the whole UI shares one vertical.
+            stdout.execute(MoveTo(inp_left, row))?;
             write!(stdout, "{}", SetForegroundColor(dim_color))?;
             write!(stdout, "│")?;
-            stdout.execute(MoveTo(cols.saturating_sub(1), row))?;
+            stdout.execute(MoveTo(inp_right, row))?;
             write!(stdout, "│")?;
             write!(stdout, "{}", ResetColor)?;
-            stdout.execute(MoveTo(bottom_indent as u16, row))?;
+            stdout.execute(MoveTo((bottom_indent + 1) as u16, row))?;
             // Bold-glow the prompt indicator + input text so they
             // match the chat above. Without this the bottom area
             // looked dimmer than the chat that scrolled past it.
@@ -1830,28 +1819,47 @@ impl Renderer {
     /// avatar without overlapping chat content.
     fn draw_avatar(&self, stdout: &mut io::Stdout, input_top: u16) -> io::Result<()> {
         use crate::ui::avatar::{AVATAR_W, art, color};
-        // Single-row avatar painted on the *input* row, horizontally
-        // centered in the left margin between col 0 and the input
-        // prompt. Single-row + on the input row means the avatar
-        // never gets caught in `ensure_room`'s `ScrollUp(1)` — the
-        // input row sits below the scroll region, so the avatar
-        // doesn't smear into the scrollback when chat grows.
+        // ui-redesign: avatar lives in its own rounded box on the
+        // bottom-left, occupying the same vertical extent as the
+        // input frame (rows [input_top - 1, status_row - 1]) and
+        // the cols [0, inp_left - 1] to the left of the chat ║.
+        // Face is centered vertically + horizontally inside.
+        let (_, rows) = self.terminal_size();
         let indent = self.content_indent();
-        if indent < AVATAR_W + 2 {
-            // Not enough margin to fit the avatar with breathing
-            // room around the input prompt's left edge.
+        let inp_left: u16 = indent.saturating_sub(1) as u16;
+        let status_row = rows.saturating_sub(1);
+        if input_top == 0 || status_row == 0 {
             return Ok(());
         }
+        if (inp_left as usize) < AVATAR_W + 2 {
+            return Ok(());
+        }
+        let box_w = inp_left as usize;
+        let inner_w = box_w.saturating_sub(2);
+        let top_row = input_top - 1;
+        let bot_row = status_row - 1;
+        if bot_row <= top_row {
+            return Ok(());
+        }
+        let dim = self.color(crate::ui::theme::dim());
+        // Frame: rounded top + sides + bottom.
+        stdout.execute(MoveTo(0, top_row))?;
+        write!(stdout, "{}", SetForegroundColor(dim))?;
+        write!(stdout, "╭{}╮", "─".repeat(inner_w))?;
+        for r in (top_row + 1)..bot_row {
+            stdout.execute(MoveTo(0, r))?;
+            write!(stdout, "│{}│", " ".repeat(inner_w))?;
+        }
+        stdout.execute(MoveTo(0, bot_row))?;
+        write!(stdout, "╰{}╯", "─".repeat(inner_w))?;
+        write!(stdout, "{}", ResetColor)?;
+        // Center the single-row face vertically + horizontally.
+        let content_rows = bot_row - top_row - 1;
+        let mid_row = top_row + 1 + content_rows / 2;
+        let face_x = 1 + ((inner_w - AVATAR_W) / 2) as u16;
         let face = art(self.avatar_state, self.avatar_tick);
         let painted = self.color(color(self.avatar_state));
-        // Center within [0, indent): x = (indent - AVATAR_W) / 2
-        let x = ((indent - AVATAR_W) / 2) as u16;
-        // Wipe the full margin (cols 0..indent) first so a face from
-        // a previous state doesn't leave fossils when its position
-        // shifts (e.g. theme change, indent recomputed on resize).
-        stdout.execute(MoveTo(0, input_top))?;
-        write!(stdout, "{}", " ".repeat(indent))?;
-        stdout.execute(MoveTo(x, input_top))?;
+        stdout.execute(MoveTo(face_x, mid_row))?;
         write!(stdout, "{}", SetForegroundColor(painted))?;
         if crate::ui::theme::is_bright(color(self.avatar_state)) {
             write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
@@ -1869,74 +1877,35 @@ impl Renderer {
     /// is responsible for moving the cursor back if needed.
     fn draw_panel(&self, stdout: &mut io::Stdout, rows: u16) -> io::Result<()> {
         let (cols, _) = self.terminal_size();
-        let panel_x = cols.saturating_sub(PANEL_WIDTH);
-        let divider_x = panel_x.saturating_sub(1);
-        // Effective panel content width = PANEL_WIDTH - 1 so we never
-        // write to the terminal's absolute last column. On most
-        // terminals, writing the bottom-right cell triggers an
-        // implicit scroll-up — that shifts the panel content up by a
-        // row each redraw and eats the top frame border.
-        let outer_w = (PANEL_WIDTH as usize).saturating_sub(1);
-        // ui-redesign: heavy double-line OUTER frame around the
-        // right panel with `[SYSTEM]` title. Sub-panel lines fit
-        // inside (width = outer_w - 2), each row gets a ║ on either
-        // side painted around the sub-panel content.
-        let inner_w = outer_w.saturating_sub(2);
-        let last_row = rows.saturating_sub(1); // status row — leave alone
-        // Reserve top + bottom rows for the outer frame; sub-panels
-        // paint in rows 1..bottom_frame_row.
-        let bottom_frame_row = last_row.saturating_sub(1);
+        // ui-redesign: right-panel content sits to the right of the
+        // chat frame's right ║. The outer top/bottom frame + the
+        // chat's ║ on the left already enclose this region — no own
+        // frame, no separator column.
+        let indent = self.content_indent();
+        let chat_width = self.content_width();
+        if indent < 1 || chat_width == 0 {
+            return Ok(());
+        }
+        let frame_right = (indent + chat_width) as u16;
+        let panel_x = frame_right + 1; // first col of right panel content
+        if panel_x >= cols {
+            return Ok(());
+        }
+        let inner_w = (cols - panel_x) as usize;
+        let last_row = rows.saturating_sub(1); // status row
+        // Bottom chat frame sits at row chat_y0 + visible_lines();
+        // side panel content ends just above it.
+        let bottom_frame_row = (1 + self.visible_lines()) as u16;
 
-        // Build sub-panel lines at inner width.
         let lines = self.build_panel_lines(inner_w, rows);
 
-        // Themed panel colors. Source lines still use the legacy
-        // sentinels (Color::Cyan = header, Color::Reset = dim,
-        // Color::White = body, Color::Green/Red = status); the paint
-        // stage remaps them to the active theme so the phosphor look
-        // applies without rewriting `build_panel_lines`.
-        let divider_color = self.color(crate::ui::theme::divider());
         let header_color = self.color(crate::ui::theme::header());
         let dim = self.color(crate::ui::theme::dim());
         let body = self.color(crate::ui::theme::agent());
 
-        // Paint the outer top border with centered `[SYSTEM]` title.
-        let title = "[SYSTEM]";
-        let title_w = title.chars().count();
-        let fill = outer_w.saturating_sub(2).saturating_sub(title_w);
-        let l = fill / 2;
-        let r = fill - l;
-        stdout.execute(MoveTo(panel_x, 0))?;
-        write!(stdout, "{}", SetForegroundColor(header_color))?;
-        write!(
-            stdout,
-            "╔{}{}{}╗",
-            "═".repeat(l),
-            title,
-            "═".repeat(r),
-        )?;
-        write!(stdout, "{}", ResetColor)?;
-
-        // Paint the divider on every row (column to the left of the
-        // panel frame).
-        for row in 0..last_row {
-            stdout.execute(MoveTo(divider_x, row))?;
-            write!(stdout, "{}", SetForegroundColor(divider_color))?;
-            write!(stdout, "│")?;
-            write!(stdout, "{}", ResetColor)?;
-        }
-
-        // Sub-panel content occupies rows 1..bottom_frame_row.
-        for row in 1..bottom_frame_row {
+        for row in 1..bottom_frame_row.min(last_row) {
             let idx = (row - 1) as usize;
-            // Outer left border.
             stdout.execute(MoveTo(panel_x, row))?;
-            write!(stdout, "{}", SetForegroundColor(header_color))?;
-            write!(stdout, "║")?;
-            write!(stdout, "{}", ResetColor)?;
-
-            // Sub-panel line (or blank pad).
-            stdout.execute(MoveTo(panel_x + 1, row))?;
             if let Some((text, color)) = lines.get(idx) {
                 let painted = match *color {
                     Color::Cyan => header_color,
@@ -1954,20 +1923,6 @@ impl Renderer {
             } else {
                 write!(stdout, "{}", " ".repeat(inner_w))?;
             }
-
-            // Outer right border.
-            stdout.execute(MoveTo(panel_x + outer_w as u16 - 1, row))?;
-            write!(stdout, "{}", SetForegroundColor(header_color))?;
-            write!(stdout, "║")?;
-            write!(stdout, "{}", ResetColor)?;
-        }
-
-        // Outer bottom border.
-        if bottom_frame_row > 0 {
-            stdout.execute(MoveTo(panel_x, bottom_frame_row))?;
-            write!(stdout, "{}", SetForegroundColor(header_color))?;
-            write!(stdout, "╚{}╝", "═".repeat(outer_w.saturating_sub(2)))?;
-            write!(stdout, "{}", ResetColor)?;
         }
 
         Ok(())
@@ -2338,6 +2293,28 @@ fn left_truncate(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(max);
     out.push('…');
     out.extend(&chars[start..]);
+    out
+}
+
+/// ui-redesign: build a `═══[TITLE]═══` segment of exactly
+/// `total_w` cells with the bracketed title centered. When
+/// `total_w` can't fit the title, fills with bare `═` (label
+/// dropped silently rather than overflowing the frame width).
+fn centered_title(title: &str, total_w: usize) -> String {
+    if total_w == 0 {
+        return String::new();
+    }
+    let tw = unicode_width::UnicodeWidthStr::width(title);
+    if tw >= total_w {
+        return "═".repeat(total_w);
+    }
+    let fill = total_w - tw;
+    let left = fill / 2;
+    let right = fill - left;
+    let mut out = String::with_capacity(total_w * 3);
+    out.push_str(&"═".repeat(left));
+    out.push_str(title);
+    out.push_str(&"═".repeat(right));
     out
 }
 
