@@ -156,7 +156,17 @@ pub fn parse_key_spec(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
         "delete" | "del" => KeyCode::Delete,
         "insert" | "ins" => KeyCode::Insert,
         s if s.starts_with('f') && s.len() > 1 => {
-            let n: u8 = s[1..].parse().ok()?;
+            // L1: strict digit check — `f01` would otherwise parse
+            // as F(1) via lenient u8::from_str. We require the
+            // suffix to be ASCII digits with no leading zero.
+            let suffix = &s[1..];
+            if !suffix.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            if suffix.len() > 1 && suffix.starts_with('0') {
+                return None;
+            }
+            let n: u8 = suffix.parse().ok()?;
             if (1..=12).contains(&n) {
                 KeyCode::F(n)
             } else {
@@ -628,6 +638,17 @@ mod tests {
         // F0 and F13 are out of range.
         assert!(parse_key_spec("f0").is_none());
         assert!(parse_key_spec("f13").is_none());
+    }
+
+    /// L1: leading-zero / non-digit suffixes on function keys are
+    /// rejected. Previously `f01` parsed as F(1) via lenient
+    /// u8::from_str.
+    #[test]
+    fn parse_key_spec_rejects_loose_function_key_digits() {
+        assert!(parse_key_spec("f01").is_none(), "f01 should not parse");
+        assert!(parse_key_spec("f00").is_none(), "f00 should not parse");
+        // Non-digit suffix: not a function key.
+        assert!(parse_key_spec("fx").is_none());
     }
 
     #[test]

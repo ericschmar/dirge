@@ -465,9 +465,14 @@ keys, Ctrl+O (expand collapsed tool result), Ctrl+X (drop interjection),
 PageUp / PageDown / Home / End. Plugin shortcuts dispatch AFTER those
 but BEFORE text input — any unused combination is yours.
 
-Plugins are snapshotted at UI startup; new bindings require restarting
-the host to take effect. Bad specs are dropped with a `tracing::warn`
-so a typo doesn't break the host.
+**Modifier matching is exact** (L2). A binding for `"ctrl-x"` only fires
+on Ctrl+X — Ctrl+Shift+X is a distinct binding. Register both specs if
+you want to match the modifier-superset.
+
+Plugin shortcuts refresh at every event-loop tick (M2), so a hook that
+calls `harness/register-shortcut` mid-session is visible to the next
+keystroke. Bad specs are dropped with a `tracing::warn` so a typo
+doesn't break the host.
 
 See [`plugins/example_shortcut.janet`](../plugins/example_shortcut.janet).
 

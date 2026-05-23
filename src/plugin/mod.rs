@@ -1079,6 +1079,25 @@ mod tests {
         );
     }
 
+    // --- L5: tool-name charset validation ------------------------------
+
+    /// Tool names with spaces, dots, slashes, etc. drop with a
+    /// tracing::warn instead of reaching the LLM provider.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_plugin_tools_drops_invalid_name_chars() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-tool "good_name-1" "" "" "{}" "h")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-tool "bad name" "" "" "{}" "h")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-tool "with.dot" "" "" "{}" "h")"#)
+            .unwrap();
+        let tools = mgr.list_plugin_tools();
+        assert_eq!(tools.len(), 1, "only the valid-charset name survives");
+        assert_eq!(tools[0].name, "good_name-1");
+    }
+
     // --- H2: tool_call_id slot + emit-tool-progress queue --------------
 
     /// Inside an `invoke_plugin_tool` call, `harness/current-tool-call`
@@ -3404,6 +3423,20 @@ fn parse_plugin_tool_line(line: &str) -> Option<PluginToolMeta> {
     if name.is_empty() || handler.is_empty() {
         return None;
     }
+    // L5: validate the LLM-facing tool name against the charset
+    // LLM providers (Anthropic, OpenAI, etc.) accept for tool
+    // names — `[a-zA-Z0-9_-]+`. A plugin that registers `"my tool"`
+    // (with a space) would otherwise reach the provider and either
+    // be rejected at the API boundary or get silently renamed.
+    // Drop the entry with a tracing::warn so the author sees it.
+    if !is_valid_tool_name(&name) {
+        tracing::warn!(
+            target: "dirge::plugin",
+            tool = %name,
+            "plugin tool name contains chars outside [a-zA-Z0-9_-]; dropping",
+        );
+        return None;
+    }
     let execution_mode = match mode_raw {
         "sequential" | "parallel" => Some(mode_raw.to_string()),
         _ => None,
@@ -3422,6 +3455,18 @@ fn parse_plugin_tool_line(line: &str) -> Option<PluginToolMeta> {
         execution_mode,
         prepare_handler,
     })
+}
+
+/// L5: LLM provider tool names must match `[a-zA-Z0-9_-]+`. Spaces,
+/// dots, slashes, unicode etc. either get rejected at the API
+/// boundary or silently renamed — neither is what the plugin author
+/// expected. Drop the registration upfront with a tracing::warn.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// One entry drained from `harness-custom-messages`. Pi parity —
