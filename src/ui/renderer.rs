@@ -58,6 +58,29 @@ pub struct PanelData {
     pub modified: Vec<String>,
 }
 
+/// Per-chat state saved while a chat is INACTIVE. Mirrors the fields
+/// the active chat uses on the `Renderer` itself; switching chats
+/// swaps state in/out via `save_active` / `load_active`. Keeps the
+/// hot-path rendering code unchanged — only chat-switch boundaries
+/// pay the snapshot cost.
+///
+/// dirge-ov2 Phase A: enables multiple subagent chat windows. The
+/// main session is always at index 0; subagent chats start at index
+/// 1. Selection state lives per-chat because a selection in chat A
+/// would be meaningless when chat B is on screen.
+pub struct ChatSnapshot {
+    pub name: String,
+    buffer: Vec<LineEntry>,
+    partial: CompactString,
+    partial_color: Color,
+    scroll_offset: usize,
+    lines: u16,
+    col: u16,
+    selection_active: bool,
+    selection_start: Option<(usize, usize)>,
+    selection_end: Option<(usize, usize)>,
+}
+
 pub struct Renderer {
     lines: u16,
     col: u16,
@@ -66,6 +89,13 @@ pub struct Renderer {
     partial: CompactString,
     partial_color: Color,
     scroll_offset: usize,
+    /// dirge-ov2: snapshots of the OTHER chats — the active chat's
+    /// state lives in the fields above. `chats[active_chat]` is the
+    /// "free slot" (its name/buffer match what's on screen but the
+    /// fields haven't been written into it yet; switching chats
+    /// flushes them).
+    chats: Vec<ChatSnapshot>,
+    active_chat: usize,
     /// Number of rows the input area currently occupies (1 by default, grows
     /// up to MAX_INPUT_VISIBLE_LINES as the user adds newlines or types past
     /// the wrap width). The chat viewport shrinks by the same amount.
@@ -100,6 +130,11 @@ impl Renderer {
             partial: CompactString::new(""),
             partial_color: Color::White,
             scroll_offset: 0,
+            // dirge-ov2: one default "main" chat. Subagent chats are
+            // appended via `add_chat`. Index 0 is always the main
+            // session.
+            chats: vec![ChatSnapshot::empty("main")],
+            active_chat: 0,
             input_rows: 1,
             monochrome: false,
             selection_active: false,
@@ -111,6 +146,103 @@ impl Renderer {
             avatar_tick: false,
         })
     }
+
+    /// dirge-ov2: append a new chat (typically a subagent) with the
+    /// supplied display name. Returns the new chat's index, which the
+    /// caller stores so it can target events at this chat later via
+    /// `switch_chat`.
+    ///
+    /// The new chat starts empty — no buffer entries, no selection,
+    /// no scroll. Does NOT switch to it; the caller chooses when to
+    /// surface the new chat in the UI.
+    pub fn add_chat(&mut self, name: impl Into<String>) -> usize {
+        self.chats.push(ChatSnapshot::empty(name.into()));
+        self.chats.len() - 1
+    }
+
+    /// dirge-ov2: switch the active chat. Saves the current chat's
+    /// state to its snapshot, loads the target chat's snapshot into
+    /// the Renderer's hot fields, and triggers a viewport repaint via
+    /// the next render call. No-op if `idx == active_chat`.
+    pub fn switch_chat(&mut self, idx: usize) {
+        if idx == self.active_chat || idx >= self.chats.len() {
+            return;
+        }
+        self.save_active();
+        self.active_chat = idx;
+        self.load_active();
+    }
+
+    pub fn active_chat(&self) -> usize {
+        self.active_chat
+    }
+
+    pub fn chat_count(&self) -> usize {
+        self.chats.len()
+    }
+
+    pub fn chat_names(&self) -> Vec<String> {
+        // Active chat's name lives in `chats[active_chat]` too (kept
+        // in sync at add-time; mutations of the active chat's name
+        // would go through a dedicated setter if added later).
+        self.chats.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// dirge-ov2: snapshot the current hot fields into the active
+    /// chat's slot. Called before switching chats and when the
+    /// caller wants a consistent persistent state (e.g. session
+    /// save).
+    fn save_active(&mut self) {
+        let slot = &mut self.chats[self.active_chat];
+        slot.buffer = std::mem::take(&mut self.buffer);
+        slot.partial = std::mem::take(&mut self.partial);
+        slot.partial_color = self.partial_color;
+        slot.scroll_offset = self.scroll_offset;
+        slot.lines = self.lines;
+        slot.col = self.col;
+        slot.selection_active = self.selection_active;
+        slot.selection_start = self.selection_start;
+        slot.selection_end = self.selection_end;
+    }
+
+    /// dirge-ov2: load the active chat's snapshot into the hot
+    /// fields. Inverse of `save_active`. Called after `switch_chat`
+    /// updates `active_chat`.
+    fn load_active(&mut self) {
+        let slot = &mut self.chats[self.active_chat];
+        self.buffer = std::mem::take(&mut slot.buffer);
+        self.partial = std::mem::take(&mut slot.partial);
+        self.partial_color = slot.partial_color;
+        self.scroll_offset = slot.scroll_offset;
+        self.lines = slot.lines;
+        self.col = slot.col;
+        self.selection_active = slot.selection_active;
+        self.selection_start = slot.selection_start;
+        self.selection_end = slot.selection_end;
+    }
+}
+
+impl ChatSnapshot {
+    fn empty(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            buffer: Vec::new(),
+            partial: CompactString::new(""),
+            partial_color: Color::White,
+            scroll_offset: 0,
+            lines: 0,
+            col: 0,
+            selection_active: false,
+            selection_start: None,
+            selection_end: None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Renderer {
+    // (continuation marker — methods below this block remain unchanged)
+    fn _ov2_phase_a_anchor() {}
 
     /// Update the avatar state and trigger a repaint of the bottom-left
     /// pixels. Cheap when the state hasn't changed — only the existing
@@ -1634,6 +1766,63 @@ pub fn copy_to_clipboard(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-ov2 Phase A: chat switching saves the prior chat's
+    /// buffer and selection, then loads the target chat's snapshot.
+    /// Round-trip preserves content.
+    #[test]
+    fn chat_snapshot_save_load_roundtrip() {
+        let mut r = Renderer::new().expect("renderer");
+        // Default chat is "main" at index 0.
+        assert_eq!(r.active_chat(), 0);
+        assert_eq!(r.chat_count(), 1);
+        assert_eq!(r.chat_names(), vec!["main".to_string()]);
+
+        // Seed main chat with some content.
+        r.buffer.push(LineEntry {
+            text: CompactString::new("main-line-1"),
+            color: Color::White,
+        });
+        r.scroll_offset = 5;
+
+        // Spawn a subagent chat and switch to it.
+        let sub_idx = r.add_chat("subagent-1");
+        assert_eq!(sub_idx, 1);
+        assert_eq!(r.chat_count(), 2);
+        r.switch_chat(sub_idx);
+        assert_eq!(r.active_chat(), 1);
+
+        // Subagent chat starts empty.
+        assert!(r.buffer.is_empty());
+        assert_eq!(r.scroll_offset, 0);
+
+        // Add content to the subagent chat.
+        r.buffer.push(LineEntry {
+            text: CompactString::new("sub-line-1"),
+            color: Color::Cyan,
+        });
+        r.scroll_offset = 2;
+
+        // Switch back to main — its content must be restored.
+        r.switch_chat(0);
+        assert_eq!(r.buffer.len(), 1);
+        assert_eq!(r.buffer[0].text.as_str(), "main-line-1");
+        assert_eq!(r.scroll_offset, 5);
+
+        // Switch back to subagent — its content also restored.
+        r.switch_chat(1);
+        assert_eq!(r.buffer.len(), 1);
+        assert_eq!(r.buffer[0].text.as_str(), "sub-line-1");
+        assert_eq!(r.scroll_offset, 2);
+
+        // Switch to same chat is a no-op.
+        r.switch_chat(1);
+        assert_eq!(r.buffer.len(), 1);
+
+        // Out-of-range index is a no-op (defensive — caller bug).
+        r.switch_chat(99);
+        assert_eq!(r.active_chat(), 1);
+    }
 
     /// Create a renderer with a synthetic buffer of `n` short lines so we
     /// can drive scroll/append behavior without touching a real terminal.
