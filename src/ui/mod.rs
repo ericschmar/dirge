@@ -2002,15 +2002,57 @@ pub async fn run_interactive(
                                 continue;
                             }
                             if text.starts_with('/') {
-                                if is_running && !matches!(
-                                    text.split_whitespace().next().unwrap_or(""),
-                                    "/quit" | "/help" | "/reasoning"
-                                ) {
+                                // dirge-nfa: read-only inspection
+                                // commands run during agent activity.
+                                // The busy gate ONLY blocks commands
+                                // that mutate state (clear, compress,
+                                // cd, model switch, prompt switch,
+                                // etc.). Looking at chat windows /
+                                // help / sessions list / tree show
+                                // doesn't need the agent idle.
+                                //
+                                // List matches:
+                                //   - the existing always-allowed
+                                //     set (/quit, /help, /reasoning)
+                                //   - inspection commands surfaced
+                                //     by the multi-chat work (/tasks)
+                                //   - read-only variants of other
+                                //     commands (no-arg /sessions,
+                                //     /tree, /model, /prompt,
+                                //     /memory list, /skill list)
+                                //
+                                // No-arg detection: the head word
+                                // matches alone; if there's an
+                                // argument, treat as potentially
+                                // mutating and gate.
+                                let head = text.split_whitespace().next().unwrap_or("");
+                                let args = text
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .map(|s| s.to_string());
+                                let always_safe = matches!(
+                                    head,
+                                    "/quit" | "/help" | "/reasoning" | "/tasks"
+                                );
+                                let safe_when_no_arg = matches!(
+                                    head,
+                                    "/sessions"
+                                        | "/tree"
+                                        | "/model"
+                                        | "/prompt"
+                                ) && args.is_none();
+                                let safe_when_list = matches!(
+                                    (head, args.as_deref()),
+                                    ("/memory", Some("list")) | ("/skill", Some("list"))
+                                );
+                                let safe_during_agent =
+                                    always_safe || safe_when_no_arg || safe_when_list;
+                                if is_running && !safe_during_agent {
                                     write_outside_chamber(
                                         &mut renderer,
                                         &mut last_tool_name,
                                         &mut tool_chamber_open,
-                                        "agent is busy — wait, interrupt (Ctrl+C), or use /quit",
+                                        "agent is busy — wait, interrupt (Ctrl+C), or use /quit. (/tasks /help /sessions /tree /model /prompt run during agent activity.)",
                                         c_error(),
                                     )?;
                                     renderer.draw_bottom(

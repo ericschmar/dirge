@@ -39,6 +39,13 @@ pub enum SubagentChatEvent {
 }
 
 pub type SubagentChatSender = mpsc::UnboundedSender<SubagentChatEvent>;
+
+/// Receiver side of the subagent chat-event channel — exposed for
+/// the UI loop's `tokio::select!` arm. Only consumed in main.rs +
+/// ui/mod.rs; marked `dead_code`-allow because the producer side
+/// (TaskTool) lives in this module and `cargo check` sees only the
+/// definition site, not the cross-module consumer.
+#[allow(dead_code)]
 pub type SubagentChatReceiver = mpsc::UnboundedReceiver<SubagentChatEvent>;
 
 /// dirge-ov2 Phase D: process-global sender for subagent chat
@@ -95,6 +102,11 @@ impl TaskTool {
     /// agent builder when constructing the TaskTool for an
     /// interactive session. Headless / test paths skip this so the
     /// tool behaves identically to the pre-ov2 implementation.
+    ///
+    /// Currently unused in production — the process-global sink
+    /// (set via `set_subagent_chat_sink`) is the wired path. Kept
+    /// for tests + future per-instance overrides.
+    #[allow(dead_code)]
     pub fn with_chat_sink(mut self, sink: SubagentChatSender) -> Self {
         self.chat_sink = Some(sink);
         self
