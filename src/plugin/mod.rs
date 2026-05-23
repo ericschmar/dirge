@@ -978,6 +978,59 @@ mod tests {
         assert!(err.contains("kaboom"), "got: {err}");
     }
 
+    // --- P9e: end-to-end load of example plugins -----------------------
+
+    /// Smoke test (P9e): load the three example plugins shipped under
+    /// `plugins/example_*.janet` and verify each phase-9 registry
+    /// surfaces them. This is the integration guard against
+    /// silently breaking the documented plugin contract — if a
+    /// future refactor changes the wire format, this test fails
+    /// before the docs do.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn phase9_example_plugins_load_end_to_end() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let plugins_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
+
+        mgr.load_file(&plugins_dir.join("example_tool.janet")).unwrap();
+        mgr.load_file(&plugins_dir.join("example_shortcut.janet")).unwrap();
+        mgr.load_file(&plugins_dir.join("example_message_renderer.janet"))
+            .unwrap();
+
+        // 9a — registered tool surfaces in the registry with the
+        // documented metadata.
+        let tools = mgr.list_plugin_tools();
+        assert_eq!(tools.len(), 1, "example_tool.janet registers exactly one tool");
+        assert_eq!(tools[0].name, "plugin_echo");
+        assert_eq!(tools[0].label, "Plugin Echo");
+        assert_eq!(tools[0].handler, "echo-tool-handler");
+
+        // Tool dispatch round-trips: the LLM-supplied args reach
+        // the Janet handler intact.
+        let out = mgr
+            .invoke_plugin_tool("echo-tool-handler", r#"{"msg":"hi"}"#)
+            .unwrap();
+        assert_eq!(out, r#"echo received args: {"msg":"hi"}"#);
+
+        // 9c — example_shortcut.janet registers two bindings.
+        let shortcuts = mgr.list_shortcuts();
+        assert_eq!(shortcuts.len(), 2);
+        let specs: Vec<_> = shortcuts.iter().map(|s| s.keys.as_str()).collect();
+        assert!(specs.contains(&"f5"));
+        assert!(specs.contains(&"ctrl-s"));
+
+        // 9d — message renderer registered for "status".
+        let renderers = mgr.list_message_renderers();
+        assert_eq!(renderers, vec![("status".to_string(), "render-status".to_string())]);
+        let rendered = mgr
+            .invoke_message_renderer("render-status", r#"{"type":"status","content":"ok"}"#)
+            .unwrap();
+        assert!(rendered.is_some());
+        let txt = rendered.unwrap();
+        assert!(txt.contains("status"), "got: {txt:?}");
+        assert!(txt.contains("ok"), "got: {txt:?}");
+    }
+
     // --- P9d: plugin-registered message renderers -----------------------
 
     #[cfg(feature = "plugin")]

@@ -26,9 +26,12 @@ that make plugins easy to write and easy to debug.
    4. [Notifications and entries](#notifications-and-entries)
    5. [Renderers](#renderers)
    6. [Slash commands](#slash-commands)
-   7. [User dialogs](#user-dialogs)
-   8. [Custom LLM providers](#custom-llm-providers)
-   9. [Session-tree control](#session-tree-control)
+   7. [Custom tools](#custom-tools)
+   8. [Keyboard shortcuts](#keyboard-shortcuts)
+   9. [Message renderers](#message-renderers)
+   10. [User dialogs](#user-dialogs)
+   11. [Custom LLM providers](#custom-llm-providers)
+   12. [Session-tree control](#session-tree-control)
 5. [Workflow patterns](#workflow-patterns)
 6. [Debugging plugins](#debugging-plugins)
 7. [Threading model and pitfalls](#threading-model-and-pitfalls)
@@ -340,6 +343,110 @@ and displays the return string. Return `nil` to display nothing.
 
 The handler runs synchronously on the Janet worker thread; long-running
 handlers will stall the agent until they return.
+
+### Custom tools
+
+Plugins can register tools the LLM calls directly, not just intercept
+built-in ones. Mirrors pi's `api.registerTool({...})`.
+
+```janet
+(defn echo-tool-handler [args]
+  # `args` is the raw JSON string the LLM produced. Plugins parse
+  # themselves if they want structured fields.
+  (string "echo received args: " args))
+
+(harness/register-tool
+  "plugin_echo"                          # LLM-visible tool name
+  "Echoes the args back verbatim."       # description shown to the LLM
+  "Plugin Echo"                          # UI display label
+  "{\"type\":\"object\",\"properties\":{\"msg\":{\"type\":\"string\"}},\"required\":[\"msg\"]}"
+  "echo-tool-handler"                    # handler fn name
+  :parallel)                             # optional: :parallel or :sequential
+```
+
+| Field | Notes |
+|-------|-------|
+| `name` | What the LLM sees in tool calls. Must not collide with a built-in (`read`, `bash`, etc.); collisions drop the plugin tool with a warning. |
+| `description` | Shown to the LLM in the tool list. State *when* to use the tool and the expected arg shape; this is what the model reads. |
+| `label` | UI display name (chat banner). Falls back to `name` when empty. |
+| `parameters` | JSON-schema string. Parsed once at startup; invalid JSON falls back to `{}` with a `tracing::warn`. |
+| `handler` | Janet function name. Called as `(handler args-json-string)`. Returns either a string (used directly) or any value `(string …)` can render. Errors surface to the LLM as tool failure. |
+| `execution-mode` | `:parallel` (default; read-only) or `:sequential` (mutating). One sequential tool forces the whole tool batch sequential. |
+
+See [`plugins/example_tool.janet`](../plugins/example_tool.janet).
+
+### Keyboard shortcuts
+
+Bind a key combination in interactive mode. Mirrors pi's
+`api.registerShortcut(KeyId, {handler})`.
+
+```janet
+(defn refresh-handler [key]
+  (string "F5 (" key ") pressed"))
+
+(harness/register-shortcut "f5"     "refresh-handler" "Refresh chat (demo)")
+(harness/register-shortcut "ctrl-s" "save-handler"    "Save (demo)")
+```
+
+**Key spec grammar** (case-insensitive):
+
+```
+(modifier "-")* key-name
+```
+
+| Modifiers | `ctrl`, `control`, `alt`, `meta`, `shift` |
+|-----------|-------------------------------------------|
+| Key names | A single character, `f1`..`f12`, or: `enter`, `esc`, `tab`, `backspace`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` |
+
+Examples: `"ctrl-x"`, `"alt-shift-f"`, `"f5"`, `"ctrl-alt-enter"`.
+
+Handlers receive the matched key spec as a single string argument so
+one handler can serve many bindings. Returning a non-nil string
+surfaces as a chat line.
+
+**Reserved keys** that plugins **cannot** override (kill signals + core
+UX): Ctrl+C, Ctrl+D, Esc (mid-run cancel), the search and rewind picker
+keys, Ctrl+O (expand collapsed tool result), Ctrl+X (drop interjection),
+PageUp / PageDown / Home / End. Plugin shortcuts dispatch AFTER those
+but BEFORE text input — any unused combination is yours.
+
+Plugins are snapshotted at UI startup; new bindings require restarting
+the host to take effect. Bad specs are dropped with a `tracing::warn`
+so a typo doesn't break the host.
+
+See [`plugins/example_shortcut.janet`](../plugins/example_shortcut.janet).
+
+### Message renderers
+
+Provide a Janet function the UI invokes when a `LoopMessage::Custom`
+event reaches the chat. Custom messages enter the loop via
+`harness/add-custom-message` (typically from a `prepare-next-run` or
+`on-turn-end` hook) and are filtered out of the LLM context — they're
+UI-only. Without a registered renderer the UI falls back to extracting
+the payload's `content` field, or stringifying the whole payload.
+
+Mirrors pi's `api.registerMessageRenderer(customType, renderer)`.
+
+```janet
+(defn render-status [payload]
+  (string "■ status: " payload))
+
+(harness/register-message-renderer "status" "render-status")
+
+(defn prepare-next-run [ctx]
+  (harness/add-custom-message
+    "{\"type\":\"status\",\"content\":\"another turn complete\"}"))
+```
+
+The renderer's `payload` argument is the raw JSON string. The UI looks
+up the renderer by the payload's `type` field, calls it, and prints
+the result as `[plugin:<type>] <text>`.
+
+Distinct from [`harness/register-renderer`](#renderers), which handles
+session-timeline entries (bookmarks, telemetry) — message renderers
+fire live mid-conversation.
+
+See [`plugins/example_message_renderer.janet`](../plugins/example_message_renderer.janet).
 
 ### User dialogs
 
