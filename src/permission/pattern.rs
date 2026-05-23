@@ -128,6 +128,55 @@ mod tests {
         }
     }
 
+    /// F3 (dirge-efw): a trailing ` *` in a command-style pattern
+    /// makes the args optional. So `ls *` matches BOTH `ls` (no
+    /// args) and `ls -la` (with args). Matches opencode's
+    /// `util/wildcard.ts:13-15` semantic. Without this, a session
+    /// allowlist entry `ls *` re-prompts when the agent next
+    /// invokes bare `ls`.
+    #[test]
+    fn f3_command_trailing_space_star_makes_args_optional() {
+        let pat = Pattern::new_command("ls *");
+        // With args — same as before.
+        assert!(pat.matches("ls -la"));
+        assert!(pat.matches("ls /tmp"));
+        // Without args — NEW behavior post-F3.
+        assert!(pat.matches("ls"));
+        // Doesn't over-match a different command that happens to
+        // start with `ls`.
+        assert!(!pat.matches("lsof"));
+        assert!(!pat.matches("less"));
+    }
+
+    /// F3 doesn't affect path-style patterns. `src/*` still
+    /// matches single-segment files and doesn't span directories.
+    /// (Note: `src/` itself matches because `*` accepts empty
+    /// segments — pre-existing behavior, orthogonal to F3.)
+    #[test]
+    fn f3_does_not_relax_path_patterns() {
+        let pat = Pattern::new("src/*");
+        // With segment — matches.
+        assert!(pat.matches("src/main.rs"));
+        // Doesn't span directories (existing semantic).
+        assert!(!pat.matches("src/agent/main.rs"));
+        // Bare `src` (no trailing slash) — pre-F3 behavior:
+        // doesn't match because pattern requires the `/`.
+        assert!(!pat.matches("src"));
+    }
+
+    /// F3: bare `git *` doesn't accidentally swallow other commands.
+    #[test]
+    fn f3_anchored_to_command_head() {
+        let pat = Pattern::new_command("git *");
+        assert!(pat.matches("git"));
+        assert!(pat.matches("git status"));
+        assert!(pat.matches("git diff --name-only"));
+        // Not anchored to a prefix; bare `git` matches but
+        // `gitk` does not.
+        assert!(!pat.matches("gitk"));
+        assert!(!pat.matches("egit"));
+    }
+
     // Regex metachars in pattern text must be escaped, not interpreted.
     #[test]
     fn special_chars_are_escaped() {
@@ -140,8 +189,32 @@ mod tests {
 }
 
 fn glob_to_regex(pattern: &str, path_style: bool) -> String {
+    // F3 (dirge-efw): trailing ` *` becomes ` (?:.*)?$` — opencode's
+    // `util/wildcard.ts:13-15` semantic. Lets a session-allowlist
+    // pattern like `ls *` match BOTH `ls` (no args) and `ls -la`
+    // (with args). Without this rewrite, `ls *` compiles to
+    // `^ls .*$` which requires the trailing space, so the user
+    // gets re-prompted for bare `ls`.
+    //
+    // Applies only to command-style patterns (path_style=false).
+    // Path patterns like `src/*` legitimately require at least
+    // one character after the slash; relaxing those would let
+    // `src/` (the directory itself, no file) match a per-file
+    // rule. Command tools use shell-style globbing where the
+    // optional-trailing-arg semantic is the user expectation.
+    if !path_style && pattern.ends_with(" *") && !pattern.ends_with("\\ *") {
+        let head = &pattern[..pattern.len() - 2];
+        let head_regex = glob_to_regex_inner(head, path_style);
+        return format!("^{head_regex}(?: .*)?$");
+    }
+    format!("^{}$", glob_to_regex_inner(pattern, path_style))
+}
+
+/// Inner glob → regex without the leading `^` and trailing `$`
+/// anchors. Separated so the F3 trailing-space-star rewrite can
+/// wrap the head independently.
+fn glob_to_regex_inner(pattern: &str, path_style: bool) -> String {
     let mut re = String::with_capacity(pattern.len() * 2);
-    re.push('^');
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -171,6 +244,5 @@ fn glob_to_regex(pattern: &str, path_style: bool) -> String {
             _ => re.push(c),
         }
     }
-    re.push('$');
     re
 }

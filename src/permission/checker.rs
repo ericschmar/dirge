@@ -973,6 +973,51 @@ mod tests {
         }
     }
 
+    /// F2 (dirge-jlj): write / apply_patch alias to the `edit`
+    /// permission. `edit: deny` blocks all three uniformly (matches
+    /// opencode's `EDIT_TOOLS` aliasing). This is enforced at the
+    /// `enforce` chokepoint, not in the checker — but the underlying
+    /// rules behavior must be sound, which we exercise here.
+    #[test]
+    fn f2_edit_alias_check_path_directly_for_write_and_apply_patch() {
+        // The checker itself doesn't alias — that lives in
+        // `tools::enforce`. But pin that the checker's `edit`
+        // rules behave as the user expects when consulted with
+        // the edit tool name.
+        use crate::permission::ToolPerm;
+        use std::collections::HashMap;
+
+        let mut edit_rules = HashMap::new();
+        edit_rules.insert("**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            edit: Some(ToolPerm::Granular(edit_rules)),
+            ..Default::default()
+        };
+
+        let mut checker = PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        );
+
+        // Direct `edit` query: hit the deny rule.
+        assert!(matches!(
+            checker.check_path("edit", "/tmp/x.rs"),
+            CheckResult::Denied(_)
+        ));
+        // Direct `write` query (no aliasing at checker level):
+        // write has no rules → builtin-not-installed (write isn't
+        // in M4 builtin-allow) → falls to default Ask.
+        assert!(matches!(
+            checker.check_path("write", "/tmp/x.rs"),
+            CheckResult::Ask
+        ));
+        // `tools::enforce` is what ties these together. The
+        // alias test for that path lives in src/agent/tools/mod.rs
+        // (covered indirectly by the bash F1 tests below since
+        // write rules drive the redirect-target gate).
+    }
+
     /// Explicit user rules override the M4 builtin-allow list.
     #[test]
     fn m4_user_rule_overrides_builtin_allow() {

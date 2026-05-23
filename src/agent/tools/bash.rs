@@ -366,6 +366,19 @@ async fn check_bash_segments(
         for target in bash::extract_redirect_targets(command) {
             enforce(permission, ask_tx, "write", Scope::PathResolve(&target)).await?;
         }
+        // F1 (dirge-dvy): route positional path arguments to
+        // file-mutating commands (rm / cp / mv / mkdir / rmdir /
+        // touch / chmod / chown / ln / tee / dd) through the write
+        // rules too. Without this, a permissive bash rule like
+        // `rm *: allow` silently allowed `rm /etc/passwd` because
+        // the path-side write deny never saw the argument. Ported
+        // from opencode shell.ts:30-51 (`FILES` set) + :191-221
+        // (`pathArgs` filter logic). The extractor skips flags
+        // (`-r`, `--recursive`), chmod permission specs (`+x`),
+        // and chmod/chown's first positional arg (mode / owner).
+        for path in bash::extract_mutation_paths(command) {
+            enforce(permission, ask_tx, "write", Scope::PathResolve(&path)).await?;
+        }
         Ok(())
     }
     #[cfg(not(feature = "semantic-bash"))]
@@ -784,6 +797,113 @@ mod tests {
     /// not the write-rules-allow path we want to exercise here.
     /// M3 is intentionally tightening external bash-redirects to
     /// prompt; this test pins the in-cwd happy path.
+    // F1 (dirge-dvy) — bash arg-side path checks. Pin that
+    // file-mutating commands route their positional path args
+    // through the write rules, independent of the bash command-
+    // pattern check.
+
+    /// `rm /etc/passwd` is denied via write rules even when the
+    /// user's bash config is otherwise permissive. Pre-F1: the
+    /// path-side check never ran for arguments (only redirect
+    /// targets), so a `bash: { "rm *": "allow" }` rule silently
+    /// allowed `rm /etc/passwd`. Post-F1: the path arg routes
+    /// through `enforce(write, /etc/passwd)` and the user's
+    /// write deny rule fires.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn rm_arg_path_routes_through_write_rules() {
+        use crate::permission::{
+            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+        };
+        use std::collections::HashMap;
+
+        // Permissive bash: allow `rm *`. Restrictive write: deny
+        // `/etc/**`. Without F1, the bash allow would let
+        // `rm /etc/passwd` through.
+        let mut bash_rules = HashMap::new();
+        bash_rules.insert("rm *".to_string(), Action::Allow);
+        let mut write_rules = HashMap::new();
+        write_rules.insert("/etc/**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            bash: Some(ToolPerm::Granular(bash_rules)),
+            write: Some(ToolPerm::Granular(write_rules)),
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result = check_bash_segments(&Some(perm), &None, "rm /etc/passwd").await;
+        assert!(
+            result.is_err(),
+            "rm /etc/passwd must hit write deny rule even when bash rule allows; got {result:?}",
+        );
+    }
+
+    /// chmod's FIRST arg (the mode spec like `777` or `u+x`) is
+    /// NOT treated as a path. Only subsequent positional args go
+    /// through the write check.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn chmod_skips_mode_spec_routes_paths() {
+        use crate::permission::{
+            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+        };
+        use std::collections::HashMap;
+
+        let mut bash_rules = HashMap::new();
+        bash_rules.insert("chmod *".to_string(), Action::Allow);
+        let mut write_rules = HashMap::new();
+        write_rules.insert("/etc/**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            bash: Some(ToolPerm::Granular(bash_rules)),
+            write: Some(ToolPerm::Granular(write_rules)),
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        // `777` is the mode spec; it must NOT be treated as a
+        // path arg (would resolve to /cwd/777, false-positive).
+        // `/etc/passwd` IS a path → should hit write deny.
+        let result =
+            check_bash_segments(&Some(perm), &None, "chmod 777 /etc/passwd").await;
+        assert!(
+            result.is_err(),
+            "chmod 777 /etc/passwd: mode skipped, path arg gated; got {result:?}",
+        );
+    }
+
+    /// Flags (`-r`, `--recursive`) are correctly skipped when
+    /// extracting path args.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn flags_skipped_when_extracting_paths() {
+        use crate::permission::{
+            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+        };
+        use std::collections::HashMap;
+
+        let mut bash_rules = HashMap::new();
+        bash_rules.insert("rm *".to_string(), Action::Allow);
+        let mut write_rules = HashMap::new();
+        write_rules.insert("/etc/**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            bash: Some(ToolPerm::Granular(bash_rules)),
+            write: Some(ToolPerm::Granular(write_rules)),
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        // `-rf` is a flag; `/etc/passwd` is the path. Flag is
+        // skipped, path hits deny.
+        let result = check_bash_segments(&Some(perm), &None, "rm -rf /etc/passwd").await;
+        assert!(
+            result.is_err(),
+            "rm -rf /etc/passwd: flag skipped, path arg gated; got {result:?}",
+        );
+    }
+
     #[cfg(feature = "semantic-bash")]
     #[tokio::test]
     async fn redirect_target_allowed_when_write_permits() {
@@ -793,13 +913,18 @@ mod tests {
         use std::collections::HashMap;
 
         // M4 (dirge-ojn): `write` no longer defaults to Allow; it
-        // falls to the new global Ask. Install an explicit write
-        // allow rule for the test target so the post-M4 default
-        // doesn't turn this into a "no ask_tx → denied" failure.
+        // falls to the new global Ask. F2 (dirge-jlj): write
+        // additionally consults `edit` rules. Install allow rules
+        // for BOTH so the combined check passes — matches the
+        // user-facing semantic that "write to X" requires write
+        // AND edit to permit it.
         let mut write_rules = HashMap::new();
         write_rules.insert("**".to_string(), Action::Allow);
+        let mut edit_rules = HashMap::new();
+        edit_rules.insert("**".to_string(), Action::Allow);
         let config = PermissionConfig {
             write: Some(ToolPerm::Granular(write_rules)),
+            edit: Some(ToolPerm::Granular(edit_rules)),
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);

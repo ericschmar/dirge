@@ -285,21 +285,53 @@ pub async fn enforce(
         return Ok(raw_scope.to_string());
     };
 
-    let (result, resolved) = {
-        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        match &scope {
-            Scope::Raw(key) => (guard.check(tool, key), raw_scope.to_string()),
-            Scope::Path(path) => (guard.check_path(tool, path), raw_scope.to_string()),
+    // Inner pure-lookup helper. Reads the checker, returns
+    // (CheckResult, resolved-path). Doesn't touch the ask flow —
+    // that's separate so the F2 alias check can MERGE results
+    // before any prompting fires.
+    fn inner_check(
+        guard: &mut crate::permission::checker::PermissionChecker,
+        tool: &str,
+        scope: &Scope<'_>,
+    ) -> (CheckResult, String) {
+        match scope {
+            Scope::Raw(key) => (guard.check(tool, key), (*key).to_string()),
+            Scope::Path(path) => (guard.check_path(tool, path), (*path).to_string()),
             Scope::PathResolve(path) => {
-                // Compute resolved BEFORE check_path so a `Denied`
-                // result still gets the canonical path back for
-                // the (currently-discarded) error path. Cheap —
-                // just a canonicalize call on the underlying
-                // checker's cached path.
                 let resolved = guard.resolve_path_for_tool(path);
                 let r = guard.check_path(tool, path);
                 (r, resolved)
             }
+        }
+    }
+
+    // F2 (dirge-jlj): write / apply_patch alias to the `edit`
+    // permission. Mirrors opencode's `EDIT_TOOLS` aliasing
+    // (`permission/index.ts:291-301`): a user writing
+    // `edit: { "**": "deny" }` blocks all three uniformly.
+    //
+    // Strategy: take the MOST RESTRICTIVE outcome between the
+    // tool's own rules and the edit rules. Deny > Ask > Allow.
+    // If the tool's specific rule allows but `edit` denies, the
+    // edit deny wins — broader deny-list semantics. If both Ask,
+    // we prompt ONCE (avoids double-prompting).
+    let (result, resolved) = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let primary = inner_check(&mut guard, tool, &scope);
+        if matches!(tool, "write" | "apply_patch") {
+            let alias = inner_check(&mut guard, "edit", &scope);
+            // Combine: most restrictive wins. Use primary's
+            // resolved-path (the tool's own canonicalization
+            // anchored to its rule set, not edit's).
+            let combined = match (&primary.0, &alias.0) {
+                (CheckResult::Denied(reason), _) => CheckResult::Denied(reason.clone()),
+                (_, CheckResult::Denied(reason)) => CheckResult::Denied(reason.clone()),
+                (CheckResult::Ask, _) | (_, CheckResult::Ask) => CheckResult::Ask,
+                _ => CheckResult::Allowed,
+            };
+            (combined, primary.1)
+        } else {
+            primary
         }
     };
 
@@ -373,3 +405,131 @@ pub async fn check_perm_path_resolve(
 // EditTool, ApplyPatchTool) now drop the file-name comparison and
 // rely on the prompt's deny-list to refuse the entire tool in plan
 // mode.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::{
+        Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// F2 (dirge-jlj): `enforce(write, ...)` MUST also consult the
+    /// `edit` rules. A user writing `edit: { "**": "deny" }`
+    /// blocks `write` AND `apply_patch` too — matching opencode's
+    /// `EDIT_TOOLS` aliasing.
+    #[tokio::test]
+    async fn enforce_write_aliases_to_edit_deny() {
+        let mut edit_rules = HashMap::new();
+        edit_rules.insert("**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            edit: Some(ToolPerm::Granular(edit_rules)),
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        );
+        let perm: PermCheck = Arc::new(Mutex::new(checker));
+
+        let result = enforce(
+            &Some(perm.clone()),
+            &None,
+            "write",
+            Scope::PathResolve("/tmp/x.rs"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_)),
+            "edit deny should propagate to write; got {result:?}",
+        );
+
+        let result = enforce(
+            &Some(perm),
+            &None,
+            "apply_patch",
+            Scope::PathResolve("/tmp/x.rs"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_)),
+            "edit deny should propagate to apply_patch; got {result:?}",
+        );
+    }
+
+    /// F2: most-restrictive-wins. If `write` is explicitly Allow
+    /// but `edit` is Deny, the Deny wins.
+    #[tokio::test]
+    async fn enforce_write_alias_most_restrictive_wins() {
+        let mut edit_rules = HashMap::new();
+        edit_rules.insert("/etc/**".to_string(), Action::Deny);
+        let mut write_rules = HashMap::new();
+        write_rules.insert("**".to_string(), Action::Allow);
+        let config = PermissionConfig {
+            edit: Some(ToolPerm::Granular(edit_rules)),
+            write: Some(ToolPerm::Granular(write_rules)),
+            ..Default::default()
+        };
+        let checker =
+            PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm: PermCheck = Arc::new(Mutex::new(checker));
+
+        // `/etc/passwd`: write allows (`**`), edit denies (`/etc/**`).
+        // More restrictive (deny) wins.
+        let result = enforce(
+            &Some(perm.clone()),
+            &None,
+            "write",
+            Scope::PathResolve("/etc/passwd"),
+        )
+        .await;
+        assert!(matches!(result, Err(_)));
+
+        // `/tmp/x.rs`: write allows (`**`), edit's `/etc/**`
+        // doesn't match → edit lookup = Ask (default), write = Allow.
+        // Combined: Ask (more restrictive). No ask_tx → "non-interactive
+        // mode" deny.
+        let result = enforce(
+            &Some(perm),
+            &None,
+            "write",
+            Scope::PathResolve("/tmp/x.rs"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_)),
+            "/tmp/x.rs: write Allow + edit Ask → combined Ask → non-interactive deny; got {result:?}",
+        );
+    }
+
+    /// F2 negative: tools NOT in EDIT_TOOLS aren't aliased.
+    /// `read` shouldn't be affected by edit rules.
+    #[tokio::test]
+    async fn enforce_read_does_not_alias_to_edit() {
+        let mut edit_rules = HashMap::new();
+        edit_rules.insert("**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            edit: Some(ToolPerm::Granular(edit_rules)),
+            ..Default::default()
+        };
+        let checker =
+            PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm: PermCheck = Arc::new(Mutex::new(checker));
+
+        // read has builtin-allow `**: allow` → succeeds
+        // regardless of edit's deny.
+        let result = enforce(
+            &Some(perm),
+            &None,
+            "read",
+            Scope::PathResolve("anywhere.rs"),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(_)),
+            "read isn't aliased to edit; should pass via builtin-allow; got {result:?}",
+        );
+    }
+}

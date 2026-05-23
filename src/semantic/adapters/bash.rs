@@ -241,6 +241,133 @@ pub fn extract_redirect_targets(command: &str) -> Vec<String> {
     }
 }
 
+/// F1 (dirge-dvy): extract positional path arguments to file-mutating
+/// commands so the permission layer can route each through the write
+/// rules — independent of the bash command-pattern check.
+///
+/// Concrete bypass this closes: a user adds `bash: { "rm *": "allow" }`
+/// for convenience. The bash command-pattern check allows
+/// `rm /etc/passwd` because it matches `rm *`. Without this extractor,
+/// the path `/etc/passwd` never reaches the write rules → silently
+/// deleted. With it, every mutation path routes through
+/// `enforce(tool="write", Scope::PathResolve(arg))` and write's deny
+/// rules apply.
+///
+/// Ported from opencode's `packages/opencode/src/tool/shell.ts:30-51`
+/// (`FILES` set) and `:191-221` (`pathArgs` filter logic). Restricted
+/// to commands that semantically WRITE files; omits `cd`/`pushd`/etc
+/// (no mutation) and `cat`/`get-content`/etc (read-only). Adds `ln`,
+/// `tee`, `dd` which opencode doesn't explicitly list but
+/// semantically mutate.
+///
+/// chmod / chown special-case: their FIRST positional arg is the
+/// mode (`777`, `u+x`) or owner spec (`user:group`), not a path.
+/// Skip arg index 0 for those commands.
+#[cfg(feature = "semantic-bash")]
+pub fn extract_mutation_paths(command: &str) -> Vec<String> {
+    const FILE_MUTATORS: &[&str] = &[
+        "rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "chown", "ln", "tee", "dd",
+    ];
+
+    use tree_sitter::Parser;
+    let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(command, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    collect_mutation_paths(tree.root_node(), command.as_bytes(), FILE_MUTATORS, &mut paths);
+    paths
+}
+
+#[cfg(feature = "semantic-bash")]
+fn collect_mutation_paths(
+    node: tree_sitter::Node,
+    source: &[u8],
+    mutators: &[&str],
+    out: &mut Vec<String>,
+) {
+    if node.kind() == "command" {
+        // Collect head + positional args. The tree-sitter-bash
+        // grammar emits the head as `command_name`, then positional
+        // args as `word` / `string` / `raw_string` / `concatenation`.
+        // Skip anything else (redirections, variable assignments,
+        // etc. — those have their own node kinds and aren't paths
+        // here).
+        let mut head: Option<String> = None;
+        let mut args: Vec<String> = Vec::new();
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i) else {
+                continue;
+            };
+            // Don't walk into redirections — they were handled by
+            // the redirect_targets extractor and including them
+            // here would double-prompt.
+            if child.kind() == "file_redirect"
+                || child.kind() == "heredoc_redirect"
+                || child.kind() == "herestring_redirect"
+            {
+                continue;
+            }
+            let text = match child.utf8_text(source) {
+                Ok(t) => t.trim().to_string(),
+                Err(_) => continue,
+            };
+            if head.is_none() {
+                head = Some(text);
+                continue;
+            }
+            // Skip flag args (`-r`, `--recursive`).
+            if text.starts_with('-') {
+                continue;
+            }
+            // Skip chmod permission specs (`+x`, `u+x`).
+            if matches!(head.as_deref(), Some("chmod")) && text.starts_with('+') {
+                continue;
+            }
+            args.push(unquote_simple(&text));
+        }
+
+        if let Some(h) = head {
+            // Strip path prefix on the head so absolute paths like
+            // `/bin/rm` still match the basename rule. Skip empty
+            // heads.
+            let basename = std::path::Path::new(&h)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(h.as_str());
+            if mutators.contains(&basename) {
+                // chmod / chown: drop the first positional arg
+                // (mode spec / owner spec — not a path).
+                let path_args: &[String] = if matches!(basename, "chmod" | "chown") {
+                    args.get(1..).unwrap_or(&[])
+                } else {
+                    &args
+                };
+                for p in path_args {
+                    if !p.is_empty() {
+                        out.push(p.clone());
+                    }
+                }
+            }
+        }
+        // Don't recurse into `command` children — done.
+        return;
+    }
+    // Recurse on non-command nodes (program, list, pipeline, etc.).
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_mutation_paths(child, source, mutators, out);
+        }
+    }
+}
+
 #[cfg(feature = "semantic-bash")]
 fn collect_redirect_targets(node: tree_sitter::Node, source: &[u8], out: &mut Vec<String>) {
     match node.kind() {
