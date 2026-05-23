@@ -776,18 +776,60 @@ pub async fn handle_slash(
                         renderer.write_line("no active loop", c_agent())?;
                     }
                 } else {
-                    let prompt = parts[1..].join(" ");
+                    // B3-4 (audit fix): parse `--max N` flag + apply
+                    // a default cap of 20 iterations so a runaway
+                    // /loop can't burn API spend until the user
+                    // notices and types /loop stop. `--max 0`
+                    // explicitly opts into unbounded (matches the
+                    // prior default behaviour).
+                    let after = text.trim().strip_prefix("/loop").unwrap_or("").trim_start();
+                    let tokens: Vec<&str> = after.split_whitespace().collect();
+                    let mut max_iterations: Option<u32> = Some(20); // default cap
+                    let mut prompt_tokens: Vec<&str> = Vec::new();
+                    let mut i = 0;
+                    while i < tokens.len() {
+                        if tokens[i] == "--max" && i + 1 < tokens.len() {
+                            match tokens[i + 1].parse::<u32>() {
+                                Ok(0) => max_iterations = None,
+                                Ok(n) => max_iterations = Some(n),
+                                Err(_) => {
+                                    renderer.write_line(
+                                        &format!(
+                                            "invalid --max value: {} (use a positive integer, or 0 for unbounded)",
+                                            tokens[i + 1]
+                                        ),
+                                        c_error(),
+                                    )?;
+                                    return Ok(());
+                                }
+                            }
+                            i += 2;
+                        } else {
+                            prompt_tokens.push(tokens[i]);
+                            i += 1;
+                        }
+                    }
+                    let prompt = prompt_tokens.join(" ");
                     if prompt.is_empty() {
-                        renderer.write_line("usage: /loop <prompt>", c_error())?;
+                        renderer.write_line(
+                            "usage: /loop [--max N] <prompt>  (default cap: 20 iterations; --max 0 = unbounded)",
+                            c_error(),
+                        )?;
                         return Ok(());
                     }
                     let plan_file = std::path::PathBuf::from("LOOP_PLAN.md");
-                    let ls = crate::extras::r#loop::LoopState::new(prompt, plan_file, None, None);
+                    let ls = crate::extras::r#loop::LoopState::new(
+                        prompt,
+                        plan_file,
+                        max_iterations,
+                        None,
+                    );
                     *loop_state = Some(ls);
-                    renderer.write_line(
-                        "loop started — iteration 1 will run after this message",
-                        c_agent(),
-                    )?;
+                    let cap_msg = match max_iterations {
+                        Some(n) => format!("loop started (max {n} iterations) — iteration 1 will run after this message"),
+                        None => "loop started (unbounded — use /loop stop to cancel) — iteration 1 will run after this message".to_string(),
+                    };
+                    renderer.write_line(&cap_msg, c_agent())?;
                 }
             }
             #[cfg(not(feature = "loop"))]

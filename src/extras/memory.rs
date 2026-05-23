@@ -115,7 +115,14 @@ pub fn write_file(dir: &Path, path: &str, content: &str) -> Result<(), String> {
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
-    std::fs::write(&resolved, content).map_err(|e| format!("Failed to write memory: {e}"))
+    // B3-1 (audit fix): atomic write via the same helper write.rs /
+    // edit.rs / apply_patch.rs / session/storage.rs use. Previously
+    // std::fs::write truncated in place — a SIGKILL or crash
+    // mid-write left a truncated .md. Two dirge instances saving
+    // the same memory now race through the same OS-level rename(2)
+    // atomicity guarantees rather than tearing.
+    crate::fs_atomic::atomic_write_sync(&resolved, content.as_bytes())
+        .map_err(|e| format!("Failed to write memory: {e}"))
 }
 
 pub fn delete_file(dir: &Path, path: &str) -> Result<(), String> {

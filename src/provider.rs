@@ -214,6 +214,19 @@ fn provider_env_var_fallbacks(kind: ProviderKind) -> &'static [&'static str] {
         // (matches the provider name), but accepting the
         // canonical form means users don't have to alias.
         ProviderKind::Glm => &["ZHIPU_API_KEY"],
+        // B3-3 (audit fix): Anthropic users on Claude.ai OAuth
+        // have ANTHROPIC_OAUTH_TOKEN exported by the official
+        // setup tools. Pi (env-api-keys.ts:97-99) treats it as a
+        // higher-priority alternative. Without this dirge users
+        // had to manually export ANTHROPIC_API_KEY to use the
+        // same token.
+        ProviderKind::Anthropic => &["ANTHROPIC_OAUTH_TOKEN"],
+        // Google's generative-language SDK (and the official
+        // gemini-cli) uses GOOGLE_GENERATIVE_AI_API_KEY. dirge's
+        // primary GEMINI_API_KEY matches the provider name in the
+        // /model command surface; accepting the Google-canonical
+        // form means users don't have to alias.
+        ProviderKind::Gemini => &["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"],
         _ => &[],
     }
 }
@@ -1028,18 +1041,27 @@ mod tests {
         assert_eq!(auto_detect_provider_from(env), Some("glm"));
     }
 
-    /// `provider_env_var_fallbacks` lists ZHIPU_API_KEY for GLM
-    /// and nothing else for other providers.
+    /// `provider_env_var_fallbacks` lists canonical alternatives
+    /// for GLM (Zhipu's name), Anthropic (OAuth token), and Gemini
+    /// (Google's canonical form). Other providers have no
+    /// alternatives.
     #[test]
-    fn fallback_list_is_glm_specific() {
+    fn fallback_list_covers_canonical_alternatives() {
         assert_eq!(
             provider_env_var_fallbacks(ProviderKind::Glm),
             &["ZHIPU_API_KEY"]
         );
+        // B3-3: Anthropic OAuth, Google's two canonical names.
+        assert_eq!(
+            provider_env_var_fallbacks(ProviderKind::Anthropic),
+            &["ANTHROPIC_OAUTH_TOKEN"]
+        );
+        assert_eq!(
+            provider_env_var_fallbacks(ProviderKind::Gemini),
+            &["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"]
+        );
         for kind in [
             ProviderKind::OpenAI,
-            ProviderKind::Anthropic,
-            ProviderKind::Gemini,
             ProviderKind::DeepSeek,
             ProviderKind::OpenRouter,
             ProviderKind::Ollama,

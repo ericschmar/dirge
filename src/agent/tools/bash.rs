@@ -450,7 +450,7 @@ fn quote_aware_split(command: &str) -> Vec<&str> {
         }
 
         if !in_single && !in_double {
-            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`/`|`.
+            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`/`|`/`&`.
             if i + 1 < bytes.len()
                 && ((b == b'&' && bytes[i + 1] == b'&') || (b == b'|' && bytes[i + 1] == b'|'))
             {
@@ -472,6 +472,17 @@ fn quote_aware_split(command: &str) -> Vec<&str> {
             // unchecked. The semantic-bash tree-sitter path correctly
             // splits pipelines; this fallback didn't.
             if b == b'|' {
+                push_segment(command, start, i, &mut segments);
+                i += 1;
+                start = i;
+                continue;
+            }
+            // B3-6 (audit fix): background `&` (single-byte) — must
+            // be checked AFTER `&&` above. Without this,
+            // `safe_cmd & rm -rf /` rode through with only the LHS
+            // matching a permission rule; the backgrounded LHS plus
+            // unchecked RHS would both execute.
+            if b == b'&' {
                 push_segment(command, start, i, &mut segments);
                 i += 1;
                 start = i;
@@ -619,6 +630,24 @@ mod tests {
         assert_eq!(segments[1], "cmd2");
         assert_eq!(segments[2], "cmd3");
         assert_eq!(segments[3], "cmd4");
+    }
+
+    /// B3-6: background `&` is a segment separator. Distinct from
+    /// `&&`, which is handled by the earlier 2-byte branch.
+    #[test]
+    fn quote_aware_split_splits_background_ampersand() {
+        let segments = quote_aware_split("safe_cmd & rm -rf /tmp/x");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], "safe_cmd");
+        assert_eq!(segments[1], "rm -rf /tmp/x");
+    }
+
+    #[test]
+    fn quote_aware_split_keeps_logical_and_separate_from_background() {
+        // `&&` still binds as a 2-byte compound — must NOT be split
+        // as two `&` separators.
+        let segments = quote_aware_split("a && b & c");
+        assert_eq!(segments, vec!["a", "b", "c"]);
     }
 
     /// Regression: bare `|` pipes must split into segments. Before

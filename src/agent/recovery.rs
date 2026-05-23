@@ -1,4 +1,45 @@
+use std::sync::LazyLock;
 use std::time::Duration;
+
+use regex::Regex;
+
+/// B3-2: match an HTTP 5xx status anchored by a structural
+/// HTTP-context marker. Avoids false-positives on bare 5xx-shaped
+/// numbers in non-HTTP text (e.g. "processed 500 items"). Patterns
+/// observed from real rig/reqwest errors:
+///   "503 Service Unavailable"        — leading status + reason
+///   "Http status: 500"               — status: prefix
+///   "status=502"                     — status= prefix
+///   "error 504: ..."                 — error prefix
+///   "(status_code=500)"              — status_code= prefix
+///   "code: 500"                      — bare code: prefix
+///   "received http 500"              — http prefix
+///   "5xx server error response"      — already lowercase
+static STATUS_5XX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?:
+            # prefix-anchored: status / code / error / http /
+            # response / request / returned, with optional
+            # `:`/`=`/`-`/whitespace between marker and number.
+            (?:status(?:_code)?|code|error|http|response|request|returned|returns)
+            \s*[:=\-]?\s*
+            5\d{2}
+            (?:\D|$)
+        )
+        |
+        (?:
+            # leading status + HTTP reason phrase (5xx Service / 5xx
+            # Gateway / 5xx Internal / 5xx Bad / 5xx Server).
+            (?:^|\D)
+            5\d{2}
+            \s+
+            (?:service|gateway|internal|bad|server)
+        )
+        ",
+    )
+    .expect("static regex compiles")
+});
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ErrorKind {
@@ -257,14 +298,17 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         return ErrorKind::RateLimit;
     }
 
-    // HTTP status codes for server errors (502/503/504 are unambiguous)
-    if lower.contains(" 503 ")
-        || lower.contains(" 502 ")
-        || lower.contains(" 504 ")
-        || lower.starts_with("503 ")
-        || lower.starts_with("502 ")
-        || lower.starts_with("504 ")
-    {
+    // B3-2 (audit fix): HTTP 5xx server errors. Previously only
+    // 502/503/504 were caught and only when surrounded by spaces;
+    // a bare 500 fell through to `Other` and the user saw a
+    // one-shot failure on transient provider 5xx. Real-world rig/
+    // reqwest errors come through in many shapes: "503 Service
+    // Unavailable", "Http status: 500", "status=502", "error 504:
+    // ...", "(status_code=500)". Match any 3-digit number starting
+    // with 5 anywhere in the message, with a non-digit boundary on
+    // BOTH sides so we don't false-positive on a 5xx-shaped
+    // substring of a larger number (e.g. "request id 50012345").
+    if STATUS_5XX_RE.is_match(&lower) {
         return ErrorKind::Network;
     }
 
@@ -524,6 +568,26 @@ mod tests {
             ErrorKind::Network
         );
         assert_eq!(classify_error("decode error: EOF"), ErrorKind::Network);
+
+        // B3-2: 5xx variants beyond the previous strict set.
+        // Plain 500 (was previously falling through to Other).
+        assert_eq!(
+            classify_error("500 Internal Server Error"),
+            ErrorKind::Network
+        );
+        // Prefix-anchored forms.
+        assert_eq!(classify_error("Http status: 500"), ErrorKind::Network);
+        assert_eq!(classify_error("status=502"), ErrorKind::Network);
+        assert_eq!(classify_error("status_code=503"), ErrorKind::Network);
+        assert_eq!(classify_error("code: 504"), ErrorKind::Network);
+        assert_eq!(
+            classify_error("CompletionError: error 500: backend hiccup"),
+            ErrorKind::Network
+        );
+        assert_eq!(
+            classify_error("received http 502 from upstream"),
+            ErrorKind::Network
+        );
     }
 
     /// `user_facing_error` produces a multi-line message with headline,

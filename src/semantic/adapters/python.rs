@@ -277,7 +277,16 @@ impl LanguageAdapter for PythonAdapter {
         let target = find_node_at_range(root, range.start_byte, range.end_byte)
             .ok_or("Could not find node at given range")?;
 
-        let query_str = "(call function: (identifier) @callee)";
+        // B3-7 (audit fix): two alternatives — direct identifier
+        // calls AND attribute-access (method) calls. Previously only
+        // the identifier form was captured, so `obj.method()`,
+        // `module.func()`, and chained calls all dropped from the
+        // results. Go/Java/C++ adapters already capture the
+        // equivalent `selector_expression`; Python lagged.
+        let query_str = r#"
+            (call function: (identifier) @callee)
+            (call function: (attribute attribute: (identifier) @callee))
+        "#;
         let query = Query::new(&lang, query_str).map_err(|e| format!("Query error: {e}"))?;
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(&query, target, source_bytes);

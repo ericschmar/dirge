@@ -568,6 +568,21 @@ impl PermissionChecker {
     pub fn set_working_dir(&mut self, dir: &str) {
         self.working_dir = dir.to_string();
         self.working_dir_canonical = canonicalize_for_cache(dir);
+        // B3-5 (audit fix): clear session-scoped state that was
+        // implicitly tied to the OLD cwd. Two concerns:
+        //   1. `recent_calls` is the doom-loop counter — stale
+        //      entries from before the cd would falsely trip the
+        //      3-identical-calls limiter on the first calls in
+        //      the new project.
+        //   2. `session_allowlist` holds patterns the user
+        //      approved for the prior project (e.g. `cd *`,
+        //      `cargo *`). Carrying them silently to a new
+        //      project means the user has implicitly granted
+        //      those permissions there too — a privilege carry-
+        //      over the audit flagged. Pi rebuilds the session
+        //      on cwd change.
+        self.recent_calls.clear();
+        self.session_allowlist.clear();
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
