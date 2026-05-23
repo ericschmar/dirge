@@ -1294,12 +1294,16 @@ pub async fn run_interactive(
                             )?;
                             continue;
                         }
-                        // Ctrl+X drops the most-recently-queued interjection
-                        // without affecting the running agent. No-op when the
-                        // queue is empty so it doesn't shadow other behaviors.
-                        let ctrl_x = key.code == KeyCode::Char('x')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_x && !interjection_queue.is_empty() {
+                        // dirge-ov2 Phase B: Ctrl-X is reclaimed for
+                        // the /tasks subagent-chat picker (matches
+                        // maki's binding). The previous "drop queued
+                        // interjection" behavior moves to Alt+X. The
+                        // queued-message footer below now reads
+                        // "Alt+X drops" instead of "Ctrl+X drops" —
+                        // surfaced wherever the queue hint is shown.
+                        let alt_x = key.code == KeyCode::Char('x')
+                            && key.modifiers.contains(KeyModifiers::ALT);
+                        if alt_x && !interjection_queue.is_empty() {
                             interjection_queue.pop_back();
                             write_outside_chamber(
                                 &mut renderer,
@@ -1311,6 +1315,68 @@ pub async fn run_interactive(
                                 ),
                                 theme::dim(),
                             )?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
+                        // dirge-ov2 Phase B: Ctrl-N cycles to the next
+                        // chat (subagent window). Wraps to first chat
+                        // after the last; no-op when only one chat
+                        // exists. Mirrors maki's NEXT_CHAT binding
+                        // (`components/keybindings.rs:136`).
+                        let ctrl_n = key.code == KeyCode::Char('n')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_n && renderer.chat_count() > 1 {
+                            let next = (renderer.active_chat() + 1) % renderer.chat_count();
+                            renderer.switch_chat(next);
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
+                        // dirge-ov2 Phase B: Ctrl-P cycles to the
+                        // previous chat. Mirrors maki's PREV_CHAT
+                        // binding (`components/keybindings.rs:135`).
+                        let ctrl_p = key.code == KeyCode::Char('p')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_p && renderer.chat_count() > 1 {
+                            let count = renderer.chat_count();
+                            let prev = (renderer.active_chat() + count - 1) % count;
+                            renderer.switch_chat(prev);
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
+                        // dirge-ov2 Phase B: Ctrl-X opens the /tasks
+                        // picker — same effect as typing `/tasks`.
+                        // No-op when only the main chat exists
+                        // (nothing to switch between). Maki's TASKS
+                        // keybinding (`components/keybindings.rs`,
+                        // `ctrl_bind!('x')`).
+                        let ctrl_x = key.code == KeyCode::Char('x')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_x && renderer.chat_count() > 1 {
+                            // Cycle through chats via Ctrl-N once a
+                            // proper picker UI lands in Phase B+.
+                            // For now, cycle forward — gives the
+                            // user a way to land on subagent chats
+                            // via a single key press.
+                            let next = (renderer.active_chat() + 1) % renderer.chat_count();
+                            renderer.switch_chat(next);
+                            renderer.render_viewport()?;
                             renderer.draw_bottom(
                                 &input,
                                 &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1937,7 +2003,7 @@ pub async fn run_interactive(
                                 }
                                 renderer.write_line(
                                     &format!(
-                                        "(queued; runner will stop at next safe boundary — Ctrl+X drops, Ctrl+C cancels)"
+                                        "(queued; runner will stop at next safe boundary — Alt+X drops, Ctrl+C cancels)"
                                     ),
                                     theme::dim(),
                                 )?;

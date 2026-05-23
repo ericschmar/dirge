@@ -1145,6 +1145,33 @@ pub async fn handle_slash(
             *is_running = false;
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "quit").into());
         }
+        // dirge-ov2 Phase B: `/tasks` lists active chat windows and
+        // cycles to the next one. Equivalent to Ctrl-X / Ctrl-N for
+        // keyboard-shy users (or scripts that drive dirge via slash
+        // commands). When only the main chat exists, prints a hint.
+        "/tasks" => {
+            let names = renderer.chat_names();
+            if names.len() <= 1 {
+                renderer.write_line(
+                    "no subagent chats — spawn one via the `task` tool or wait for the agent to dispatch a subagent.",
+                    c_result(),
+                )?;
+            } else {
+                renderer.write_line("chat windows:", c_result())?;
+                let active = renderer.active_chat();
+                for (i, name) in names.iter().enumerate() {
+                    let marker = if i == active { "→" } else { " " };
+                    renderer.write_line(&format!("  {} [{}] {}", marker, i, name), c_result())?;
+                }
+                let next = (active + 1) % names.len();
+                renderer.switch_chat(next);
+                renderer.render_viewport()?;
+                renderer.write_line(
+                    &format!("→ switched to chat {} ({})", next, names[next]),
+                    c_result(),
+                )?;
+            }
+        }
         "/clear" => {
             session.messages.clear();
             session.total_estimated_tokens = 0;
@@ -1767,7 +1794,15 @@ pub async fn handle_slash(
             renderer.write_line("  Ctrl+R                 toggle reasoning", c_result())?;
             renderer.write_line("  Ctrl+C / Ctrl+D        interrupt/quit", c_result())?;
             renderer.write_line(
-                "  Ctrl+X                 drop last queued interjection",
+                "  Ctrl+N / Ctrl+P        next / previous chat (subagent windows)",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  Ctrl+X / /tasks        cycle through chat windows",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  Alt+X                  drop last queued interjection",
                 c_result(),
             )?;
             renderer.write_line(
