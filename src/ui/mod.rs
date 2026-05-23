@@ -4377,6 +4377,55 @@ pub async fn run_interactive(
                         }
                     }
                 }
+
+                // dirge-9xo: auto-resume the parent agent when a
+                // background subagent finishes and the parent is
+                // currently idle. Matches opencode's `continueIfIdle`
+                // pattern (`packages/opencode/src/tool/task.ts:215-
+                // 240`): when a background task injects its result,
+                // resume the main thread automatically so the user
+                // doesn't have to re-prompt to see the agent act on
+                // it.
+                //
+                // Gate on:
+                //   - we just handled a terminal event (Complete /
+                //     Failed — both arms above either fall through
+                //     here)
+                //   - the parent is idle (no event_rx active)
+                //   - BackgroundStore has pending notifications (a
+                //     real result is sitting there waiting to be
+                //     surfaced to the parent — not just a stray
+                //     event)
+                let has_pending_bg = bg_store
+                    .as_ref()
+                    .map(|s| s.has_pending_notifications())
+                    .unwrap_or(false);
+                if !is_running && has_pending_bg {
+                    // Synthesize a tiny user-side prompt; the real
+                    // payload rides in the system-reminder that
+                    // `prepend_pending_notifications` builds from the
+                    // drained notifications below.
+                    let synth_prompt =
+                        "Continue based on the background task results above.".to_string();
+                    session.add_message(MessageRole::User, &synth_prompt);
+                    let history = crate::agent::runner::convert_history(session);
+                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    let composed =
+                        crate::agent::tools::background::prepend_pending_notifications(
+                            &synth_prompt,
+                            bg_store.as_ref(),
+                        );
+                    let runner = agent.clone().spawn_runner(composed, history);
+                    agent_rx = Some(runner.event_rx);
+                    agent_abort = Some(runner.task);
+                    agent_interject = Some(runner.interject_tx);
+                    is_running = true;
+                    renderer.draw_bottom(
+                        &input,
+                        &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                        is_running,
+                    )?;
+                }
             }
             Some(question_req) = async {
                 if let Some(rx) = &mut question_rx {

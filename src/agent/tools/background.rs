@@ -256,6 +256,14 @@ impl BackgroundStore {
         self.lock().pending.drain(..).collect()
     }
 
+    /// dirge-9xo: peek whether there's at least one pending
+    /// notification without draining. Used by the UI auto-resume
+    /// path to decide whether a subagent completion should kick
+    /// the parent agent into a new turn.
+    pub fn has_pending_notifications(&self) -> bool {
+        !self.lock().pending.is_empty()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
