@@ -152,17 +152,58 @@ impl Tool for EditTool {
         let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
         let normalized_old = args.old_text.replace("\r\n", "\n");
 
-        if !content.contains(&normalized_old) {
+        // B3-9 (audit fix): replacer cascade. Previously dirge did
+        // a single exact-substring match and bailed with
+        // "old_text not found" on any whitespace, indent, or
+        // trailing-space drift. opencode's edit.ts:222-432 has a
+        // 5-step cascade; pi's edit-diff.ts:91-132 has
+        // fuzzyFindText. We port the three highest-value steps
+        // (LineTrimmed, WhitespaceNormalized, IndentationFlexible)
+        // which together catch the ~95% of LLM whitespace drift
+        // failures. Each fallback is logged so the user sees
+        // we matched with tolerance, not exactness.
+        let (match_positions, fallback_used): (Vec<(usize, usize)>, Option<&'static str>) = {
+            // Step 1: simple exact match (current behaviour).
+            let exact: Vec<(usize, usize)> = content
+                .match_indices(&normalized_old)
+                .map(|(i, _)| (i, i + normalized_old.len()))
+                .collect();
+            if !exact.is_empty() {
+                (exact, None)
+            } else if let Some(matches) = find_line_trimmed_matches(&content, &normalized_old)
+                && !matches.is_empty()
+            {
+                (matches, Some("line-trimmed"))
+            } else if let Some(matches) =
+                find_whitespace_normalized_matches(&content, &normalized_old)
+                && !matches.is_empty()
+            {
+                (matches, Some("whitespace-normalized"))
+            } else if let Some(matches) =
+                find_indentation_flexible_matches(&content, &normalized_old)
+                && !matches.is_empty()
+            {
+                (matches, Some("indentation-flexible"))
+            } else {
+                (Vec::new(), None)
+            }
+        };
+
+        if match_positions.is_empty() {
             return Err(ToolError::Msg(format!(
-                "old_text not found in '{}'.\nEnsure the exact text matches including whitespace and line endings.",
+                "old_text not found in '{}'.\nEnsure the exact text matches including whitespace and line endings. \
+                Tried exact match, line-trimmed match, whitespace-normalized match, and indentation-flexible match.",
                 args.path
             )));
         }
 
-        let match_positions: Vec<usize> = content
-            .match_indices(&normalized_old)
-            .map(|(i, _)| i)
-            .collect();
+        // Reduce to start positions for backwards compat with the
+        // downstream ambiguity-reporting and replacement logic.
+        // Each "position" still refers to the START of a match;
+        // the actual matched length is captured via the byte range
+        // for replacement below.
+        let match_ranges: Vec<(usize, usize)> = match_positions;
+        let match_positions: Vec<usize> = match_ranges.iter().map(|(s, _)| *s).collect();
 
         let do_replace_all = args.replace_all.unwrap_or(false);
 
@@ -217,10 +258,35 @@ impl Tool for EditTool {
         }
 
         let byte_pos = match_positions[0];
+        // B3-9: when the cascade fired, the matched substring may
+        // differ from normalized_old (different whitespace/indent).
+        // Replace by exact byte range instead of string.replace
+        // (which would re-search normalized_old and not find it).
         let new_content = if do_replace_all {
-            content.replace(&normalized_old, &args.new_text)
+            // For replace_all we splice every range in reverse
+            // order so earlier offsets stay valid.
+            let mut out = content.clone();
+            let mut ranges = match_ranges.clone();
+            ranges.sort_by(|a, b| b.0.cmp(&a.0));
+            for (start, end) in ranges {
+                out.replace_range(start..end, &args.new_text);
+            }
+            out
         } else {
-            content.replacen(&normalized_old, &args.new_text, 1)
+            let (start, end) = match_ranges[0];
+            let mut out = content.clone();
+            out.replace_range(start..end, &args.new_text);
+            out
+        };
+
+        // B3-9: surface the fallback used so the LLM sees we
+        // didn't match exactly — helps it correct future calls.
+        let fallback_note = match fallback_used {
+            Some(label) => format!(
+                " (matched via {} fallback — exact text not found; whitespace/indent tolerated)",
+                label
+            ),
+            None => String::new(),
         };
 
         let output = if has_crlf {
@@ -245,9 +311,13 @@ impl Tool for EditTool {
         // so don't repeat it. The diff block below is the meat;
         // this first line is a compact summary.
         let mut result = if do_replace_all {
-            format!("Applied edit ({} replacements)", match_positions.len())
+            format!(
+                "Applied edit ({} replacements){}",
+                match_positions.len(),
+                fallback_note
+            )
         } else {
-            "Applied edit".to_string()
+            format!("Applied edit{}", fallback_note)
         };
         // Mention the line delta when adding/removing lines so the
         // LLM can confirm the size of change without re-reading
@@ -297,5 +367,244 @@ impl Tool for EditTool {
             );
         }
         Ok(result)
+    }
+}
+
+// B3-9 — replacer cascade helpers. Port of opencode's edit.ts:240-540
+// fallback ladder. Each helper returns a Vec of (start_byte,
+// end_byte) byte ranges in `content` that match `find` under the
+// helper's normalization. Empty Vec = no matches. The cascade
+// tries each in priority order in the call site above.
+
+/// Line-trimmed match. Match each logical block of N lines where
+/// each line's .trim() equals the corresponding find line's
+/// .trim(). Catches the common case of "LLM emitted the right
+/// content but with slightly off indent or trailing whitespace."
+/// Mirrors opencode `LineTrimmedReplacer` (edit.ts:244).
+fn find_line_trimmed_matches(content: &str, find: &str) -> Option<Vec<(usize, usize)>> {
+    let content_lines: Vec<&str> = content.split('\n').collect();
+    let find_lines: Vec<&str> = find.split('\n').collect();
+    if find_lines.is_empty() {
+        return None;
+    }
+    // Line-start byte offsets for content.
+    let mut line_starts = Vec::with_capacity(content_lines.len() + 1);
+    line_starts.push(0usize);
+    let mut acc = 0usize;
+    for line in &content_lines {
+        acc += line.len() + 1; // +1 for the \n separator
+        line_starts.push(acc);
+    }
+    let mut out = Vec::new();
+    for i in 0..=content_lines.len().saturating_sub(find_lines.len()) {
+        let block = &content_lines[i..i + find_lines.len()];
+        let all_trim_match = block
+            .iter()
+            .zip(find_lines.iter())
+            .all(|(a, b)| a.trim() == b.trim());
+        if !all_trim_match {
+            continue;
+        }
+        let start_byte = line_starts[i];
+        // End of the matched block (no trailing \n unless the
+        // block ends with one in source). Compute by walking
+        // forward: sum byte lengths + (n-1) interior newlines.
+        let mut end_byte = start_byte;
+        for (k, line) in block.iter().enumerate() {
+            end_byte += line.len();
+            if k < block.len() - 1 {
+                end_byte += 1;
+            }
+        }
+        out.push((start_byte, end_byte));
+    }
+    Some(out)
+}
+
+/// Whitespace-normalized match. Collapse all whitespace runs in
+/// both content and find to single spaces, then look for line-by-
+/// line equality. Mirrors opencode `WhitespaceNormalizedReplacer`
+/// (edit.ts:419). Catches "LLM tab vs spaces" / "double-spaces"
+/// drift.
+fn find_whitespace_normalized_matches(content: &str, find: &str) -> Option<Vec<(usize, usize)>> {
+    fn normalize(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_ws = false;
+        for c in s.chars() {
+            if c.is_whitespace() {
+                if !prev_ws && !out.is_empty() {
+                    out.push(' ');
+                }
+                prev_ws = true;
+            } else {
+                out.push(c);
+                prev_ws = false;
+            }
+        }
+        if out.ends_with(' ') {
+            out.pop();
+        }
+        out
+    }
+    let norm_find = normalize(find);
+    if norm_find.is_empty() {
+        return None;
+    }
+    let find_lines: Vec<&str> = find.split('\n').collect();
+    let content_lines: Vec<&str> = content.split('\n').collect();
+    let mut line_starts = Vec::with_capacity(content_lines.len() + 1);
+    line_starts.push(0usize);
+    let mut acc = 0usize;
+    for line in &content_lines {
+        acc += line.len() + 1;
+        line_starts.push(acc);
+    }
+    // Try block sizes from find_lines.len() up to find_lines.len()
+    // + 5 (cap) so a single-line `find` can match a 3-line block in
+    // content (LLM emitted "fn foo() { let x = 1; }" but source has
+    // it on 3 lines). +5 covers typical re-formatting drift without
+    // O(N²) blowup. For a given start line, keep only the SHORTEST
+    // matching block size — multiple block sizes can hit the same
+    // start when trailing empty lines normalize to nothing.
+    use std::collections::HashMap;
+    let mut by_start: HashMap<usize, (usize, usize)> = HashMap::new();
+    let max_block = find_lines.len() + 5;
+    for block_size in find_lines.len()..=max_block.min(content_lines.len()) {
+        if block_size == 0 {
+            continue;
+        }
+        for i in 0..=content_lines.len().saturating_sub(block_size) {
+            let block = &content_lines[i..i + block_size];
+            let block_text = block.join("\n");
+            if normalize(&block_text) != norm_find {
+                continue;
+            }
+            let start_byte = line_starts[i];
+            let mut end_byte = start_byte;
+            for (k, line) in block.iter().enumerate() {
+                end_byte += line.len();
+                if k < block.len() - 1 {
+                    end_byte += 1;
+                }
+            }
+            by_start
+                .entry(start_byte)
+                .and_modify(|cur| {
+                    if end_byte < cur.1 {
+                        *cur = (start_byte, end_byte);
+                    }
+                })
+                .or_insert((start_byte, end_byte));
+        }
+    }
+    let mut out: Vec<(usize, usize)> = by_start.into_values().collect();
+    out.sort_by_key(|(s, _)| *s);
+    Some(out)
+}
+
+/// Indentation-flexible match. Strip the minimum common leading
+/// whitespace from both find and each candidate block, then
+/// compare. Mirrors opencode `IndentationFlexibleReplacer`
+/// (edit.ts:463). Catches the case where the LLM emitted code
+/// with a different baseline indent than the source.
+fn find_indentation_flexible_matches(content: &str, find: &str) -> Option<Vec<(usize, usize)>> {
+    fn strip_min_indent(s: &str) -> String {
+        let lines: Vec<&str> = s.split('\n').collect();
+        let min_indent = lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
+            .min()
+            .unwrap_or(0);
+        lines
+            .iter()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    String::from(*l)
+                } else {
+                    // Slice off the first min_indent characters
+                    // safely (each is whitespace, so single-byte
+                    // ASCII; but use char-aware slice anyway).
+                    let mut chars = l.chars();
+                    for _ in 0..min_indent {
+                        chars.next();
+                    }
+                    chars.collect::<String>()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let norm_find = strip_min_indent(find);
+    let find_lines: Vec<&str> = find.split('\n').collect();
+    let content_lines: Vec<&str> = content.split('\n').collect();
+    let mut line_starts = Vec::with_capacity(content_lines.len() + 1);
+    line_starts.push(0usize);
+    let mut acc = 0usize;
+    for line in &content_lines {
+        acc += line.len() + 1;
+        line_starts.push(acc);
+    }
+    let mut out = Vec::new();
+    for i in 0..=content_lines.len().saturating_sub(find_lines.len()) {
+        let block = &content_lines[i..i + find_lines.len()];
+        let block_text = block.join("\n");
+        if strip_min_indent(&block_text) != norm_find {
+            continue;
+        }
+        let start_byte = line_starts[i];
+        let mut end_byte = start_byte;
+        for (k, line) in block.iter().enumerate() {
+            end_byte += line.len();
+            if k < block.len() - 1 {
+                end_byte += 1;
+            }
+        }
+        out.push((start_byte, end_byte));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::*;
+
+    #[test]
+    fn line_trimmed_matches_indent_drift() {
+        let content = "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n";
+        // LLM emitted with no leading indent.
+        let find = "let x = 1;\nlet y = 2;";
+        let m = find_line_trimmed_matches(content, find).unwrap();
+        assert_eq!(m.len(), 1);
+        let (s, e) = m[0];
+        assert_eq!(&content[s..e], "    let x = 1;\n    let y = 2;");
+    }
+
+    #[test]
+    fn line_trimmed_no_match_when_content_differs() {
+        let content = "let x = 1;\nlet y = 2;\n";
+        let find = "let x = 1;\nlet z = 3;";
+        let m = find_line_trimmed_matches(content, find).unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn whitespace_normalized_matches_tab_vs_spaces() {
+        let content = "fn  foo()  {\n\tlet x = 1;\n}\n";
+        let find = "fn foo() { let x = 1; }";
+        let m = find_whitespace_normalized_matches(content, find).unwrap();
+        // Block spans the 3 lines fn... { ... } when joined.
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn indentation_flexible_matches_re_indented_block() {
+        let content = "fn foo() {\n        let x = 1;\n        let y = 2;\n}\n";
+        // LLM emitted the inner block with NO baseline indent.
+        let find = "let x = 1;\nlet y = 2;";
+        let m = find_indentation_flexible_matches(content, find).unwrap();
+        assert_eq!(m.len(), 1);
+        let (s, e) = m[0];
+        assert_eq!(&content[s..e], "        let x = 1;\n        let y = 2;");
     }
 }
