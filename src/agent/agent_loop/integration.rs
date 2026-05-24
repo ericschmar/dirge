@@ -327,6 +327,12 @@ pub struct LoopSpawnConfig {
     /// identifier. Code review #2 — was missing; hook used to
     /// receive empty string.
     pub provider_name: Option<String>,
+
+    /// Model identifier forwarded to `LoopConfig.model_name` so
+    /// the `tool_input_repair` telemetry records `(model, tool,
+    /// repair_kind)`. `None` is acceptable — telemetry falls back
+    /// to `"unknown"`.
+    pub model_name: Option<String>,
 }
 
 impl LoopSpawnConfig {
@@ -342,6 +348,7 @@ impl LoopSpawnConfig {
             initial_prompt: prompt.into(),
             tools: Vec::new(),
             provider_name: None,
+            model_name: None,
             #[cfg(feature = "plugin")]
             plugin_mgr: None,
             steering_queue: None,
@@ -387,6 +394,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         metadata: std::collections::HashMap::new(),
         request_timeout: None,
         provider_name: cfg.provider_name.clone(),
+        model_name: cfg.model_name.clone(),
     };
 
     #[cfg(feature = "plugin")]

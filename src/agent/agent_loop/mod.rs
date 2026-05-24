@@ -41,6 +41,7 @@ pub mod run;
 pub mod steering;
 pub mod stream;
 pub mod tool;
+pub mod tool_input_repair;
 pub mod tools;
 pub mod types;
 
@@ -72,6 +73,9 @@ pub use run::{LoopError, run_agent_loop, run_agent_loop_continue, run_loop};
 pub use steering::{steering_from_queue, steering_from_queue_with_sanitizer};
 pub use stream::{LlmContext, StreamFn, StreamOptions, stream_assistant_response};
 pub use tool::LoopTool;
+pub use tool_input_repair::{
+    RepairKind, RepairResult, format_structured_error, is_path_field_name, validate_and_repair,
+};
 pub use tools::{
     ExecutedToolCallBatch, ToolCall, execute_tool_calls, execute_tool_calls_parallel,
     execute_tool_calls_sequential, extract_tool_calls,

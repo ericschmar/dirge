@@ -267,6 +267,14 @@ pub struct LoopConfig {
     /// `AnyAgentInner` variant name). Code review #2 — earlier
     /// code passed `""` here, breaking any provider-aware hook.
     pub provider_name: Option<String>,
+
+    /// Model identifier carried through the loop so cross-cutting
+    /// telemetry (notably the `tool_input_repair` log) can record
+    /// `(model, tool, repair_kind)` and surface per-(model, tool)
+    /// regression rates. Set at run construction by the same caller
+    /// that fills `provider_name`. `None` is acceptable —
+    /// telemetry falls back to an `unknown` placeholder.
+    pub model_name: Option<String>,
 }
 
 /// `convertToLlm` signature. Synchronous in pi (returns
@@ -365,6 +373,7 @@ impl Clone for LoopConfig {
             metadata: self.metadata.clone(),
             request_timeout: self.request_timeout,
             provider_name: self.provider_name.clone(),
+            model_name: self.model_name.clone(),
         }
     }
 }

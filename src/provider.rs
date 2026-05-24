@@ -516,6 +516,24 @@ impl AnyModel {
             AnyModel::Custom(m) => btw!(m.clone()),
         }
     }
+
+    /// Return the model identifier string that was passed when
+    /// the model was built (`client.completion_model("…")`).
+    /// Forwarded to `LoopConfig.model_name` so the
+    /// `tool_input_repair` telemetry can record `(model, tool,
+    /// repair_kind)`.
+    pub fn name(&self) -> String {
+        match self {
+            AnyModel::OpenRouter(m) => m.model.clone(),
+            AnyModel::OpenAI(m) => m.model.clone(),
+            AnyModel::Anthropic(m) => m.model.clone(),
+            AnyModel::Gemini(m) => m.model.clone(),
+            AnyModel::DeepSeek(m) => m.model.clone(),
+            AnyModel::Glm(m) => m.model.clone(),
+            AnyModel::Ollama(m) => m.model.clone(),
+            AnyModel::Custom(m) => m.model.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -538,6 +556,13 @@ pub struct AnyAgent {
     /// Extracted from the rig Agent's preamble field at build
     /// time (every variant exposes `Agent.preamble: Option<String>`).
     preamble: String,
+    /// Model identifier — the same string the user passed via
+    /// `--model` or pulled from config. Carried so `spawn_runner`
+    /// can forward it into `LoopSpawnConfig::model_name` for the
+    /// `tool_input_repair` telemetry's `(model, tool, repair_kind)`
+    /// triple. `String::new()` is acceptable — telemetry falls back
+    /// to `"unknown"` when the field is empty.
+    model_name: String,
 }
 
 #[derive(Clone)]
@@ -559,6 +584,7 @@ impl AnyAgent {
         chunk_timeout: std::time::Duration,
         loop_tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
         preamble: String,
+        model_name: String,
     ) -> Self {
         AnyAgent {
             inner,
@@ -566,6 +592,7 @@ impl AnyAgent {
             chunk_timeout,
             loop_tools,
             preamble,
+            model_name,
         }
     }
 
@@ -664,6 +691,11 @@ impl AnyAgent {
         cfg.history = loop_history;
         cfg.tools = self.loop_tools;
         cfg.provider_name = Some(provider_name);
+        cfg.model_name = if self.model_name.is_empty() {
+            None
+        } else {
+            Some(self.model_name.clone())
+        };
         #[cfg(feature = "plugin")]
         {
             cfg.plugin_mgr = crate::plugin::hook::global();
@@ -874,6 +906,10 @@ pub async fn build_agent(
     // (already factored into resolve_provider above the call site).
     let provider_name = cli.resolve_provider(cfg);
     let chunk_timeout = cfg.resolve_stream_chunk_timeout(&provider_name);
+    // Capture the model identifier before `match model` consumes
+    // it — forwarded into `AnyAgent.model_name` so `spawn_runner`
+    // can plumb it through to the `tool_input_repair` telemetry.
+    let model_name = parent_model.name();
 
     macro_rules! build_inner {
         ($m:expr, $variant:ident) => {{
@@ -948,6 +984,7 @@ pub async fn build_agent(
                 chunk_timeout,
                 loop_tools,
                 preamble,
+                model_name.clone(),
             )
         }};
     }
@@ -1105,6 +1142,7 @@ mod tests {
             std::time::Duration::from_secs(300),
             Vec::new(),    // loop_tools — empty for test fixture
             String::new(), // preamble — empty for test fixture
+            "gpt-4o".to_string(),
         )
     }
 

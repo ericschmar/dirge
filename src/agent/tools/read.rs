@@ -161,11 +161,34 @@ impl Tool for ReadTool {
         let resolved_path =
             check_perm_path_resolve(&self.permission, &self.ask_tx, "read", &args.path).await?;
 
+        // Relational defaulting: when only one of offset/limit is
+        // provided, fill the other with a sensible default and surface
+        // the decision as a Note: line (not Error: — keeps TUI from
+        // painting it red). This lets the model self-correct next turn.
+        let (offset, limit, default_note) = match (args.offset, args.limit) {
+            (Some(o), Some(l)) => (o.max(1) - 1, l, None),
+            (Some(o), None) => (
+                o.max(1) - 1,
+                2000,
+                Some(
+                    "Note: limit was not provided; defaulted to 2000 lines. To read fewer or more, retry with both offset (1-indexed) and limit.",
+                ),
+            ),
+            (None, Some(l)) => (
+                0,
+                l,
+                Some(
+                    "Note: offset was not provided; defaulted to line 1 (start of file). To start elsewhere, retry with both offset (1-indexed) and limit.",
+                ),
+            ),
+            (None, None) => (0, 2000, None),
+        };
+
         let cache_key = format!(
             "read:{}:{}:{}",
             args.path,
-            args.offset.unwrap_or(1),
-            args.limit.unwrap_or(2000),
+            offset.saturating_add(1), // 0-based → 1-based for cache key stability
+            limit,
         );
 
         if let Some(ref cache) = self.cache {
@@ -197,9 +220,6 @@ impl Tool for ReadTool {
                 file_size
             )));
         }
-
-        let offset = args.offset.unwrap_or(1).max(1) - 1;
-        let limit = args.limit.unwrap_or(2000);
 
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
@@ -351,7 +371,11 @@ impl Tool for ReadTool {
             });
         }
 
-        Ok(info)
+        if let Some(note) = default_note {
+            Ok(format!("{note}\n\n{info}"))
+        } else {
+            Ok(info)
+        }
     }
 }
 
@@ -606,5 +630,116 @@ mod tests {
             !out.contains("showing lines 100-1"),
             "must NOT show backwards range: {out:?}",
         );
+    }
+
+    // ============================================================
+    // Phase 3: relational defaulting tests
+    // ============================================================
+
+    /// Neither offset nor limit → silent defaults, no Note.
+    #[tokio::test]
+    async fn read_neither_offset_nor_limit_no_note() {
+        let path = temp_path("rel-neither");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!out.contains("Note:"), "no defaults → no note");
+        assert!(out.contains("a"), "should read content");
+    }
+
+    /// offset alone → limit defaulted to 2000, Note surfaced.
+    #[tokio::test]
+    async fn read_offset_alone_defaults_limit_with_note() {
+        let path = temp_path("rel-offset");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(2),
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(out.contains("Note:"), "offset-only should surface note");
+        assert!(
+            out.contains("limit was not provided"),
+            "note should mention limit default: {out}",
+        );
+        assert!(!out.contains("Error:"), "must use Note: not Error:");
+        // Should read from line 2 with default limit of 2000.
+        assert!(out.contains("b"), "should contain content");
+        assert!(
+            !out.contains("1: a"),
+            "should NOT contain content before offset"
+        );
+    }
+
+    /// limit alone → offset defaulted to line 1, Note surfaced.
+    #[tokio::test]
+    async fn read_limit_alone_defaults_offset_with_note() {
+        let path = temp_path("rel-limit");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(out.contains("Note:"), "limit-only should surface note");
+        assert!(
+            out.contains("offset was not provided"),
+            "note should mention offset default: {out}",
+        );
+        assert!(!out.contains("Error:"), "must use Note: not Error:");
+        // Should read from start with limit 2.
+        assert!(out.contains("1: a"), "should start from line 1");
+        assert!(
+            !out.contains("3: c"),
+            "should stop at limit; got line 3: {out}"
+        );
+    }
+
+    /// Both offset and limit → explicit values used, no Note.
+    #[tokio::test]
+    async fn read_both_offset_and_limit_no_note() {
+        let path = temp_path("rel-both");
+        std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(2),
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!out.contains("Note:"), "both set → no defaults → no note");
+        assert!(out.contains("2: b"), "should start at line 2");
+        assert!(out.contains("3: c"), "should include line 3");
+        assert!(!out.contains("4: d"), "should stop after limit of 2");
+        // Both provided means 1-indexed offset 2, limit 2 → lines 2 and 3.
     }
 }

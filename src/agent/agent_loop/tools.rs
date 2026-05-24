@@ -191,8 +191,48 @@ async fn prepare_tool_call(
     // prepareArguments compat shim. Pi line 579.
     let prepared_args = tool.prepare_arguments(tool_call.arguments.clone());
 
-    // Schema validate — DEFERRED. See doc above. Pi line 580.
-    let mut validated_args = prepared_args;
+    // Schema validate + repair. Pi line 580.
+    // Validate-then-repair semantics: valid inputs are never touched.
+    // On validation failure, apply targeted repairs for the four
+    // common open-model shape mistakes (null-for-optional,
+    // JSON-string-as-array, {}-to-[], bare-string-to-array).
+    let mut validated_args = match crate::agent::agent_loop::tool_input_repair::validate_and_repair(
+        tool.parameters(),
+        &prepared_args,
+    ) {
+        Ok(None) => {
+            // Valid input — pass through untouched.
+            prepared_args
+        }
+        Ok(Some(rr)) => {
+            tracing::info!(
+                target: "tool_repair",
+                model = config.model_name.as_deref().unwrap_or("unknown"),
+                tool = %tool_call.name,
+                repair = ?rr.kinds,
+                "tool input repaired"
+            );
+            rr.repaired
+        }
+        Err(errors) => {
+            let msg = crate::agent::agent_loop::tool_input_repair::format_structured_error(
+                tool.parameters(),
+                &prepared_args,
+                &errors,
+            );
+            tracing::info!(
+                target: "tool_repair",
+                model = config.model_name.as_deref().unwrap_or("unknown"),
+                tool = %tool_call.name,
+                repair = "failed",
+                "tool input repair failed"
+            );
+            return PrepareOutcome::Immediate {
+                result: create_error_tool_result(&msg),
+                is_error: true,
+            };
+        }
+    };
 
     // beforeToolCall. Pi lines 581-605.
     if let Some(hook) = &config.before_tool_call {
@@ -931,6 +971,7 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             request_timeout: None,
             provider_name: None,
+            model_name: None,
         }
     }
 

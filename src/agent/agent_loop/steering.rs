@@ -406,6 +406,7 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             request_timeout: None,
             provider_name: None,
+            model_name: None,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));
 

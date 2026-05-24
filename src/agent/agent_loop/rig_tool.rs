@@ -185,12 +185,21 @@ impl LoopTool for RigToolAdapter {
 }
 
 /// Convert rig's `ToolError` to the `String` shape `LoopTool::execute`
-/// returns. The wrapped error is preserved as a Display string —
-/// downstream `prepare_tool_call` wraps this in a
-/// `create_error_tool_result` text block, so the LLM sees the same
-/// message the rig path would have surfaced.
+/// returns. Schema errors are caught earlier by `prepare_tool_call`'s
+/// repair layer; this function handles runtime tool errors. If a
+/// schema error leaks through (defense-in-depth), wrap it in a
+/// model-readable retry hint rather than leaking raw serde diagnostics.
 fn format_tool_error(err: ToolError) -> String {
-    err.to_string()
+    let raw = err.to_string();
+    if raw.contains("missing field") || raw.contains("expected") || raw.contains("invalid type") {
+        format!(
+            "Tool input rejected: the arguments did not match the tool's schema.\n\
+             Try: re-check the tool's required fields and types, then retry.\n\
+             Details: {raw}"
+        )
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]
