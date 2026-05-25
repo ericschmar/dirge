@@ -1276,7 +1276,7 @@ pub(crate) fn display_col_to_char_index(s: &str, display_col: usize) -> usize {
 /// display cells handles multi-byte UTF-8 (the cursor column is
 /// the display width of the row prefix up to the byte).
 fn wrap_editor(full: &str, cursor_byte: usize, wrap_w: usize) -> (Vec<String>, u16, u16) {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let wrap_w = wrap_w.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut cursor_row: u16 = 0;
@@ -1285,44 +1285,70 @@ fn wrap_editor(full: &str, cursor_byte: usize, wrap_w: usize) -> (Vec<String>, u
 
     let mut byte_idx: usize = 0;
     for logical in full.split('\n') {
-        // Soft-wrap by display width. Walk chars, accumulating
-        // width — start a new row when adding the next char would
-        // exceed `wrap_w`.
         let logical_start = byte_idx;
-        let mut cur_row = String::new();
+        let logical_end = logical_start + logical.len();
+
+        // Word-aware soft wrapping for this logical line.
+        let mut cur = String::new();
         let mut cur_w: usize = 0;
         let mut local_byte: usize = 0;
+
         for ch in logical.chars() {
             let w = ch.width().unwrap_or(0);
-            if cur_w + w > wrap_w && !cur_row.is_empty() {
-                // Check cursor before flushing the row.
-                let row_start_byte = logical_start + local_byte - cur_row.len();
-                let row_end_byte = row_start_byte + cur_row.len();
-                if cursor_byte >= row_start_byte && cursor_byte <= row_end_byte {
-                    cursor_row = rows.len() as u16;
-                    let prefix_end = cursor_byte - row_start_byte;
-                    cursor_col = unicode_width::UnicodeWidthStr::width(
-                        &cur_row.as_str()[..prefix_end.min(cur_row.len())],
-                    ) as u16;
+            if cur_w + w > wrap_w && !cur.is_empty() {
+                // Find last whitespace to break at a word boundary.
+                let break_at = cur.rfind(|c: char| c == ' ' || c == '\t');
+                match break_at {
+                    Some(ws_idx) => {
+                        // Word-boundary break.  Split at the whitespace:
+                        // prefix stays on this row, suffix (whitespace +
+                        // trailing text) moves to the continuation row.
+                        let prefix: String = cur[..ws_idx].to_string();
+                        let suffix: String = cur[ws_idx..].trim_start().to_string();
+
+                        let row_start = logical_start + local_byte - cur.len();
+                        let row_end = row_start + prefix.len();
+                        rows.push(prefix);
+                        if cursor_byte >= row_start && cursor_byte <= row_end {
+                            cursor_row = rows.len() as u16 - 1;
+                            cursor_col =
+                                UnicodeWidthStr::width(&full[row_start..cursor_byte.min(row_end)])
+                                    as u16;
+                        }
+                        // Start continuation row with the dangling suffix.
+                        cur = suffix;
+                        cur_w = UnicodeWidthStr::width(cur.as_str());
+                    }
+                    None => {
+                        // No whitespace — a single token is wider than the
+                        // row budget.  Fall back to character-level break.
+                        let row_start = logical_start + local_byte - cur.len();
+                        let row_end = row_start + cur.len();
+                        rows.push(std::mem::take(&mut cur));
+                        if cursor_byte >= row_start && cursor_byte <= row_end {
+                            cursor_row = rows.len() as u16 - 1;
+                            cursor_col =
+                                UnicodeWidthStr::width(&full[row_start..cursor_byte.min(row_end)])
+                                    as u16;
+                        }
+                        cur_w = 0;
+                    }
                 }
-                rows.push(std::mem::take(&mut cur_row));
-                cur_w = 0;
             }
-            cur_row.push(ch);
+            cur.push(ch);
             cur_w += w;
             local_byte += ch.len_utf8();
         }
-        // Cursor on the (last) row of this logical line?
-        let row_start_byte = logical_start + local_byte - cur_row.len();
-        let row_end_byte = row_start_byte + cur_row.len();
-        if cursor_byte >= row_start_byte && cursor_byte <= row_end_byte {
-            cursor_row = rows.len() as u16;
-            let prefix_end = cursor_byte - row_start_byte;
-            cursor_col = unicode_width::UnicodeWidthStr::width(
-                &cur_row.as_str()[..prefix_end.min(cur_row.len())],
-            ) as u16;
+
+        // Remaining characters on this logical line form the last row.
+        let row_start = logical_start + local_byte - cur.len();
+        let row_end = logical_start + local_byte;
+        rows.push(cur);
+        if cursor_byte >= row_start && cursor_byte <= row_end {
+            cursor_row = rows.len() as u16 - 1;
+            cursor_col = UnicodeWidthStr::width(&full[row_start..cursor_byte.min(row_end)]) as u16;
         }
-        rows.push(cur_row);
+
         // Advance past this logical line + the '\n'.
         byte_idx += logical.len() + 1;
     }
