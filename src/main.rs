@@ -1060,7 +1060,7 @@ async fn run_headless_loop(
                     };
                     let safe = ansi::strip_controls(&combined, StripPolicy::KEEP_NEWLINE);
                     eprintln!("{safe}");
-                    Some(combined)
+                    Some(safe)
                 }
                 Err(e) => {
                     let msg = format!("error: {}", e);

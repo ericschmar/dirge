@@ -225,22 +225,33 @@ pub fn sanitize_output(text: &str) -> CompactString {
             // Single-byte: ESC + any other char (reset, etc.)
             match chars.next() {
                 Some('[') | Some(']') => {
-                    // Consume until sequence terminator (alphabetic,
-                    // tilde, or BEL for OSC).
+                    // Consume until sequence terminator. Cap at 256
+                    // bytes to prevent DoS on unterminated sequences
+                    // (tool output containing "\x1b[no-alpha-here").
+                    let mut n = 0;
                     for next in &mut chars {
                         if next.is_ascii_alphabetic() || next == '~' || next == '\x07' {
                             break;
                         }
+                        n += 1;
+                        if n >= 256 {
+                            break;
+                        }
                     }
                 }
-                // DCS/APC/PM/SOS — consume until ST (ESC \).
+                // DCS/APC/PM/SOS — consume until ST (ESC \). Cap at 4 KB.
                 Some('P') | Some('X') | Some('^') | Some('_') => {
                     let mut prev = '\0';
+                    let mut n = 0;
                     for next in &mut chars {
                         if prev == '\x1b' && next == '\\' {
                             break;
                         }
                         prev = next;
+                        n += 1;
+                        if n >= 4096 {
+                            break;
+                        }
                     }
                 }
                 Some(_) => {} // Single-byte esc sequence — skip the second byte.
