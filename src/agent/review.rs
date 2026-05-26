@@ -99,11 +99,7 @@ Be specific and actionable. Future sessions should benefit from what you learned
 /// This is fire-and-forget — it runs in a `tokio::spawn` task and
 /// returns immediately. Failures are logged to stderr and never
 /// block the user.
-pub fn spawn_background_review(
-    agent: AnyAgent,
-    _paths: ProjectPaths,
-    transcript: String,
-) {
+pub fn spawn_background_review(agent: AnyAgent, _paths: ProjectPaths, transcript: String) {
     // Rate-limit: skip if a review ran recently. Uses atomic
     // compare-and-swap so concurrent Done events from different
     // sessions don't race — only the first one wins.
@@ -124,10 +120,8 @@ pub fn spawn_background_review(
 
     tokio::spawn(async move {
         // Build a review runner with only memory + skill tools.
-        let review_runner = agent.spawn_review_runner(
-            COMBINED_REVIEW_PROMPT.to_string(),
-            transcript,
-        );
+        let review_runner =
+            agent.spawn_review_runner(COMBINED_REVIEW_PROMPT.to_string(), transcript);
 
         // Drain events. We don't render them — the review runs
         // silently in the background.
@@ -178,8 +172,8 @@ pub fn build_transcript(session: &crate::session::Session) -> String {
                     out.push_str(&format!("Assistant: {}\n", msg.content));
                 }
                 for tc in &msg.tool_calls {
-                    let args_str = serde_json::to_string(&tc.args)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let args_str =
+                        serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
                     out.push_str(&format!("  [Tool: {}({})]\n", tc.name, args_str));
                     match &tc.state {
                         crate::session::ToolCallState::Completed { result } => {
@@ -248,11 +242,7 @@ mod tests {
                 result: "file contents here".to_string(),
             },
         };
-        s.add_message_with_tool_calls(
-            MessageRole::Assistant,
-            "Let me read that.",
-            vec![tc],
-        );
+        s.add_message_with_tool_calls(MessageRole::Assistant, "Let me read that.", vec![tc]);
 
         let t = build_transcript(&s);
         assert!(t.contains("[Tool: read("));
@@ -267,7 +257,9 @@ mod tests {
             id: "c1".to_string(),
             name: "bash".to_string(),
             args: serde_json::json!({"cmd": "cat big.txt"}),
-            state: ToolCallState::Completed { result: big.clone() },
+            state: ToolCallState::Completed {
+                result: big.clone(),
+            },
         };
         s.add_message_with_tool_calls(MessageRole::Assistant, "", vec![tc]);
 
@@ -279,7 +271,10 @@ mod tests {
     #[test]
     fn transcript_includes_system_messages() {
         let mut s = make_session();
-        s.add_message(MessageRole::System, "compaction summary: previous work on auth module");
+        s.add_message(
+            MessageRole::System,
+            "compaction summary: previous work on auth module",
+        );
         s.add_message(MessageRole::User, "continue");
 
         let t = build_transcript(&s);

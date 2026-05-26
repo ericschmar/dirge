@@ -219,10 +219,7 @@ mod tests {
     /// git root marker and stop walking.
     #[test]
     fn find_git_root_recognises_worktree_marker() {
-        let dir = std::env::temp_dir().join(format!(
-            "dirge-worktree-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("dirge-worktree-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Create a worktree-style .git file.
@@ -247,9 +244,10 @@ mod tests {
         assert!(
             root.join(".git").is_dir() || {
                 let git_file = root.join(".git");
-                git_file.is_file() && std::fs::read_to_string(&git_file)
-                    .map(|c| c.starts_with("gitdir:"))
-                    .unwrap_or(false)
+                git_file.is_file()
+                    && std::fs::read_to_string(&git_file)
+                        .map(|c| c.starts_with("gitdir:"))
+                        .unwrap_or(false)
             },
             "expected {root:?} to be a git root"
         );

@@ -60,8 +60,7 @@ impl CuratorState {
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read curator state: {e}"))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse curator state: {e}"))
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse curator state: {e}"))
     }
 
     fn save(&self, path: &PathBuf) -> Result<(), String> {
@@ -243,11 +242,8 @@ mod tests {
 
     fn temp_project() -> (ProjectPaths, std::path::PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "dirge-curator-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dirge-curator-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
@@ -337,12 +333,14 @@ mod tests {
         // Original gone.
         assert!(!paths.skills_dir().join("old-skill").is_dir());
         // Present in archive.
-        assert!(paths
-            .skills_dir()
-            .join(".archive")
-            .join("old-skill")
-            .join("SKILL.md")
-            .is_file());
+        assert!(
+            paths
+                .skills_dir()
+                .join(".archive")
+                .join("old-skill")
+                .join("SKILL.md")
+                .is_file()
+        );
     }
 
     // ── apply_automatic_transitions ────────────────────
