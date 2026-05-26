@@ -205,6 +205,7 @@ impl SkillManager {
     }
 
     /// Archive a skill — move to `.archive/`. Does not delete.
+    #[allow(dead_code)]
     pub fn archive(&self, name: &str) -> Result<(), String> {
         let src = self.skills_dir.join(name);
         if !src.is_dir() {
@@ -222,6 +223,7 @@ impl SkillManager {
     }
 
     /// Restore an archived skill.
+    #[allow(dead_code)]
     pub fn restore(&self, name: &str) -> Result<(), String> {
         let archive_dir = self.skills_dir.join(".archive");
         let src = archive_dir.join(name);

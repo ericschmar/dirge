@@ -29,9 +29,11 @@ use super::types::{Context, TurnUpdate};
 /// small clone overhead for a clean async-fn shape.
 #[derive(Debug, Clone)]
 pub struct BeforeToolCallContext {
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    // assistant_message + tool_call_id are carried for API completeness
+    // (pi types.ts:84) but not read by current plugin hooks.
+    #[allow(dead_code)]
     pub assistant_message: AssistantMessage,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub tool_call_id: String,
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub tool_call_name: String,
@@ -67,17 +69,19 @@ pub type BeforeToolCallFn = Arc<
 /// `AfterToolCallContext` (types.ts:96).
 #[derive(Debug, Clone)]
 pub struct AfterToolCallContext {
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    // assistant_message, tool_call_id, args, is_error are carried
+    // for API completeness (pi types.ts:96) but not read by current plugin hooks.
+    #[allow(dead_code)]
     pub assistant_message: AssistantMessage,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub tool_call_id: String,
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub tool_call_name: String,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub args: Value,
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub result: LoopToolResult,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub is_error: bool,
 }
 
@@ -109,13 +113,16 @@ pub type AfterToolCallFn = Arc<
 ///   `{ message, toolResults, context, newMessages }`
 #[derive(Debug, Clone)]
 pub struct TurnHookContext {
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    // All fields are carried for API completeness (pi types.ts:112)
+    // but current plugin hooks (prepare_next_turn, should_stop_after_turn)
+    // use _ctx — they read from PluginManager slots instead.
+    #[allow(dead_code)]
     pub message: AssistantMessage,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub tool_results: Vec<ToolResultMessage>,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub context: Context,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    #[allow(dead_code)]
     pub new_messages: Vec<LoopMessage>,
 }
 

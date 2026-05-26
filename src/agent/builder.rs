@@ -154,6 +154,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Err(_) => None,
         };
     let skill_manager = crate::extras::skills::manager::SkillManager::new(&paths);
+    let usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
 
     // Inject available project skills into the preamble so the
     // model knows what procedural knowledge exists for this project.
@@ -290,6 +291,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::SkillTool::new(
                 Arc::clone(&skills),
                 skill_manager,
+                usage_store.clone(),
                 permission.clone(),
                 ask_tx.clone(),
             )),
@@ -520,9 +522,9 @@ pub async fn build_loop_tools(
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let skill_mgr = crate::extras::skills::manager::SkillManager::new(
-        &crate::extras::dirge_paths::ProjectPaths::new(&cwd),
-    );
+    let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
+    let skill_mgr = crate::extras::skills::manager::SkillManager::new(&paths);
+    let usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
     let skills: Arc<[Skill]> = Arc::from(
         tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
             .await
@@ -678,7 +680,7 @@ pub async fn build_loop_tools(
     // safe (a skill body could do anything).
     tools.push(
         wrap(
-            tools::SkillTool::new(Arc::clone(&skills), skill_mgr, permission.clone(), ask_tx.clone()),
+            tools::SkillTool::new(Arc::clone(&skills), skill_mgr, usage_store.clone(), permission.clone(), ask_tx.clone()),
             Some(ToolExecutionMode::Sequential),
         )
         .await,

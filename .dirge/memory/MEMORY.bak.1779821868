@@ -1,0 +1,37 @@
+## AgentEvent variant addition checklist
+When adding new variant to `src/event.rs`:
+1. `bridge.rs` — `translate()` match + `agent_event_kind` test helper
+2. `h7_smoke.rs` — `print_event()` match
+3. `integration.rs` — `agent_event_kind()` match
+4. `src/extras/acp/mod.rs` — ACP event loop match
+5. `src/ui/mod.rs` — main handler + `#[cfg(feature = "loop")]` path
+6. `src/provider/mod.rs` — `run_print` (wildcard ok)
+7. `src/agent/review.rs` — (wildcard ok)
+Compiler catches all non-exhaustive patterns.
+§
+## Code conventions
+- NO `#![allow(dead_code)]` module-level. Delete legacy code, don't suppress. `#[cfg(test)]` for test-only exports. `#[cfg_attr(not(feature))]` for feature-gated fields.
+- New AgentEvent variant: update bridge.rs, h7_smoke.rs, integration.rs, acp/mod.rs, ui/mod.rs, provider/mod.rs. Compiler catches exhaustiveness.
+- Porting from Hermes: read Python source FIRST, port every guard clause, match error messages, no simplifications.
+- Dead code triage: check PLAN_LEARNING.md + ~/src/hermes reference → wire if forgotten → targeted #[allow] if future infra → delete if junk.
+- Build: `cargo check --bin dirge` then `cargo test --bin dirge` (1306 tests). `cargo test --bin dirge <filter>` for targeted runs. Git: `git add -A && git commit && git pull --rebase && git push`.
+§
+## Key pitfalls
+- **end_session() in persist_turn_to_db() caused session content leakage into chat.** Marking session "done" after every turn confuses downstream consumers. Keep `#[cfg(test)]` — only compression splits + explicit user exit call it.
+- Hooks.rs fields on BeforeToolCallContext/AfterToolCallContext/TurnHookContext: changed from `cfg_attr(not(plugin))` to plain `#[allow(dead_code)]` — fields carried for API completeness (pi types.ts) but current plugin hooks read PluginManager slots instead.
+- **UsageStore.clone() for mutation from `&self`:** SkillTool.call() takes `&self`, so usage counter bumps clone the store. Cheap clone, best-effort telemetry — intentional pattern.
+- **File locking:** UsageStore.save() uses PID-based create-exclusive lock (same pattern as memory_store.rs). `kill(pid, 0)` staleness detection, 50×10ms retry.
+- **FTS5 external content tables:** `'rebuild'` re-indexes using old trigger formula; to change indexed content need DELETE + INSERT SELECT.
+- **env::set_var + parallel tests = flaky.** Static Mutex + EnvGuard RAII that clears on Drop.
+§
+## Code conventions
+- NO `#![allow(dead_code)]` module-level. Delete legacy code, don't suppress. `#[cfg(test)]` for test-only exports. `#[cfg_attr(not(feature))]` for feature-gated fields.
+- New AgentEvent variant: update bridge.rs, h7_smoke.rs, integration.rs, acp/mod.rs, ui/mod.rs, provider/mod.rs. Compiler catches exhaustiveness.
+- All changes: `cargo check` then `cargo test --bin dirge` (1306 tests). Commit + `git pull --rebase && git push`.
+- Porting from Hermes: read Python source FIRST, port every guard clause, match error messages, no simplifications.
+§
+end_session() kept #[cfg(test)] — calling it in persist_turn_to_db() caused previous session content leakage into chat. The UPDATE sets ended_at on active session, confusing downstream consumers. Reserved for compression splits + explicit user exit. Hooks.rs fields assistant_message, tool_call_id, args, is_error on Before/AfterToolCallContext, and all TurnHookContext fields changed from cfg_attr(not(plugin)) to plain allow(dead_code) — fields are carried for API completeness (pi types.ts) but current plugin hooks use PluginManager slots instead.
+§
+Build: `cargo check --bin dirge` (type check), `cargo test --bin dirge` (1306 tests, ~2.4s). Tests parallel by default — env var mutations need Mutex serialization. `cargo test --bin dirge <filter>` for targeted runs. Git: `git add -A && git commit && git pull --rebase && git push`.
+§
+UsageStore file locking: copied FileLock pattern from memory_store.rs — PID-based create-exclusive lock file with staleness detection (kill(pid, 0) on unix, 10ms retry x 50 attempts). Lock acquired in save() before atomic_write_sync. Dropped lock file on Lock guard drop. No external crate needed.

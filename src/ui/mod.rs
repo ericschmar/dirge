@@ -372,7 +372,14 @@ fn persist_turn_to_db(
     let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
     let db = match crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
         Ok(db) => db,
-        Err(_) => return,
+        Err(e) => {
+            tracing::debug!(
+                target: "dirge::ui",
+                error = %e,
+                "Session DB unavailable — turn not persisted"
+            );
+            return;
+        }
     };
     let now = chrono::Utc::now().to_rfc3339();
     let sid = format!(
@@ -428,6 +435,12 @@ fn persist_turn_to_db(
             &now,
         );
     }
+
+    // NOTE: end_session intentionally NOT called here.
+    // Marking the session "done" after every turn was found to
+    // cause previous session content to leak into the chat.
+    // end_session() is reserved for true session termination
+    // (compression splits, explicit user exit).
 }
 
 /// Map a plugin-supplied color string ("cyan", "red", ...) to a
@@ -3562,7 +3575,7 @@ pub async fn run_interactive(
                     AgentEvent::UserMessage { content } => {
                         write_user_lines(&mut renderer, &content)?;
                         renderer.write_line("", Color::White)?;
-                        session.add_message(MessageRole::User, &content);
+                        // session.add_message handled at input time (line ~2119)
                     }
                 }
                 renderer.draw_bottom(

@@ -76,6 +76,7 @@ impl SkillUsage {
 
 /// Sidecar store for skill telemetry at `.dirge/skills/.usage.json`.
 /// Thread-safe via internal locking — all methods take `&mut self`.
+#[derive(Clone)]
 pub struct UsageStore {
     path: PathBuf,
     lock_path: PathBuf,
@@ -120,9 +121,11 @@ impl UsageStore {
         })
     }
 
-    /// Serialize and write atomically. Best-effort: failures are
-    /// logged and silently dropped.
+    /// Serialize and write atomically. Acquires an exclusive file lock
+    /// before writing to prevent corruption from concurrent processes.
+    /// Best-effort: failures are logged and silently dropped.
     pub fn save(&self) -> Result<(), String> {
+        let _lock = acquire_usage_lock(&self.lock_path)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create usage directory: {e}"))?;
@@ -188,6 +191,7 @@ impl UsageStore {
     }
 
     /// Set the pinned flag. Pinned skills are exempt from curator transitions.
+    #[allow(dead_code)]
     pub fn set_pinned(&mut self, name: &str, pinned: bool) -> Result<(), String> {
         let entry = self.get_or_create(name, None);
         entry.pinned = pinned;
@@ -238,8 +242,68 @@ impl UsageStore {
     }
 
     /// Iterate over all skill names tracked in the usage store.
+    #[allow(dead_code)]
     pub fn skill_names(&self) -> impl Iterator<Item = &String> {
         self.data.keys()
+    }
+}
+
+/// Acquire an exclusive file lock on the usage sidecar lock file.
+/// Uses create-exclusive semantics with PID-based staleness detection
+/// (same pattern as memory_store.rs).
+fn acquire_usage_lock(lock_path: &PathBuf) -> Result<UsageLock, String> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create lock directory: {e}"))?;
+    }
+    for attempt in 0..50 {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut f) => {
+                let pid = std::process::id().to_string();
+                let _ = std::io::Write::write_all(&mut f, pid.as_bytes());
+                return Ok(UsageLock { path: lock_path.clone() });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Check staleness on first attempt only.
+                if attempt == 0 {
+                    if let Ok(content) = std::fs::read_to_string(lock_path) {
+                        let pid: Result<u32, _> = content.trim().parse();
+                        if let Ok(pid) = pid {
+                            // Check if process is still alive.
+                            #[cfg(unix)]
+                            {
+                                unsafe {
+                                    if libc::kill(pid as i32, 0) != 0 {
+                                        let _ = std::fs::remove_file(lock_path);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(format!("Failed to acquire usage lock: {e}"));
+            }
+        }
+    }
+    Err("Timed out waiting for usage file lock".to_string())
+}
+
+struct UsageLock {
+    path: PathBuf,
+}
+
+impl Drop for UsageLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

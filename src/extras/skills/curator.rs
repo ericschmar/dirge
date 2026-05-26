@@ -141,7 +141,7 @@ impl Curator {
         }
 
         // Load usage tracking for pin/activity checks.
-        let usage = match crate::extras::skills::usage::UsageStore::load(&self.paths) {
+        let mut usage = match crate::extras::skills::usage::UsageStore::load(&self.paths) {
             Ok(u) => Some(u),
             Err(_) => None,
         };
@@ -200,25 +200,31 @@ impl Curator {
                 // Archive this skill.
                 self.archive_skill(&name)?;
                 // Update usage state if loaded.
-                if let Some(ref usage) = usage {
-                    let mut u = crate::extras::skills::usage::UsageStore::load(&self.paths)
-                        .unwrap_or_else(|_| unreachable!());
+                if let Some(ref mut u) = usage {
                     let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Archived);
                 }
             } else if age_days >= STALE_AFTER_DAYS {
                 stale_names.push(name.clone());
-                if let Some(ref usage) = usage {
-                    let mut u = crate::extras::skills::usage::UsageStore::load(&self.paths)
-                        .unwrap_or_else(|_| unreachable!());
+                if let Some(ref mut u) = usage {
                     let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Stale);
                 }
-            } else if let Some(ref usage) = usage {
+            } else {
                 // Recent activity on a stale skill → reactivate.
-                if usage.get(&name).map(|u| matches!(u.state, crate::extras::skills::usage::SkillState::Stale)).unwrap_or(false) {
-                    let mut u = crate::extras::skills::usage::UsageStore::load(&self.paths)
-                        .unwrap_or_else(|_| unreachable!());
-                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Active);
-                    reactivated.push(name);
+                let needs_reactivate = match usage.as_ref() {
+                    Some(u) => u
+                        .get(&name)
+                        .map(|r| matches!(r.state, crate::extras::skills::usage::SkillState::Stale))
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if needs_reactivate {
+                    if let Some(ref mut u) = usage {
+                        let _ = u.set_state(
+                            &name,
+                            crate::extras::skills::usage::SkillState::Active,
+                        );
+                        reactivated.push(name);
+                    }
                 }
             }
         }

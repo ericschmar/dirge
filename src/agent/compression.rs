@@ -14,10 +14,12 @@
 //! 5. Assemble compressed: head + summary + tail
 //! 6. Rotate session id (parent_session_id chain)
 //!
-//! The LLM call is deferred to the stream pipeline (the auxiliary
-//! model is configured via LoopConfig.compact_model). Until then,
-//! placeholder compression drops old tool outputs and inserts a
-//! summary marker so the threshold logic is exercised.
+//! CURRENT STATE: Steps 1-3 (pruning + threshold) are wired into the
+//! agent loop at run.rs:438-476. Steps 4-6 (LLM call, summary assembly,
+//! session rotation) are implemented and tested below but awaiting wiring
+//! of the auxiliary model pipeline (LoopConfig.compact_model). The
+//! individual `#[allow(dead_code)]` annotations mark this future
+//! infrastructure — do not remove.
 
 use serde_json::Value;
 
@@ -38,20 +40,25 @@ that appears AFTER this summary. The current session state (files, \
 config, etc.) may reflect work described here — avoid repeating it:";
 
 // Budget constants from Hermes (context_compressor.py:54-59).
+#[allow(dead_code)]
 const MIN_SUMMARY_TOKENS: u64 = 2000;
+#[allow(dead_code)]
 const SUMMARY_RATIO: f64 = 0.20;
+#[allow(dead_code)]
 const SUMMARY_TOKENS_CEILING: u64 = 12_000;
 
 /// Chars-per-token rough estimate. Port of Hermes's _CHARS_PER_TOKEN.
 const CHARS_PER_TOKEN: u64 = 4;
 
 /// Hard floor for a compression model's context window (64K).
+#[allow(dead_code)]
 const MINIMUM_CONTEXT_LENGTH: u64 = 64_000;
 
 // ── Public API ───────────────────────────────────────────
 
 /// Compression outcome with metadata.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CompressionResult {
     /// The generated summary text.
     pub summary: String,
@@ -79,6 +86,7 @@ pub fn should_compress(prompt_tokens: u64, context_window: u64) -> bool {
 
 /// Approximate token count from total character length.
 /// 4 chars ≈ 1 token (rough, model-independent).
+#[allow(dead_code)]
 pub fn approx_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(CHARS_PER_TOKEN)
 }
@@ -214,11 +222,12 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
 
 /// Build the structured summary prompt for the auxiliary model.
 /// Port of Hermes's _generate_summary prompt (context_compressor.py:960-1046).
+#[allow(dead_code)]
 pub fn build_summary_prompt(
     turns_to_summarize: &[Value],
     summary_budget: u64,
     previous_summary: Option<&str>,
-    focus_topic: Option<&str>, // reserved for future /compress <focus>
+    _focus_topic: Option<&str>, // reserved for future /compress <focus>
 ) -> String {
     let _summarizer_preamble = "\
 You are a summarization agent creating a context checkpoint. \
@@ -308,6 +317,7 @@ Use this exact structure:\n\n\
 
 /// Serialize turns for the summarizer prompt. Each turn gets
 /// role + content (text fields only, tool results truncated).
+#[allow(dead_code)]
 fn serialize_turns_for_summary(turns: &[Value]) -> String {
     let mut out = String::new();
     for (i, turn) in turns.iter().enumerate() {
@@ -333,6 +343,7 @@ fn serialize_turns_for_summary(turns: &[Value]) -> String {
 
 /// Compute the summary budget from the compressed token count.
 /// Port of Hermes's _compute_summary_budget.
+#[allow(dead_code)]
 pub fn summary_budget(compressed_tokens: u64) -> u64 {
     let ratio_budget = (SUMMARY_RATIO * compressed_tokens as f64) as u64;
     ratio_budget.clamp(MIN_SUMMARY_TOKENS, SUMMARY_TOKENS_CEILING)
@@ -340,6 +351,7 @@ pub fn summary_budget(compressed_tokens: u64) -> u64 {
 
 /// Validate that a summary contains the expected sections.
 /// At minimum it should mention Active Task and have some structure.
+#[allow(dead_code)]
 pub fn validate_summary(summary: &str) -> bool {
     if summary.is_empty() {
         return false;
@@ -352,6 +364,7 @@ pub fn validate_summary(summary: &str) -> bool {
 /// Find the latest context summary marker in the message list.
 /// Returns (index, body) of the last system message containing
 /// SUMMARY_PREFIX, or None.
+#[allow(dead_code)]
 pub fn find_previous_summary(messages: &[Value]) -> Option<(usize, String)> {
     messages
         .iter()

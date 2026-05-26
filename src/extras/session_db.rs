@@ -16,7 +16,7 @@
 use rusqlite::{Connection, OpenFlags, params};
 use std::path::Path;
 
-#[allow(dead_code)]
+// Used in migrate() to set user_version pragma.
 const SCHEMA_VERSION: u32 = 5;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
@@ -26,6 +26,7 @@ static LAST_INIT_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new
 
 /// Return the most recent session DB init failure, if any.
 /// Port of Hermes's `get_last_init_error()` (hermes_state.py:94-100).
+#[allow(dead_code)]
 pub fn last_init_error() -> Option<String> {
     LAST_INIT_ERROR.lock().unwrap().clone()
 }
@@ -406,7 +407,7 @@ impl SessionDb {
 pub struct SearchResult {
     pub session_id: String,
     pub content: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // populated from SQL, not yet read by consumers
     pub role: String,
     pub timestamp: String,
 }
@@ -549,7 +550,6 @@ impl SessionDb {
     /// The trigram tokenizer creates overlapping 3-character sequences,
     /// making substring matching work natively for any script.
     /// Port of Hermes's trigram search path (hermes_state.py:2245-2350).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn search_messages_trigram(
         &self,
         query: &str,
@@ -621,7 +621,10 @@ impl SessionDb {
     /// No-ops when the session is already ended — the first end_reason
     /// wins (compression splits keep their end_reason).
     /// Port of Hermes's `end_session()` (hermes_state.py:732-748).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 
+    /// Currently test-only. Will be wired for compression splits
+    /// and explicit user exit paths.
+    #[cfg(test)]
     pub fn end_session(&self, session_id: &str, end_reason: &str) -> Result<(), String> {
         self.conn
             .execute(

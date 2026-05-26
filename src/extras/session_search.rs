@@ -19,6 +19,25 @@
 
 use crate::extras::session_db::{SearchResult, SessionDb};
 
+/// Detect CJK (Chinese/Japanese/Korean) characters in a query.
+/// When CJK is present, the default unicode61 tokenizer splits
+/// each character into a separate token, breaking phrase matching.
+/// We route to the trigram FTS5 index instead.
+/// Port of Hermes's `_query_contains_cjk()` (hermes_state.py:2085-2105).
+fn contains_cjk(query: &str) -> bool {
+    query.chars().any(|c| {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+            | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Extension A
+            | '\u{3040}'..='\u{309F}' // Hiragana
+            | '\u{30A0}'..='\u{30FF}' // Katakana
+            | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+            | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
+            | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
+        )
+    })
+}
+
 /// A single search hit in the DISCOVERY shape. Contains the
 /// matched session with context for the agent to understand
 /// what happened.
@@ -124,7 +143,14 @@ impl SessionSearch {
     /// root.
     pub fn discover(&self, query: &str) -> Result<Vec<DiscoveryHit>, String> {
         let sanitized = sanitize_fts5_query(query);
-        let results = self.db.search_messages(&sanitized, None)?;
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let results = if contains_cjk(&sanitized) {
+            self.db.search_messages_trigram(&sanitized, None)?
+        } else {
+            self.db.search_messages(&sanitized, None)?
+        };
         if results.is_empty() {
             return Ok(Vec::new());
         }

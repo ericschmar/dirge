@@ -1,14 +1,21 @@
----
-name: dead-code-cleanup
-description: Systematic dead code removal following dirge conventions.
-triggers:
-  - "clean up dead code"
-  - "remove allow(dead_code)"
-  - "dead code warnings"
-  - "#![allow(dead_code)]"
----
+# dead-code-cleanup
+# dead-code-cleanup
+
+Systematic dead code removal following dirge conventions.
 
 ## Dead code cleanup workflow
+
+### Process (do in this order)
+
+1. `cargo check --bin dirge 2>&1 | grep "never used\|never read\|warning: "` to enumerate
+2. Group by category:
+   - **Bug**: `#[cfg_attr(not(feature), allow)]` that's stale — code IS used, annotation is wrong
+   - **Forgotten wiring**: feature is implemented+tested but never called from integration point
+   - **Future infrastructure**: implemented+tested, awaiting pipeline component (compression LLM, slash commands)
+   - **Genuine dead code**: no tests, no plan reference, no Hermes source — delete
+3. For each warning, check `PLAN_LEARNING.md` for feature spec
+4. Check `~/src/hermes/` for reference implementation to confirm wiring intent
+5. Wire up if feature needed and tested, keep `#[allow]` + rationale comment if future infra, delete if junk
 
 ### Rules (in priority order)
 
@@ -20,13 +27,33 @@ triggers:
 
 ### Exceptions
 
-`agent_loop/mod.rs` uses `#![allow(unused_imports)]` on its re-export block because many re-exports are consumed by tests or external crates, not the binary.
+- `agent_loop/mod.rs` uses `#![allow(unused_imports)]` on its re-export block
+- `compression.rs` has ~13 `#[allow]` annotations — all Round 9 infrastructure awaiting auxiliary LLM pipeline (LoopConfig.compact_model). Verified against Hermes context_compressor.py. Do NOT remove.
+- `session_db.rs`: `last_init_error()` awaits slash-command, `set_parent_session()` awaits compression pipeline
+- `session_db.rs`: `SearchResult.role` — populated from SQL, not yet read by consumers
+- `skills/manager.rs`: `archive()`/`restore()` await skill tool action wiring
+- `skills/usage.rs`: `set_pinned()` (web API only in Hermes — awaits /pin slash), `skill_names()` (tool schemas, autocomplete)
+- `skills/curator.rs`: `IDLE_HOURS`, `SkillLifecycle` — curator infrastructure
+
+### What was wired (2025 session)
+
+- `search_messages_trigram` → wired into `SessionSearch::discover()` via `contains_cjk()` for CJK detection
+- `record_create`, `record_view`, `record_patch` → wired into `SkillTool` create/edit/patch actions
+- `record_use` → wired into `SkillTool` load action (alongside `record_view`, matching Hermes `skill_tool.py:105-108`)
+- `UsageStore.lock_path` → file locking in `save()` via `acquire_usage_lock()` (PID create-exclusive)
+- `end_session()` → wired then UNWIRED from `persist_turn_to_db()`. Now `#[cfg(test)]`. See pitfalls.
+
+### Pitfalls
+
+- **`end_session()` in `persist_turn_to_db()` causes session content leakage**: marking session "done" after every turn makes previous session content dump alongside user input. Keep `#[cfg(test)]` — only two Hermes callers: compression rotation and explicit user exit.
+- **Don't add `end_session()` to turn-persistence paths** — it's not idempotent in effect despite being idempotent in SQL.
+- **UsageStore.clone() for mutation from `&self` context**: since `SkillTool.call()` takes `&self`, usage counter bumps require `self.usage.clone()` to get an owned mutable copy. This is intentional — best-effort telemetry, the clone is cheap.
 
 ### Verification
 
 ```bash
 cargo check --bin dirge  # must produce ZERO warnings
-cargo test --bin dirge   # all 1259 tests must pass
+cargo test --bin dirge   # all 1306 tests must pass
 ```
 
 ### What was removed in the canonical cleanup
