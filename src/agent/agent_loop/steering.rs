@@ -375,6 +375,8 @@ mod tests {
             repair_stats: std::sync::Arc::new(
                 crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
             ),
+            tool_def_filter: None,
+            dynamic_tool_search: false,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));
 

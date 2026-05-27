@@ -306,6 +306,32 @@ pub struct LoopConfig {
     /// the UI can print "repaired 3 inputs (1 md-link unwrap, 2
     /// null-strip), 0 invalid" at session close.
     pub repair_stats: std::sync::Arc<super::tool_input_repair::RepairStats>,
+
+    /// Phase-3 dynamic-tool-search: per-session "loaded" tool set.
+    /// When `Some`, the request builder filters tool defs sent to
+    /// the model to (a) the always-on set
+    /// (`tools::tool_search::ALWAYS_ON_TOOLS`), (b) tools whose
+    /// names are in this set, and (c) `tool_search` itself.
+    ///
+    /// `None` (the default) preserves legacy behavior — every
+    /// registered tool definition ships every turn. The `tool_search`
+    /// meta-tool inserts names into this set when the model
+    /// discovers a needed tool; the SAME Arc is shared between
+    /// the tool's executor and the filter inside the request
+    /// builder, so a tool the model just discovered shows up on
+    /// the next turn's request.
+    pub tool_def_filter:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+
+    /// Phase-3 dynamic-tool-search opt-in. Mirrors the
+    /// config.json `dynamic_tool_search` key. When `true` the
+    /// session allocates a `tool_def_filter` and includes the
+    /// `tool_search` tool in the registry; when `false` (default)
+    /// the loop runs in legacy "ship every tool every turn"
+    /// mode. Carried on `LoopConfig` so non-loop callers can
+    /// inspect the setting without rebuilding the request-side
+    /// filter independently.
+    pub dynamic_tool_search: bool,
 }
 
 /// `convertToLlm` signature. Synchronous in pi (returns
@@ -382,6 +408,11 @@ impl std::fmt::Debug for LoopConfig {
             .field("provider_name", &self.provider_name)
             .field("model_name", &self.model_name)
             .field("compact_model", &self.compact_model)
+            .field(
+                "tool_def_filter",
+                &self.tool_def_filter.as_ref().map(|_| "<set>"),
+            )
+            .field("dynamic_tool_search", &self.dynamic_tool_search)
             .finish()
     }
 }
@@ -411,6 +442,8 @@ impl Clone for LoopConfig {
             storm_mutating_tools: self.storm_mutating_tools.clone(),
             storm_exempt_tools: self.storm_exempt_tools.clone(),
             repair_stats: self.repair_stats.clone(),
+            tool_def_filter: self.tool_def_filter.clone(),
+            dynamic_tool_search: self.dynamic_tool_search,
         }
     }
 }

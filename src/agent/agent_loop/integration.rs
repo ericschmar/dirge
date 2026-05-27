@@ -354,6 +354,20 @@ pub struct LoopSpawnConfig {
     /// can call the auxiliary model. Production code builds this
     /// from `AnyClient::compress_messages`; tests can mock it.
     pub summarize_fn: Option<crate::agent::compression::SummarizeFn>,
+
+    /// Phase-3: per-session loaded-tool set. When `Some`, the
+    /// request builder filters tool defs sent to the model
+    /// against this set + the always-on list. Must be the SAME
+    /// Arc passed to the `ToolSearchTool` instance in `tools` —
+    /// that's how the meta-tool's results surface to the next
+    /// turn's request. `None` keeps the legacy "ship every tool
+    /// every turn" behavior.
+    pub tool_def_filter: Option<Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+
+    /// Phase-3: whether dynamic-tool-search is on. Mirrors the
+    /// `dynamic_tool_search` config knob. Carried alongside
+    /// `tool_def_filter` for introspection.
+    pub dynamic_tool_search: bool,
 }
 
 impl LoopSpawnConfig {
@@ -376,6 +390,8 @@ impl LoopSpawnConfig {
             tool_execution: ToolExecutionMode::Parallel,
             event_channel_capacity: 256,
             summarize_fn: None,
+            tool_def_filter: None,
+            dynamic_tool_search: false,
         }
     }
 }
@@ -423,6 +439,8 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        tool_def_filter: cfg.tool_def_filter.clone(),
+        dynamic_tool_search: cfg.dynamic_tool_search,
     };
 
     #[cfg(feature = "plugin")]

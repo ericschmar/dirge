@@ -606,6 +606,21 @@ pub struct AnyAgent {
     /// triple. `String::new()` is acceptable — telemetry falls back
     /// to `"unknown"` when the field is empty.
     model_name: String,
+    /// Phase-3: dynamic-tool-search opt-in. Resolved from
+    /// `config.dynamic_tool_search` at `build_agent` time.
+    /// When `true`, `spawn_runner` wires the shared
+    /// `tool_def_filter` Arc into both the stream factory (for
+    /// per-turn filtering) and (already) into the
+    /// `ToolSearchTool` instance in `loop_tools`. Default
+    /// `false` — the untouched-by-this-feature path.
+    dynamic_tool_search: bool,
+    /// Phase-3: per-session loaded-tool set. Allocated by
+    /// `build_agent` when `dynamic_tool_search` is on, and
+    /// shared with the `ToolSearchTool` instance registered in
+    /// `loop_tools`. `spawn_runner` forwards this Arc to the
+    /// stream factory so the filter sees the same set the tool
+    /// mutates. `None` when the feature is off.
+    tool_def_filter: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 }
 
 #[derive(Clone)]
@@ -636,7 +651,25 @@ impl AnyAgent {
             loop_tools,
             preamble,
             model_name,
+            dynamic_tool_search: false,
+            tool_def_filter: None,
         }
+    }
+
+    /// Phase-3: enable the dynamic-tool-search path for sessions
+    /// spawned from this agent. `filter` is the shared Arc
+    /// already wired into the `ToolSearchTool` registered in
+    /// `loop_tools` (so the tool's mutations and the request
+    /// filter see the SAME set). Caller (build_agent) reads
+    /// `config.dynamic_tool_search`; when off, this method
+    /// isn't called and the legacy path runs untouched.
+    pub fn with_dynamic_tool_search(
+        mut self,
+        filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.dynamic_tool_search = true;
+        self.tool_def_filter = Some(filter);
+        self
     }
 
     pub async fn run_print(
@@ -857,8 +890,17 @@ impl AnyAgent {
             .map(|t| loop_tool_to_rig_definition(t.as_ref()))
             .collect();
 
+        // Phase-3: per-session loaded-tool set was allocated at
+        // `build_agent` time (when `dynamic_tool_search` is on)
+        // and the SAME Arc was passed both to the
+        // `ToolSearchTool` registered in `self.loop_tools` and
+        // stored on `self.tool_def_filter`. The factory reads it
+        // per-request; the tool inserts into it on execute.
+        // `None` keeps the legacy path.
+        let tool_def_filter = self.tool_def_filter.clone();
+
         // Build the StreamFn (4.5h-2 + 4.5h-3 chunk timeout).
-        let inner_stream_fn = self.build_stream_fn(tool_defs);
+        let inner_stream_fn = self.build_stream_fn_with_filter(tool_defs, tool_def_filter.clone());
         // Wrap with retry (4.5g) so transient Network / RateLimit
         // errors auto-retry with exponential backoff + Retry-After.
         let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
@@ -890,6 +932,8 @@ impl AnyAgent {
             Some(self.model_name.clone())
         };
         cfg.steering_queue = steering_queue;
+        cfg.tool_def_filter = tool_def_filter;
+        cfg.dynamic_tool_search = self.dynamic_tool_search;
         #[cfg(feature = "plugin")]
         {
             cfg.plugin_mgr = crate::plugin::hook::global();
@@ -973,57 +1017,81 @@ impl AnyAgent {
         &self,
         tools: Vec<rig::completion::ToolDefinition>,
     ) -> crate::agent::agent_loop::StreamFn {
-        use crate::agent::agent_loop::rig_stream_fn_from_model_with_provider;
+        self.build_stream_fn_with_filter(tools, None)
+    }
+
+    /// Phase-3 dynamic-tool-search variant. When
+    /// `tool_def_filter` is `Some`, the per-request tool list is
+    /// filtered to the always-on set + names present in the
+    /// shared loaded set (plus `tool_search`). When `None`, the
+    /// behavior is byte-for-byte identical to the legacy
+    /// `build_stream_fn`.
+    pub fn build_stream_fn_with_filter(
+        &self,
+        tools: Vec<rig::completion::ToolDefinition>,
+        tool_def_filter: Option<
+            std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        >,
+    ) -> crate::agent::agent_loop::StreamFn {
+        use crate::agent::agent_loop::rig_stream_fn_from_model_with_filter;
         let chunk_timeout = self.chunk_timeout;
         let provider = Some(self.provider_name().to_string());
         match &self.inner {
-            AnyAgentInner::OpenRouter(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::OpenRouter(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::OpenAI(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::OpenAI(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Anthropic(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Anthropic(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Gemini(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Gemini(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::DeepSeek(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::DeepSeek(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Glm(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Glm(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Ollama(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Ollama(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Custom(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Custom(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
         }
     }
@@ -1106,7 +1174,13 @@ pub async fn build_agent(
             // the same cache as the rig path (tool result
             // dedup) — though after h-6 the rig path no longer
             // runs, so this is effectively single-owner.
-            let loop_tools = builder::build_loop_tools(
+            //
+            // Phase-3: build_loop_tools returns `(tools,
+            // tool_def_filter)`. When `cfg.dynamic_tool_search`
+            // is on, `tool_def_filter` is `Some` and a
+            // `ToolSearchTool` has been registered inside `tools`
+            // with the same Arc.
+            let (loop_tools, tool_def_filter) = builder::build_loop_tools(
                 cache.clone(),
                 permission_for_loop,
                 ask_tx_for_loop,
@@ -1129,16 +1203,30 @@ pub async fn build_agent(
             // Phase 4.5h-6: extract the rig Agent's preamble so
             // the new path can pass it as Context.system_prompt.
             // rig's Agent has `preamble: Option<String>` public.
-            let preamble = agent.preamble.clone().unwrap_or_default();
+            // Phase-3: when dynamic-tool-search is on, append a
+            // one-liner nudge so the model knows to call
+            // `tool_search` before reaching for unknown tools.
+            let mut preamble = agent.preamble.clone().unwrap_or_default();
+            if tool_def_filter.is_some() {
+                if !preamble.is_empty() {
+                    preamble.push_str("\n\n");
+                }
+                preamble.push_str(crate::agent::prompt::DYNAMIC_TOOL_SEARCH_PROMPT);
+            }
 
-            AnyAgent::new(
+            let agent = AnyAgent::new(
                 AnyAgentInner::$variant(agent),
                 cache,
                 chunk_timeout,
                 loop_tools,
                 preamble,
                 model_name.clone(),
-            )
+            );
+            if let Some(filter) = tool_def_filter {
+                agent.with_dynamic_tool_search(filter)
+            } else {
+                agent
+            }
         }};
     }
 

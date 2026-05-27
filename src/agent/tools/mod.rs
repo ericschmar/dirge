@@ -11,6 +11,7 @@ mod list_dir;
 mod lsp;
 mod memory;
 pub(crate) mod modified;
+pub(crate) mod output_relay;
 pub(crate) mod plan;
 pub(crate) mod question;
 mod read;
@@ -22,6 +23,7 @@ mod skill;
 pub mod task;
 mod task_status;
 pub(crate) mod todo;
+pub mod tool_search;
 mod webfetch;
 mod websearch;
 pub(crate) mod write;
@@ -46,6 +48,8 @@ pub use skill::SkillTool;
 pub use task::TaskTool;
 pub use task_status::TaskStatusTool;
 pub use todo::WriteTodoList;
+#[allow(unused_imports)]
+pub use tool_search::{ALWAYS_ON_TOOLS, TOOL_SEARCH_NAME, ToolMeta, ToolSearchTool};
 pub use webfetch::WebFetchTool;
 pub use websearch::WebSearchTool;
 pub use write::WriteTool;
@@ -83,6 +87,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "skill",
     "task",
     "task_status",
+    "tool_search",
     "question",
     "webfetch",
     "websearch",

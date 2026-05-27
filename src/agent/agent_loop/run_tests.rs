@@ -81,6 +81,8 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     }
 }
 

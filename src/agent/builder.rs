@@ -236,6 +236,20 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         builder = builder.temperature(clamped);
     }
 
+    // Phase 3 / part 2: install configured inline-output budgets
+    // for the disk-backed-output relay. `set_thresholds` writes
+    // process-wide statics read by `relay_if_large` on every
+    // bash/webfetch call. Done once at builder time — re-calling
+    // with the same values is a cheap atomic store.
+    crate::agent::tools::output_relay::set_thresholds(
+        cfg.tools
+            .as_ref()
+            .and_then(|t| t.bash_output_inline_max_bytes),
+        cfg.tools
+            .as_ref()
+            .and_then(|t| t.webfetch_output_inline_max_bytes),
+    );
+
     if cli.resolve_no_tools(cfg) {
         (builder.build(), ToolCache::new())
     } else {
@@ -545,12 +559,15 @@ pub async fn build_loop_tools(
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     cli: &Cli,
     cfg: &Config,
-) -> Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> {
+) -> (
+    Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
 
     if cli.resolve_no_tools(cfg) {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -905,7 +922,33 @@ pub async fn build_loop_tools(
         }
     }
 
-    tools
+    // Phase-3: dynamic-tool-search opt-in. When enabled, take a
+    // metadata snapshot of EVERY tool registered above (registry
+    // includes plugin + MCP + semantic + built-ins), allocate the
+    // shared loaded-set Arc, and register `ToolSearchTool`
+    // alongside the rest. The SAME Arc is returned so
+    // `build_agent` can attach it to `AnyAgent.tool_def_filter`
+    // (which `spawn_runner` then forwards to the stream
+    // factory's filter).
+    let tool_def_filter = if cfg.resolve_dynamic_tool_search() {
+        let registry: Vec<tools::ToolMeta> = tools
+            .iter()
+            .map(|t| tools::tool_search::meta_from_loop_tool(t.as_ref()))
+            .collect();
+        let filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let search_tool = tools::ToolSearchTool::new(Arc::new(registry), filter.clone());
+        // ToolSearchTool implements LoopTool directly (not via
+        // RigToolAdapter — it needs to mutate session state and
+        // doesn't fit the rig::ToolDyn shape). Push as Arc
+        // straight away.
+        tools.push(Arc::new(search_tool));
+        Some(filter)
+    } else {
+        None
+    };
+
+    (tools, tool_def_filter)
 }
 
 /// Append a mode-specific reminder to `preamble` based on the active prompt
@@ -1043,7 +1086,7 @@ mod reminder_tests {
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
 
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None, // permission
             None, // ask_tx
@@ -1081,7 +1124,7 @@ mod reminder_tests {
         let cfg = Config::default();
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None,
             None,
@@ -1115,7 +1158,7 @@ mod reminder_tests {
         let cfg = Config::default();
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None,
             None,
@@ -1158,7 +1201,7 @@ mod reminder_tests {
         let cfg = Config::default();
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None,
             None,

@@ -326,13 +326,11 @@ impl Tool for BashTool {
         // mis-ordering interleaved output.
         let mut result = output.merged;
         // Cap raw bash output before it enters LLM context. The
-        // UI's `render_tool_output` already truncates the display,
-        // but the full string was being persisted to
-        // `ToolCallState::Completed` → fed back to the LLM on the
-        // next turn. `cat /dev/urandom | head -c 10M` would have
-        // shoved millions of tokens at the model. Apply the cap
-        // here at the source. 256 KiB ≈ 65k tokens worst-case,
-        // already well above any sensible single-command output.
+        // streaming drain-loop above already enforces an in-memory
+        // ceiling at 256 KiB (TOOL-7) so the cap below is normally
+        // a no-op — kept as belt-and-braces in case the drain loop
+        // ever races. 256 KiB ≈ 65k tokens worst-case, already well
+        // above any sensible single-command output.
         const BASH_OUTPUT_CAP_BYTES: usize = 256 * 1024;
         if result.len() > BASH_OUTPUT_CAP_BYTES {
             // Slice at UTF-8 char boundary.
@@ -348,18 +346,26 @@ impl Tool for BashTool {
                 (cut + dropped) / 1024,
             ));
         }
-        if output.exit_code != 0 {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&format!("Exit code: {}", output.exit_code));
-        }
         // Bash may have mutated the filesystem; conservatively invalidate the
         // per-turn read/grep/list cache.
         if let Some(ref cache) = self.cache {
             cache.clear();
         }
-        Ok(result)
+
+        // Phase 3 / part 2: hand the (post-cap) buffer to the
+        // disk-backed-output relay. Below the inline budget the
+        // relay is a no-op and the exit-code line is appended
+        // inline; above the budget we write the full output to
+        // `~/.dirge/transient/<pid>/bash-<ts>.txt` and return a
+        // head/tail summary plus a `read`-tool hint. No envelope:
+        // bash output is local, not external content.
+        let exit_note = if output.exit_code != 0 {
+            format!("Exit code: {}", output.exit_code)
+        } else {
+            String::new()
+        };
+        let outcome = crate::agent::tools::output_relay::relay_if_large("bash", result, &exit_note);
+        Ok(outcome.text)
     }
 }
 

@@ -90,6 +90,13 @@ Available tools:
 pub const TODO_TOOLS_PROMPT: &str = "\
 - write_todo_list: Create or update a structured task list to track progress in the current coding session. Use this for complex multi-step tasks. Replaces any existing todo list.";
 
+/// Phase-3 — appended to the system prompt when
+/// `dynamic_tool_search` is on. Tells the model only a small
+/// always-on set of tools ships every turn and the rest must be
+/// discovered via `tool_search`.
+pub const DYNAMIC_TOOL_SEARCH_PROMPT: &str = "\
+Many tools are not loaded by default. Call `tool_search` with a query to discover and load relevant tools — they'll be available on the next turn. Always-on tools (write_todo_list, task_status) are shipped every turn and need no discovery.";
+
 pub const COMPACTION_PROMPT: &str = "\
 You are a conversation summarizer for a coding session. Produce a structured summary of the conversation below.
 

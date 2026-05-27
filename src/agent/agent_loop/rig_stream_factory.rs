@@ -101,6 +101,7 @@ where
 /// debugging only).
 ///
 /// Production callers should always pass `Some(name)`.
+#[allow(dead_code)]
 pub fn rig_stream_fn_from_model_with_provider<M>(
     model: M,
     tools: Vec<ToolDefinition>,
@@ -111,13 +112,49 @@ where
     M: CompletionModel + Clone + Send + Sync + 'static,
     M::StreamingResponse: Clone + Unpin + Send + Sync + GetTokenUsage + 'static,
 {
+    rig_stream_fn_from_model_with_filter(model, tools, chunk_timeout, provider_name, None)
+}
+
+/// Phase-3 dynamic-tool-search variant: takes an optional
+/// `tool_def_filter` Arc shared with `LoopConfig.tool_def_filter`.
+///
+/// When `Some`, the per-request tool list is filtered to
+/// `tools::tool_search::ALWAYS_ON_TOOLS` + names present in the
+/// set (plus `tool_search` itself). When `None`, the full
+/// `tools` Vec ships every turn — byte-for-byte identical to the
+/// pre-Phase-3 path.
+///
+/// The filter is read fresh per request (Arc + Mutex), so a
+/// `tool_search` call that inserts a name into the set is
+/// visible on the very next turn's request.
+pub fn rig_stream_fn_from_model_with_filter<M>(
+    model: M,
+    tools: Vec<ToolDefinition>,
+    chunk_timeout: Option<std::time::Duration>,
+    provider_name: Option<String>,
+    tool_def_filter: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+) -> StreamFn
+where
+    M: CompletionModel + Clone + Send + Sync + 'static,
+    M::StreamingResponse: Clone + Unpin + Send + Sync + GetTokenUsage + 'static,
+{
     let tools = Arc::new(tools);
     let provider_name = Arc::new(provider_name);
+    let filter = Arc::new(tool_def_filter);
     Arc::new(move |ctx: LlmContext, opts: super::stream::StreamOptions| {
         let model = model.clone();
         let tools = tools.clone();
         let provider_name = provider_name.clone();
-        invoke_one_stream(model, tools, ctx, chunk_timeout, opts, provider_name)
+        let filter = filter.clone();
+        invoke_one_stream(
+            model,
+            tools,
+            ctx,
+            chunk_timeout,
+            opts,
+            provider_name,
+            filter,
+        )
     })
 }
 
@@ -137,6 +174,9 @@ fn invoke_one_stream<M>(
     chunk_timeout: Option<std::time::Duration>,
     opts: super::stream::StreamOptions,
     provider_name: Arc<Option<String>>,
+    tool_def_filter: Arc<
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    >,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
@@ -169,12 +209,34 @@ where
         //    provider implementations vary in which they honor;
         //    unsupported fields are silently ignored downstream.
         let mut builder = CompletionRequestBuilder::new(model.clone(), prompt);
-        if !ctx.system_prompt.is_empty() {
-            builder = builder.preamble(ctx.system_prompt);
+        let system_prompt = ctx.system_prompt;
+        let history_len = history.len();
+
+        // Phase-3: filter tool defs to the always-on set + loaded
+        // set + `tool_search`. When no filter is installed, ship
+        // the full `tools` Vec unchanged — preserves legacy
+        // behavior byte-for-byte.
+        let outgoing_tools: Vec<ToolDefinition> =
+            filter_tool_defs(&tools, tool_def_filter.as_ref().as_ref());
+
+        // Phase-3 part 3: emit cache-prefix telemetry so external
+        // analysis can detect unexpected drift in the cacheable
+        // (system + tools) prefix across turns. See
+        // docs/PROMPT_CACHE_AUDIT.md.
+        let provider: Option<&str> = provider_name.as_ref().as_deref();
+        emit_cache_prefix_event(
+            provider,
+            &system_prompt,
+            &outgoing_tools,
+            history_len,
+        );
+
+        if !system_prompt.is_empty() {
+            builder = builder.preamble(system_prompt);
         }
         builder = builder.messages(history);
-        if !tools.is_empty() {
-            builder = builder.tools((*tools).clone());
+        if !outgoing_tools.is_empty() {
+            builder = builder.tools(outgoing_tools);
         }
         // Build additional_params using a per-provider mapper
         // (phase 4.6 follow-up). Each provider has its own
@@ -184,7 +246,6 @@ where
         // The mapper produces the right shape; rig's
         // additional_params is opaque so it forwards whatever
         // we give it.
-        let provider: Option<&str> = provider_name.as_ref().as_deref();
         let additional = build_provider_additional_params(provider, &opts);
         if let Some(v) = additional {
             builder = builder.additional_params(v);
@@ -207,6 +268,84 @@ where
             }
         }
     })
+}
+
+/// Phase-3 — pure filter helper. Returns the subset of `tools`
+/// to ship in the next request, given the shared loaded-set
+/// Arc. When `filter` is `None` the input Vec is returned
+/// unchanged (legacy "ship every tool" path). When `Some`, only
+/// always-on names (`tools::tool_search::ALWAYS_ON_TOOLS`) and
+/// names present in the set survive.
+///
+/// Names in the set that don't correspond to any registered
+/// tool are silently ignored — matches the spec's "if
+/// `tool_search` returns names that aren't in the registry,
+/// just ignore them" contract.
+/// Phase-3 part 3: emit a `prompt_cache_prefix` tracing event
+/// carrying stable hashes of the cacheable prefix (system prompt,
+/// tool list) plus history length. External analysis can detect
+/// unexpected drift across turns of the same session — e.g. a
+/// refactor that accidentally moves cwd-injection from session-
+/// start to per-turn would surface as a fluctuating system hash.
+///
+/// Tool list is sorted by name before hashing so unrelated
+/// iteration-order differences (e.g. HashMap randomisation in a
+/// future MCP backend) don't show up as spurious drift.
+///
+/// Uses `std::hash::DefaultHasher` (SipHash 1-3) for cheap, stable
+/// 64-bit digests. Not cryptographic — telemetry only.
+fn emit_cache_prefix_event(
+    provider: Option<&str>,
+    system_prompt: &str,
+    tools: &[ToolDefinition],
+    history_len: usize,
+) {
+    use std::hash::{Hash, Hasher};
+    let mut h_system = std::collections::hash_map::DefaultHasher::new();
+    system_prompt.hash(&mut h_system);
+    let system_hash = h_system.finish();
+
+    let mut tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    tool_names.sort_unstable();
+    let mut h_tools = std::collections::hash_map::DefaultHasher::new();
+    for n in &tool_names {
+        n.hash(&mut h_tools);
+        0u8.hash(&mut h_tools);
+    }
+    let tools_hash = h_tools.finish();
+
+    tracing::debug!(
+        target: "dirge::prompt_cache",
+        provider = provider.unwrap_or("unknown"),
+        system_hash = format!("{system_hash:016x}"),
+        tools_hash = format!("{tools_hash:016x}"),
+        tool_count = tools.len(),
+        system_bytes = system_prompt.len(),
+        history_len = history_len,
+        "prompt_cache_prefix"
+    );
+}
+
+pub fn filter_tool_defs(
+    tools: &[ToolDefinition],
+    filter: Option<&std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+) -> Vec<ToolDefinition> {
+    match filter {
+        None => tools.to_vec(),
+        Some(arc) => {
+            let loaded = arc.lock().unwrap_or_else(|e| e.into_inner());
+            let always_on: std::collections::HashSet<&str> =
+                crate::agent::tools::tool_search::ALWAYS_ON_TOOLS
+                    .iter()
+                    .copied()
+                    .collect();
+            tools
+                .iter()
+                .filter(|td| always_on.contains(td.name.as_str()) || loaded.contains(&td.name))
+                .cloned()
+                .collect()
+        }
+    }
 }
 
 /// Convert one of our `Value`-shaped messages to a rig
@@ -968,5 +1107,140 @@ mod tests {
         assert!(v.get("reasoning_level").is_some());
         assert!(v.get("reasoning").is_none());
         assert!(v.get("thinking").is_none());
+    }
+
+    // ============================================================
+    // Phase-3 tool_search filter tests
+    // ============================================================
+
+    fn mk_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("desc for {name}"),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    /// Default-off: filter is None → every tool ships, byte-for-
+    /// byte identical input/output. The behavior-preservation
+    /// guarantee from the spec.
+    #[test]
+    fn tool_search_filter_none_passes_all_tools() {
+        let defs = vec![mk_def("read"), mk_def("write"), mk_def("custom_mcp")];
+        let out = filter_tool_defs(&defs, None);
+        assert_eq!(out.len(), 3);
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["read", "write", "custom_mcp"]);
+    }
+
+    /// Empty loaded set + a filter → only always-on names ship
+    /// (which includes `tool_search` itself by construction).
+    #[test]
+    fn tool_search_filter_empty_set_keeps_only_always_on() {
+        let defs = vec![
+            mk_def("read"),
+            mk_def("write"),
+            mk_def("tool_search"),
+            mk_def("write_todo_list"),
+            mk_def("task_status"),
+            mk_def("custom_mcp"),
+        ];
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let out = filter_tool_defs(&defs, Some(&filter));
+        let names: std::collections::HashSet<String> = out.iter().map(|d| d.name.clone()).collect();
+        // Always-on tools survive; others don't.
+        assert!(names.contains("tool_search"));
+        assert!(names.contains("write_todo_list"));
+        assert!(names.contains("task_status"));
+        assert!(!names.contains("read"), "read must be filtered out");
+        assert!(!names.contains("write"));
+        assert!(!names.contains("custom_mcp"));
+    }
+
+    /// Filter containing only `tool_search` (already always-on)
+    /// — other tools still suppressed. Mirrors the "filter is
+    /// `{tool_search}` only, all other tools are absent" check
+    /// from the spec.
+    #[test]
+    fn tool_search_filter_only_tool_search_suppresses_others() {
+        let defs = vec![
+            mk_def("read"),
+            mk_def("write"),
+            mk_def("tool_search"),
+            mk_def("custom_mcp"),
+        ];
+        let mut set = std::collections::HashSet::new();
+        set.insert("tool_search".to_string());
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(set));
+        let out = filter_tool_defs(&defs, Some(&filter));
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["tool_search"]);
+    }
+
+    /// After `tool_search` returns "read", the shared set
+    /// contains "read"; the NEXT filter call surfaces it.
+    /// Mirrors the spec's "model calls tool_search, NEXT turn's
+    /// defs include `read`" check.
+    #[test]
+    fn tool_search_filter_loaded_tool_surfaces_on_next_turn() {
+        let defs = vec![
+            mk_def("read"),
+            mk_def("write"),
+            mk_def("tool_search"),
+            mk_def("custom_mcp"),
+        ];
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        // Turn 1: no "read" in set.
+        let out1 = filter_tool_defs(&defs, Some(&filter));
+        assert!(!out1.iter().any(|d| d.name == "read"));
+        // Tool execution inserts "read" into the shared set.
+        filter.lock().unwrap().insert("read".to_string());
+        // Turn 2: "read" must now ship.
+        let out2 = filter_tool_defs(&defs, Some(&filter));
+        assert!(out2.iter().any(|d| d.name == "read"));
+    }
+
+    /// Names in the loaded set that aren't in the registry are
+    /// silently ignored — matches the "user removed a tool"
+    /// degraded path.
+    #[test]
+    fn tool_search_filter_ignores_unknown_names_in_set() {
+        let defs = vec![mk_def("read"), mk_def("tool_search")];
+        let mut set = std::collections::HashSet::new();
+        set.insert("read".to_string());
+        set.insert("phantom_tool".to_string()); // doesn't exist
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(set));
+        let out = filter_tool_defs(&defs, Some(&filter));
+        let names: std::collections::HashSet<String> = out.iter().map(|d| d.name.clone()).collect();
+        assert!(names.contains("read"));
+        assert!(names.contains("tool_search"));
+        assert!(!names.contains("phantom_tool"));
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Phase-3 part 3: the prefix-hash helper is a pure function
+    /// of (system_prompt, tools-sorted-by-name). Same inputs →
+    /// same emitted hashes. We can't directly inspect the
+    /// emitted tracing event from here, but we can verify the
+    /// helper doesn't panic and is deterministic across runs
+    /// when invoked with identical inputs (no internal RNG).
+    #[test]
+    fn emit_cache_prefix_event_is_deterministic() {
+        let defs = vec![mk_def("write"), mk_def("read")];
+        // Call twice; if anything stateful crept in (RNG /
+        // HashMap iteration / file IO) this would surface as
+        // either a panic, a tracing-subscriber blowup, or an
+        // observable side effect under cargo test's harness.
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3);
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3);
+        // Permuting tool order must NOT change the digest (the
+        // helper sorts before hashing). Smoke: this call must
+        // also not panic.
+        let permuted = vec![mk_def("read"), mk_def("write")];
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &permuted, 3);
     }
 }

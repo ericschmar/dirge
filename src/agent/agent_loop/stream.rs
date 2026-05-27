@@ -411,6 +411,8 @@ mod tests {
             repair_stats: std::sync::Arc::new(
                 crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
             ),
+            tool_def_filter: None,
+            dynamic_tool_search: false,
         }
     }
 
@@ -710,6 +712,8 @@ mod tests {
             repair_stats: std::sync::Arc::new(
                 crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
             ),
+            tool_def_filter: None,
+            dynamic_tool_search: false,
         };
         let signal = AbortSignal::new();
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(32);

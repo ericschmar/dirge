@@ -207,6 +207,8 @@ async fn h7_scenario_1_simple_text() {
         provider_name: None,
         model_name: None,
         summarize_fn: None,
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -275,6 +277,8 @@ async fn h7_scenario_2_turn_boundaries() {
         provider_name: None,
         model_name: None,
         summarize_fn: None,
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -377,6 +381,8 @@ async fn h7_scenario_5_auth_error_surfaces() {
         provider_name: None,
         model_name: None,
         summarize_fn: None,
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, _) = drain_to_done(runner).await;
@@ -531,6 +537,8 @@ async fn h7_scenario_3_tool_dispatch() {
         provider_name: None,
         model_name: None,
         summarize_fn: None,
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -637,6 +645,8 @@ async fn h7_glm_scenario_1_simple_text() {
         provider_name: None,
         model_name: None,
         summarize_fn: None,
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -761,6 +771,8 @@ async fn h7_glm_scenario_3_tool_dispatch() {
         provider_name: None,
         model_name: None,
         summarize_fn: None,
+        tool_def_filter: None,
+        dynamic_tool_search: false,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;

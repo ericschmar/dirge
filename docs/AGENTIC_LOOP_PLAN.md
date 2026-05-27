@@ -145,7 +145,7 @@ auto-repair + relational defaults for free; the agent can't
 write syntactically-broken code without seeing the error in the
 same turn.
 
-### Phase 3 — Context management (~2-3 days)
+### Phase 3 — Context management (~2-3 days) ✅ shipped
 
 **Goal**: stop sending the entire toolset every turn; stop
 dumping multi-MB tool outputs into the context.

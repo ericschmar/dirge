@@ -50,6 +50,19 @@ pub struct ProviderSettings {
 pub struct ToolsConfig {
     pub websearch: Option<bool>,
     pub webfetch: Option<bool>,
+    /// Phase 3 / part 2: inline output budget for the `bash`
+    /// tool. Output at-or-below this size (AND ≤200 lines) is
+    /// returned verbatim; anything above is written to
+    /// `~/.dirge/transient/<pid>/bash-<unix_ts>.txt` and a head/
+    /// tail summary is returned to the model along with a hint
+    /// telling it to use the `read` tool to inspect specific
+    /// portions. Default 8 KiB. Set to a huge number to disable
+    /// the relay; set lower to keep more turns inline-summarized.
+    pub bash_output_inline_max_bytes: Option<usize>,
+    /// As above but for the `webfetch` tool. Default 8 KiB. The
+    /// 10 MiB streaming body cap inside `webfetch` itself is
+    /// independent and stays as the in-memory ceiling.
+    pub webfetch_output_inline_max_bytes: Option<usize>,
 }
 
 /// Per-server LSP configuration. All fields optional — unspecified fields
@@ -182,6 +195,14 @@ pub struct Config {
     /// to start.
     pub theme: Option<String>,
     pub tools: Option<ToolsConfig>,
+
+    /// Phase-3 (`docs/AGENTIC_LOOP_PLAN.md`): when true, ship only
+    /// `tool_search` + a small always-on set in the per-turn tool
+    /// defs, and let the model discover the rest via
+    /// `tool_search(query)`. Default `false` — preserves the
+    /// "ship every tool every turn" path. Useful on long sessions
+    /// with MCP-heavy toolsets (≈30% token savings).
+    pub dynamic_tool_search: Option<bool>,
     #[cfg(feature = "lsp")]
     pub lsp: Option<LspConfig>,
     #[cfg(feature = "mcp")]
@@ -224,6 +245,11 @@ impl Config {
 
     pub fn resolve_compact_enabled(&self) -> bool {
         self.compact_enabled.unwrap_or(true)
+    }
+
+    /// Phase-3: dynamic-tool-search opt-in. Default off.
+    pub fn resolve_dynamic_tool_search(&self) -> bool {
+        self.dynamic_tool_search.unwrap_or(false)
     }
 
     pub fn resolve_tool_result_max_chars(&self) -> usize {
