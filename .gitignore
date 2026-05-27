@@ -36,3 +36,10 @@ model-prompts/
 *.db
 .beads-credential-key
 .claude/
+
+# Memory-tool backup snapshots (timestamped rotations from the
+# memory subsystem). They're local-only and should never be
+# committed. Surfaced by PR #146 leaking `.dirge/memory/*.bak.*`
+# into the repo.
+.dirge/memory/*.bak*
+*.bak.[0-9]*

@@ -172,6 +172,11 @@ pub struct InputEditor {
     pub cursor: usize,
     history: Vec<CompactString>,
     history_pos: Option<usize>,
+    /// In-progress text stashed when the user starts navigating history.
+    /// Restored when they navigate past the newest entry (Down at the
+    /// most-recent history slot) so the draft isn't lost. `None` when
+    /// the live buffer IS the draft (not navigating history).
+    history_draft: Option<(CompactString, usize)>,
     pub picker: Option<FilePicker>,
     monochrome: bool,
     kill_ring: Vec<CompactString>,
@@ -327,6 +332,7 @@ impl InputEditor {
             cursor: 0,
             history: Vec::new(),
             history_pos: None,
+            history_draft: None,
             picker: None,
             monochrome: false,
             kill_ring: Vec::new(),
@@ -353,10 +359,13 @@ impl InputEditor {
         // text from before the set_text (which would be jarring —
         // the editor was just rewritten by /fork). History position
         // also resets so Up/Down navigation starts from the new
-        // baseline instead of mid-history.
+        // baseline instead of mid-history. Drop the history draft
+        // too — the user just got a /fork-restored prompt; that IS
+        // the new draft.
         self.kill_ring.clear();
         self.yank_state = None;
         self.history_pos = None;
+        self.history_draft = None;
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -794,6 +803,7 @@ impl InputEditor {
                     }
                 }
                 self.history_pos = None;
+                self.history_draft = None;
                 self.buffer.clear();
                 self.cursor = 0;
                 // Flatten markers in kill-ring entries to their raw bodies
@@ -1152,6 +1162,12 @@ impl InputEditor {
         if hist_len == 0 {
             return;
         }
+        // Stash whatever the user was typing when they first start
+        // navigating history. Restored by `history_down` when they
+        // pass back beyond the most-recent entry.
+        if self.history_pos.is_none() {
+            self.history_draft = Some((self.buffer.clone(), self.cursor));
+        }
         let pos = match self.history_pos {
             Some(p) if p > 0 => p - 1,
             Some(_) => 0,
@@ -1171,9 +1187,17 @@ impl InputEditor {
                 self.cursor = self.buffer.len();
             }
             Some(_) => {
+                // Past the most-recent history entry → return to
+                // whatever the user was typing before they started
+                // browsing history (empty if there was no draft).
                 self.history_pos = None;
-                self.buffer.clear();
-                self.cursor = 0;
+                if let Some((draft, cursor)) = self.history_draft.take() {
+                    self.buffer = draft;
+                    self.cursor = cursor.min(self.buffer.len());
+                } else {
+                    self.buffer.clear();
+                    self.cursor = 0;
+                }
             }
             None => {}
         }
@@ -1283,6 +1307,71 @@ mod tests {
         assert_eq!(byte_at_char_col(s, 5, s.len(), 2), s.len());
         // col 3 (past EOL) clamps to end
         assert_eq!(byte_at_char_col(s, 5, s.len(), 3), s.len());
+    }
+
+    /// History navigation must preserve the user's in-progress draft.
+    /// Up stashes it; Down past the newest entry restores it.
+    #[test]
+    fn history_up_stashes_in_progress_draft() {
+        let mut e = InputEditor::new();
+        e.history.push("first".into());
+        e.history.push("second".into());
+        e.insert_str("working on this");
+        let saved_cursor = e.cursor;
+
+        e.history_up();
+        assert_eq!(e.buffer.as_str(), "second");
+        // The in-progress text is stashed, not lost.
+        assert_eq!(
+            e.history_draft.as_ref().map(|(s, c)| (s.as_str(), *c)),
+            Some(("working on this", saved_cursor))
+        );
+
+        e.history_up();
+        assert_eq!(e.buffer.as_str(), "first");
+
+        e.history_down();
+        assert_eq!(e.buffer.as_str(), "second");
+
+        // Down past the most-recent entry restores the draft.
+        e.history_down();
+        assert_eq!(e.buffer.as_str(), "working on this");
+        assert_eq!(e.cursor, saved_cursor);
+        assert!(e.history_draft.is_none());
+    }
+
+    #[test]
+    fn history_up_with_empty_draft_still_returns_empty_on_restore() {
+        let mut e = InputEditor::new();
+        e.history.push("only".into());
+
+        e.history_up();
+        assert_eq!(e.buffer.as_str(), "only");
+
+        e.history_down();
+        assert_eq!(e.buffer.as_str(), "");
+        assert!(e.history_draft.is_none());
+    }
+
+    #[test]
+    fn history_down_with_no_navigation_is_noop() {
+        let mut e = InputEditor::new();
+        e.insert_str("draft");
+        let before = e.buffer.clone();
+        e.history_down();
+        assert_eq!(e.buffer, before);
+        assert!(e.history_draft.is_none());
+    }
+
+    #[test]
+    fn set_text_clears_history_draft() {
+        let mut e = InputEditor::new();
+        e.history.push("h".into());
+        e.insert_str("draft");
+        e.history_up();
+        assert!(e.history_draft.is_some());
+        e.set_text("fork-restored");
+        assert!(e.history_draft.is_none());
     }
 
     #[test]

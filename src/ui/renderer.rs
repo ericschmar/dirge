@@ -94,13 +94,34 @@ const PANEL_AUTO_MIN_COLS: u16 = 100;
 #[cfg(feature = "experimental-ui-terminal-tab")]
 fn format_terminal_title(state: crate::ui::avatar::AvatarState, tool_name: Option<&str>) -> String {
     use crate::ui::avatar::AvatarState;
+    // PR #144 follow-up: strip control bytes from caller-supplied
+    // tool names. Today the names come from the internal tool
+    // registry (`bash`, `edit`, …) so this is purely defensive,
+    // but a plugin or MCP server is one register-call away from
+    // smuggling `\x07` (BEL) or `\x1b` (ESC) into a name — which
+    // would prematurely close the OSC or inject further escape
+    // sequences when concatenated below. Newlines also break the
+    // title display.
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .filter(|c| {
+                !c.is_control() && *c != '\u{0007}' && *c != '\u{001b}' && *c != '\u{009c}'
+            })
+            .take(64)
+            .collect()
+    };
     match state {
         AvatarState::Idle | AvatarState::Done => "● dirge".to_string(),
         AvatarState::Thinking => "● dirge: thinking".to_string(),
         AvatarState::Speaking => "● dirge: responding".to_string(),
         AvatarState::Reading | AvatarState::Writing | AvatarState::Bash => {
             if let Some(name) = tool_name {
-                format!("◌ dirge: {}", name)
+                let clean = sanitize(name);
+                if clean.is_empty() {
+                    "◌ dirge: working".to_string()
+                } else {
+                    format!("◌ dirge: {}", clean)
+                }
             } else {
                 "◌ dirge: working".to_string()
             }
@@ -108,6 +129,32 @@ fn format_terminal_title(state: crate::ui::avatar::AvatarState, tool_name: Optio
         AvatarState::Alert => "✗ dirge: needs input".to_string(),
         AvatarState::Error => "✗ dirge: ERROR".to_string(),
     }
+}
+
+/// Build the OSC-0 byte sequence to set the terminal title. PR #144
+/// follow-up: switch to ST (`\x1b\\`) terminator, which is the
+/// RFC 1605 / xterm-canonical form and passes through tmux without
+/// needing `set-option -g allow-passthrough on`. BEL works on most
+/// terminals but tmux specifically prefers ST.
+#[cfg(feature = "experimental-ui-terminal-tab")]
+fn osc_set_title(title: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(title.len() + 5);
+    out.extend_from_slice(b"\x1b]0;");
+    out.extend_from_slice(title.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// Emit an empty OSC-0 to release the terminal title back to the
+/// shell's default. The TUI shutdown path in `terminal.rs` inlines
+/// the same bytes alongside other reset escapes for efficiency;
+/// this helper exists as a single source of truth for future
+/// callers (signal handlers, panic-recovery, etc.) and to anchor
+/// the unit test.
+#[cfg(feature = "experimental-ui-terminal-tab")]
+#[allow(dead_code)]
+fn osc_reset_title() -> Vec<u8> {
+    b"\x1b]0;\x1b\\".to_vec()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,8 +533,8 @@ impl Renderer {
         {
             if new_title != self.cached_terminal_title {
                 self.cached_terminal_title.clone_from(&new_title);
-                let osc = format!("\x1b]0;{}\x07", new_title);
-                let _ = terminal.backend_mut().write_all(osc.as_bytes());
+                let osc = osc_set_title(&new_title);
+                let _ = terminal.backend_mut().write_all(&osc);
             }
         }
 
@@ -2237,5 +2284,45 @@ mod tests {
             t.contains("✗"),
             "alert states should use red dot marker: {t:?}"
         );
+    }
+
+    /// PR #144 follow-up: tool names containing BEL/ESC/newline must
+    /// be scrubbed before being concatenated into the OSC payload —
+    /// otherwise a hostile plugin or MCP server could inject further
+    /// escape sequences via `set_last_tool_name`.
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn terminal_title_strips_control_bytes_from_tool_name() {
+        use crate::ui::avatar::AvatarState;
+        let t = super::format_terminal_title(AvatarState::Reading, Some("evil\x07\x1b[31m"));
+        assert!(!t.contains('\x07'));
+        assert!(!t.contains('\x1b'));
+        // The clean residue should still surface so the user sees
+        // *something* if the name was mostly text.
+        assert!(t.contains("evil"));
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn terminal_title_all_control_bytes_falls_back_to_working() {
+        use crate::ui::avatar::AvatarState;
+        let t = super::format_terminal_title(AvatarState::Bash, Some("\x07\x1b\n"));
+        assert_eq!(t, "◌ dirge: working");
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn osc_set_title_uses_st_terminator() {
+        let bytes = super::osc_set_title("hello");
+        // OSC introducer `\x1b]0;` + payload + ST terminator `\x1b\\`
+        assert_eq!(bytes, b"\x1b]0;hello\x1b\\");
+        assert!(!bytes.contains(&0x07), "BEL should not be used: {:?}", bytes);
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn osc_reset_title_releases_to_shell() {
+        let bytes = super::osc_reset_title();
+        assert_eq!(bytes, b"\x1b]0;\x1b\\");
     }
 }

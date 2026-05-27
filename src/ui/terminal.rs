@@ -259,11 +259,20 @@ impl Drop for TerminalGuard {
         // scrolling — the DECRST sequences below take it back down.
         //   ?2004  — bracketed paste
         //   ?1049  — alternate screen (LeaveAlternateScreen)
+        // PR #144 follow-up: reset the terminal tab/window title that
+        // the `experimental-ui-terminal-tab` feature set. Empty OSC-0
+        // releases the title back to the shell's default (most
+        // terminals re-derive on the next prompt). ST terminator
+        // (`\x1b\\`) matches the canonical xterm form and is tmux-
+        // friendly. Emitting unconditionally is fine — terminals
+        // that ignore OSC-0 also ignore the reset, and the cost is
+        // 5 bytes on shutdown.
         let _ = stdout.write_all(
             b"\x1b[0m\
               \x1b[?25h\
               \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\
               \x1b[?2004l\
+              \x1b]0;\x1b\\\
               \x1b[?1049l",
         );
         let _ = stdout.flush();
