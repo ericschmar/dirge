@@ -42,9 +42,7 @@ use std::sync::Arc;
 /// call). `None` disables the LLM pass — the loop falls back to
 /// pruning only.
 pub type SummarizeFn = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> + Send + Sync,
 >;
 
 /// Filter-safe preamble injected before the summary so the model
@@ -82,37 +80,12 @@ pub const PROTECT_TAIL_DEFAULT: usize = 5;
 
 // ── Public API ───────────────────────────────────────────
 
-/// Compression outcome with metadata.
-#[derive(Debug, Clone)]
-pub struct CompressionResult {
-    /// The generated summary text.
-    pub summary: String,
-    /// New session id after rotation.
-    pub new_session_id: String,
-    /// Previous session id (parent_session_id).
-    pub parent_session_id: String,
-    /// Approximate token count before compression.
-    pub tokens_before: u64,
-    /// Approximate token count after compression.
-    pub tokens_after: u64,
-    /// Number of tool results pruned.
-    pub pruned_count: usize,
-    /// Number of messages in the compressed middle section.
-    pub compressed_messages: usize,
-}
-
 /// Should compression be attempted?
 /// True when prompt_tokens exceeds 75% of context_window.
 /// Port of Hermes's threshold check.
 pub fn should_compress(prompt_tokens: u64, context_window: u64) -> bool {
     let threshold = (0.75 * context_window as f64) as u64;
     prompt_tokens > threshold
-}
-
-/// Approximate token count from total character length.
-/// 4 chars ≈ 1 token (rough, model-independent).
-pub fn approx_tokens(text: &str) -> u64 {
-    (text.len() as u64).div_ceil(CHARS_PER_TOKEN)
 }
 
 /// Estimate tokens for a slice of messages by summing content
@@ -440,7 +413,8 @@ pub fn apply_summary(
     let compress_start = compress_start.min(n);
     let compress_end = compress_end.min(n).max(compress_start);
 
-    let mut out: Vec<Value> = Vec::with_capacity(n.saturating_sub(compress_end - compress_start) + 1);
+    let mut out: Vec<Value> =
+        Vec::with_capacity(n.saturating_sub(compress_end - compress_start) + 1);
     // Protected head — copy verbatim.
     for msg in messages.iter().take(compress_start) {
         out.push(msg.clone());
@@ -747,7 +721,10 @@ mod tests {
         // Summary message at index 2.
         assert_eq!(out[2]["role"].as_str().unwrap(), "system");
         let s = out[2]["content"].as_str().unwrap();
-        assert!(s.starts_with(SUMMARY_PREFIX), "summary should start with prefix");
+        assert!(
+            s.starts_with(SUMMARY_PREFIX),
+            "summary should start with prefix"
+        );
         assert!(s.contains("## Active Task"));
         assert!(s.contains("fix the bug"));
         // Tail.
@@ -813,13 +790,19 @@ mod tests {
         let _ = tokens;
 
         // 2. compute window.
-        let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        let (start, end) =
+            compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
         assert!(start < end);
         let middle = &msgs[start..end];
         assert!(!middle.is_empty());
 
         // 3. build prompt.
-        let prompt = build_summary_prompt(middle, summary_budget(estimate_messages_tokens(middle)), None, None);
+        let prompt = build_summary_prompt(
+            middle,
+            summary_budget(estimate_messages_tokens(middle)),
+            None,
+            None,
+        );
         assert!(prompt.contains("TURNS TO SUMMARIZE"));
         assert!(prompt.contains("turn 0"));
 
