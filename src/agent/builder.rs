@@ -1316,6 +1316,142 @@ mod reminder_tests {
         );
     }
 
+    /// dirge-1ati — full end-to-end: `build_agent_inner` runs with
+    /// the same DI pattern as production and produces an `Agent<M>`
+    /// whose `preamble` field carries every guidance block the
+    /// unit-level tests assert on (SKILLS_GUIDANCE, MEMORY_GUIDANCE,
+    /// SESSION_SEARCH_GUIDANCE). Pre-fix only the assembly helper
+    /// was tested; this test exercises the full builder path so a
+    /// future change that accidentally drops a guidance block from
+    /// the wiring (rather than from the helper) is caught.
+    #[tokio::test]
+    async fn build_agent_inner_emits_assembled_preamble() {
+        use crate::context::ContextFiles;
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let cli = Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = Config::default();
+        let context = ContextFiles {
+            agents: None,
+            prompts: std::collections::HashMap::new(),
+            current_prompt: None,
+            current_prompt_name: None,
+            current_prompt_deny_tools: Vec::new(),
+        };
+        // Real openai client/model — never called (no network until
+        // first request). The builder only inspects type bounds and
+        // builds the rig Agent wrapper around it.
+        let client = openai::Client::new("test-key")
+            .expect("openai client builds")
+            .completions_api();
+        let model = client.completion_model("gpt-4o");
+        let sandbox = Sandbox::new(false);
+
+        let (agent, _cache, _provider) = build_agent_inner(
+            model,
+            &cli,
+            &cfg,
+            &context,
+            None, // permission
+            None, // ask_tx
+            None, // question_tx
+            None, // plan_tx
+            None, // bg_store
+            #[cfg(feature = "lsp")]
+            None,
+            sandbox,
+            None, // parent_model
+            #[cfg(feature = "mcp")]
+            None,
+            #[cfg(feature = "semantic")]
+            None,
+            None, // session_id
+        )
+        .await;
+
+        let preamble = agent.preamble.unwrap_or_default();
+
+        // SKILLS_GUIDANCE markers (dirge-xxun).
+        assert!(
+            preamble.contains("## Skill creation and maintenance"),
+            "preamble must include skills heading"
+        );
+        assert!(
+            preamble.contains("complex task"),
+            "preamble must include create trigger"
+        );
+        assert!(
+            preamble.contains("action='patch'"),
+            "preamble must include skill patch action"
+        );
+
+        // MEMORY_GUIDANCE markers (dirge-a6bv).
+        assert!(
+            preamble.contains("persistent memory"),
+            "preamble must include memory intro"
+        );
+        assert!(
+            preamble.contains("Do NOT save task progress"),
+            "preamble must include do-not-save rule"
+        );
+        assert!(
+            preamble.contains("declarative facts"),
+            "preamble must include declarative-fact framing"
+        );
+
+        // SESSION_SEARCH_GUIDANCE markers (dirge-a6bv).
+        assert!(
+            preamble.contains("session_search"),
+            "preamble must mention session_search"
+        );
+        assert!(
+            preamble.contains("before asking them to repeat"),
+            "preamble must include past-session-recall nudge"
+        );
+
+        // Memory tool action names match the real schema
+        // (dirge-yqmo) — caught here in the resolved preamble so a
+        // future change to the SYSTEM_PROMPT bullet is verified
+        // end-to-end, not just in the constant.
+        for action in ["view", "add", "replace", "remove"] {
+            assert!(
+                preamble.contains(action),
+                "preamble must mention real memory action '{}'",
+                action
+            );
+        }
+        for forbidden in ["delete", "create"] {
+            // Project skills preamble references action='create' /
+            // 'delete' for the skill tool — those are valid words in
+            // SKILLS_GUIDANCE / project-skills block. The memory
+            // bullet itself must not contain them. So grep the
+            // `- memory:` line specifically.
+            let mem_line = preamble
+                .lines()
+                .find(|l| l.trim_start().starts_with("- memory:"))
+                .expect("memory bullet present");
+            assert!(
+                !mem_line
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|w| w == forbidden),
+                "memory bullet must not name forbidden action '{}': {}",
+                forbidden,
+                mem_line
+            );
+        }
+
+        // Project-skills preamble action (dirge-rq65) — if the
+        // project happens to have no skills the block is absent,
+        // so only assert when present.
+        if preamble.contains("## Project Skills") {
+            assert!(
+                preamble.contains("action='load'"),
+                "project-skills preamble must direct to action='load'"
+            );
+        }
+    }
+
     /// dirge-a6bv — assembled preamble carries hermes's MEMORY_GUIDANCE
     /// and SESSION_SEARCH_GUIDANCE blocks: when to save vs not save,
     /// declarative-fact phrasing, and the past-session-recall nudge.

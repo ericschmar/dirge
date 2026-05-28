@@ -1152,6 +1152,15 @@ impl AnyAgent {
     ///
     /// Returns immediately with `AgentRunner`; the loop runs on
     /// a spawned tokio task.
+    /// dirge-1ati — test accessor for the assembled system prompt
+    /// that `build_agent_inner` produced. Returns the same string
+    /// `spawn_runner` later forwards to the agent loop as
+    /// `LoopSpawnConfig::system_prompt`, so an end-to-end test can
+    /// assert that the guidance blocks reach the model verbatim.
+    pub fn preamble(&self) -> &str {
+        &self.preamble
+    }
+
     /// Return the provider name as a static string (matches the
     /// CLI / config naming: "openai", "anthropic", ..., "glm",
     /// "ollama", "openrouter", "custom"). Used to populate
