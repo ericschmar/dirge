@@ -28,6 +28,39 @@ const MIN_REVIEW_INTERVAL_SECS: u64 = 900; // 15 minutes
 /// Last review timestamp (Unix seconds).
 static LAST_REVIEW: AtomicU64 = AtomicU64::new(0);
 
+/// Attempt to atomically claim the next review slot. Returns
+/// `Some(prev_value)` if we won the race and the spawned task should
+/// proceed — the caller MUST call [`release_review_slot`] with the
+/// returned value if the task fails before producing useful work, so
+/// the next session can retry instead of waiting 15 minutes.
+///
+/// Returns `None` if either (a) the previous review completed less
+/// than `MIN_REVIEW_INTERVAL_SECS` ago, or (b) a concurrent caller
+/// won the CAS — both cases are silent skips.
+///
+/// dirge-bo88: the original code did `load(); … ; store(now)` which
+/// (a) raced between concurrent Done events from different sessions
+/// and (b) advanced the timestamp before the spawned task ran, so an
+/// early failure suppressed retries for 15 minutes.
+fn claim_review_slot(now: u64) -> Option<u64> {
+    let last = LAST_REVIEW.load(Ordering::Acquire);
+    if now.saturating_sub(last) < MIN_REVIEW_INTERVAL_SECS {
+        return None;
+    }
+    match LAST_REVIEW.compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(last),
+        Err(_) => None, // lost the race; another caller claimed it
+    }
+}
+
+/// Roll the LAST_REVIEW timestamp back to the value captured at
+/// `claim_review_slot` time. Only does so if our timestamp is still
+/// the latest — otherwise a later successful review has already
+/// completed and we'd corrupt its timestamp. dirge-bo88.
+fn release_review_slot(prev: u64, ours: u64) {
+    let _ = LAST_REVIEW.compare_exchange(ours, prev, Ordering::AcqRel, Ordering::Acquire);
+}
+
 /// Review prompt focused on project memory, pitfalls, and skills.
 /// Port of Hermes's `_COMBINED_REVIEW_PROMPT` (background_review.py:150-158)
 /// and `_SKILL_REVIEW_PROMPT` (background_review.py:45-148), adapted
@@ -84,23 +117,22 @@ pub fn spawn_background_review(
     transcript: String,
     review_prompt_override: Option<&str>,
 ) {
-    // Rate-limit: skip if a review ran recently. Uses atomic
-    // compare-and-swap so concurrent Done events from different
-    // sessions don't race — only the first one wins.
+    // dirge-bo88: atomic CAS claim of the next review slot. Returns
+    // `None` if we lost the race or the rate-limit window is still
+    // open. The previous-value `prev` is captured so we can roll back
+    // on early failure (otherwise an immediately-failing review would
+    // silently suppress the next 15 minutes of attempts).
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let last = LAST_REVIEW.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < MIN_REVIEW_INTERVAL_SECS {
+    let Some(prev) = claim_review_slot(now) else {
         tracing::debug!(
             target: "dirge::review",
-            elapsed_secs = %(now - last),
-            "Skipping background review — last review was too recent"
+            "Skipping background review — rate-limited or another caller won the race"
         );
         return;
-    }
-    LAST_REVIEW.store(now, Ordering::Relaxed);
+    };
 
     let prompt = review_prompt_override
         .map(|s| s.to_string())
@@ -161,6 +193,18 @@ pub fn spawn_background_review(
             tracing::info!(
                 target: "dirge::review",
                 "Background review completed — project knowledge updated"
+            );
+        }
+
+        // dirge-bo88: if the review never managed to do any work
+        // (errored before any tool call), roll back the timestamp so
+        // the next session can retry instead of being silently locked
+        // out for 15 minutes.
+        if had_error && tool_actions.is_empty() {
+            release_review_slot(prev, now);
+            tracing::debug!(
+                target: "dirge::review",
+                "Released LAST_REVIEW slot — review produced no work"
             );
         }
     });
@@ -325,5 +369,122 @@ mod tests {
         // typing works.)
         let custom = "Custom review prompt";
         assert_ne!(custom, COMBINED_REVIEW_PROMPT);
+    }
+
+    // ── dirge-bo88: claim/release rate-limit slot ──────────────────
+    //
+    // These tests mutate the process-wide `LAST_REVIEW` AtomicU64,
+    // so they take a serial mutex to avoid clobbering each other in
+    // parallel test runs.
+
+    use std::sync::Mutex;
+    static LAST_REVIEW_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_last_review() {
+        LAST_REVIEW.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn claim_review_slot_succeeds_when_unset() {
+        let _g = LAST_REVIEW_LOCK.lock().unwrap();
+        reset_last_review();
+        let now = 10_000;
+        let claimed = claim_review_slot(now);
+        assert_eq!(claimed, Some(0), "first call should claim with prev=0");
+        assert_eq!(
+            LAST_REVIEW.load(Ordering::Acquire),
+            now,
+            "timestamp advanced"
+        );
+    }
+
+    #[test]
+    fn claim_review_slot_rejects_inside_rate_limit_window() {
+        let _g = LAST_REVIEW_LOCK.lock().unwrap();
+        reset_last_review();
+        let t1 = 100_000;
+        assert!(claim_review_slot(t1).is_some(), "first call claims");
+
+        // Inside the 15-minute window — must be rejected.
+        let t2 = t1 + (MIN_REVIEW_INTERVAL_SECS - 1);
+        assert!(
+            claim_review_slot(t2).is_none(),
+            "second call within window must be rate-limited"
+        );
+
+        // Outside the window — must succeed.
+        let t3 = t1 + MIN_REVIEW_INTERVAL_SECS + 1;
+        assert!(
+            claim_review_slot(t3).is_some(),
+            "call past the window must succeed"
+        );
+    }
+
+    #[test]
+    fn release_review_slot_rolls_back_when_we_are_still_latest() {
+        let _g = LAST_REVIEW_LOCK.lock().unwrap();
+        reset_last_review();
+        let now = 200_000;
+        let prev = claim_review_slot(now).expect("claim");
+        assert_eq!(prev, 0);
+        assert_eq!(LAST_REVIEW.load(Ordering::Acquire), now);
+
+        // Simulate the review failing immediately.
+        release_review_slot(prev, now);
+        assert_eq!(
+            LAST_REVIEW.load(Ordering::Acquire),
+            prev,
+            "release rolls timestamp back so retry can run"
+        );
+
+        // After rollback, an immediate retry should work.
+        let retry = claim_review_slot(now + 1);
+        assert!(retry.is_some(), "retry must claim after rollback");
+    }
+
+    #[test]
+    fn release_review_slot_does_not_clobber_a_later_review() {
+        let _g = LAST_REVIEW_LOCK.lock().unwrap();
+        reset_last_review();
+        let t1 = 300_000;
+        let prev = claim_review_slot(t1).expect("first claim");
+        // Simulate a much-later successful review having advanced the
+        // timestamp (e.g., the failing review's release call ran late
+        // and a fresh review already completed).
+        let t2 = t1 + 10 * MIN_REVIEW_INTERVAL_SECS;
+        LAST_REVIEW.store(t2, Ordering::Release);
+
+        release_review_slot(prev, t1);
+        assert_eq!(
+            LAST_REVIEW.load(Ordering::Acquire),
+            t2,
+            "stale release must NOT roll back a later review's timestamp"
+        );
+    }
+
+    #[test]
+    fn claim_review_slot_is_race_safe_under_concurrent_callers() {
+        // Spawn many threads racing to claim the slot from the unset
+        // state. Exactly one must win; the rest get `None`. Without
+        // the CAS (pre-fix `load() + store(now)`) this test would
+        // occasionally observe two winners.
+        let _g = LAST_REVIEW_LOCK.lock().unwrap();
+        reset_last_review();
+        let now = 500_000;
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..32 {
+                s.spawn(|| {
+                    if claim_review_slot(now).is_some() {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "exactly one concurrent caller must win the claim"
+        );
     }
 }
