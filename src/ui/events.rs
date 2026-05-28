@@ -10,6 +10,112 @@ use crate::ui::markdown;
 use crate::ui::renderer::Renderer;
 use crate::ui::theme;
 
+/// dirge-jhky — derive a one-line preview describing what a
+/// session was about, for the `/sessions` listing.
+///
+/// Order of preference:
+/// 1. The Active Task / Goal line from the most recent
+///    compaction summary, if any — that's the model's own one-
+///    sentence answer to "what is the user trying to do here".
+/// 2. The first user message (truncated to `max_chars`). User
+///    prompts are typically a clear statement of intent; the
+///    last assistant message often isn't.
+/// 3. The last message content (truncated). Fall-back when
+///    neither of the above applies — e.g., a fresh session with
+///    only one assistant turn.
+/// 4. Empty string for empty sessions.
+///
+/// The returned string is at most `max_chars` characters, with a
+/// trailing ellipsis when truncation happened. Single line only —
+/// newlines are replaced with spaces.
+pub fn session_preview(session: &crate::session::Session, max_chars: usize) -> String {
+    if session.messages.is_empty() && session.compactions.is_empty() {
+        return String::new();
+    }
+    let raw = compaction_active_task(session)
+        .or_else(|| first_user_message(session))
+        .or_else(|| last_message_content(session))
+        .unwrap_or_default();
+    truncate_oneline(&raw, max_chars)
+}
+
+/// Extract the "## Active Task" or "## Goal" section's first
+/// line from the most recent compaction summary. Returns `None`
+/// when there's no compaction or no recognised section.
+fn compaction_active_task(session: &crate::session::Session) -> Option<String> {
+    let summary = session.compactions.last()?.summary.as_str();
+    // Look for a section heading then take its first non-empty
+    // content line. Active Task wins over Goal because it
+    // identifies what the session is currently doing.
+    for heading in ["## Active Task", "## Goal"] {
+        if let Some(start) = summary.find(heading) {
+            let rest = &summary[start + heading.len()..];
+            // Skip blank lines after the heading, return the
+            // first content line.
+            for line in rest.lines() {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.starts_with('#') {
+                    // Hit the next section without finding content.
+                    break;
+                }
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn first_user_message(session: &crate::session::Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, MessageRole::User))
+        .map(|m| m.content.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn last_message_content(session: &crate::session::Session) -> Option<String> {
+    session
+        .messages
+        .last()
+        .map(|m| m.content.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn truncate_oneline(s: &str, max_chars: usize) -> String {
+    // Collapse newlines + tabs to spaces so the preview stays
+    // single-line. Trim runs of spaces so a wrapped prompt
+    // doesn't render with double spaces in the middle.
+    let mut collapsed = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        let mapped = if c == '\n' || c == '\r' || c == '\t' {
+            ' '
+        } else {
+            c
+        };
+        if mapped == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        collapsed.push(mapped);
+    }
+    let trimmed = collapsed.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let prefix: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{prefix}…")
+    }
+}
+
 pub fn format_time(rfc3339: &str) -> CompactString {
     let dt = chrono::DateTime::parse_from_rfc3339(rfc3339).ok();
     let dt = match dt {
@@ -330,4 +436,150 @@ fn strip_orphan_mouse_reports(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{MessageRole, Session};
+
+    fn make_session() -> Session {
+        Session::new("openrouter", "gpt-5", 200_000)
+    }
+
+    #[test]
+    fn session_preview_empty_session_is_empty() {
+        let s = make_session();
+        assert_eq!(session_preview(&s, 60), "");
+    }
+
+    #[test]
+    fn session_preview_uses_first_user_message_when_no_compaction() {
+        let mut s = make_session();
+        s.add_message(
+            MessageRole::User,
+            "Implement session_search exclusion for current session",
+        );
+        s.add_message(MessageRole::Assistant, "ok done");
+        let p = session_preview(&s, 60);
+        assert!(
+            p.starts_with("Implement session_search"),
+            "preview should lead with the user prompt: {p:?}"
+        );
+        assert!(!p.contains("ok done"));
+    }
+
+    #[test]
+    fn session_preview_truncates_long_prompts_with_ellipsis() {
+        let mut s = make_session();
+        let long = "x".repeat(200);
+        s.add_message(MessageRole::User, &long);
+        let p = session_preview(&s, 30);
+        assert_eq!(p.chars().count(), 30, "preview must respect max_chars");
+        assert!(p.ends_with('…'));
+    }
+
+    #[test]
+    fn session_preview_collapses_newlines_to_single_line() {
+        let mut s = make_session();
+        s.add_message(MessageRole::User, "first line\n\nsecond line\nthird\ttab");
+        let p = session_preview(&s, 80);
+        assert!(!p.contains('\n'), "preview must be single-line: {p:?}");
+        assert!(!p.contains('\t'));
+        // Multiple consecutive whitespace collapses to one.
+        assert!(!p.contains("  "), "double-space remained: {p:?}");
+        assert!(p.contains("first line second line third tab"));
+    }
+
+    #[test]
+    fn session_preview_skips_system_messages_for_first_user() {
+        let mut s = make_session();
+        s.add_message(MessageRole::System, "system bootstrap");
+        s.add_message(MessageRole::User, "user intent");
+        s.add_message(MessageRole::Assistant, "reply");
+        let p = session_preview(&s, 60);
+        assert!(p.contains("user intent"));
+        assert!(!p.contains("system bootstrap"));
+        assert!(!p.contains("reply"));
+    }
+
+    #[test]
+    fn session_preview_falls_back_to_last_when_no_user_message() {
+        // Session containing only assistant/system messages — no
+        // user prompt to anchor on. Fall back to the last
+        // message content.
+        let mut s = make_session();
+        s.add_message(MessageRole::Assistant, "spontaneous greeting");
+        s.add_message(MessageRole::Assistant, "follow-up reply");
+        let p = session_preview(&s, 60);
+        assert!(
+            p.contains("follow-up reply"),
+            "fallback should be last message: {p:?}"
+        );
+    }
+
+    #[test]
+    fn session_preview_prefers_compaction_active_task() {
+        let mut s = make_session();
+        s.add_message(MessageRole::User, "old prompt that got compacted");
+        s.compactions.push(crate::session::Compaction {
+            summary: compact_str::CompactString::new(
+                "## Active Task\nWire session_search current-session exclusion\n\n## Goal\nFix the bug",
+            ),
+            first_kept_index: 1,
+            summarized_count: 1,
+            token_savings: 100,
+            created_at: compact_str::CompactString::new("2026-05-28T00:00:00Z"),
+        });
+        let p = session_preview(&s, 80);
+        assert!(
+            p.contains("Wire session_search current-session exclusion"),
+            "preview must use compaction Active Task: {p:?}"
+        );
+        assert!(
+            !p.contains("old prompt"),
+            "compaction overrides first-user-message: {p:?}"
+        );
+    }
+
+    #[test]
+    fn session_preview_falls_back_to_goal_when_active_task_missing() {
+        let mut s = make_session();
+        s.add_message(MessageRole::User, "u");
+        s.compactions.push(crate::session::Compaction {
+            summary: compact_str::CompactString::new(
+                "## Goal\nrefactor the curator into umbrella skills\n\n## Completed\n- nothing",
+            ),
+            first_kept_index: 1,
+            summarized_count: 1,
+            token_savings: 50,
+            created_at: compact_str::CompactString::new("2026-05-28T00:00:00Z"),
+        });
+        let p = session_preview(&s, 80);
+        assert!(
+            p.contains("refactor the curator into umbrella skills"),
+            "Goal section should be used when Active Task absent: {p:?}"
+        );
+    }
+
+    #[test]
+    fn session_preview_ignores_empty_active_task_section() {
+        let mut s = make_session();
+        s.add_message(MessageRole::User, "the user's actual intent");
+        s.compactions.push(crate::session::Compaction {
+            // Active Task heading present but immediately followed
+            // by the next section — no content. Should fall through
+            // to the first user message.
+            summary: compact_str::CompactString::new("## Active Task\n\n## Goal\n\n## Notes\n"),
+            first_kept_index: 1,
+            summarized_count: 1,
+            token_savings: 0,
+            created_at: compact_str::CompactString::new("2026-05-28T00:00:00Z"),
+        });
+        let p = session_preview(&s, 80);
+        assert!(
+            p.contains("the user's actual intent"),
+            "should fall through past empty sections to user message: {p:?}"
+        );
+    }
 }

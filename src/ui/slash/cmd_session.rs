@@ -3,7 +3,7 @@
 
 use super::{SlashCtx, c_agent, c_error, c_result, undo_last};
 use crate::session::MessageRole;
-use crate::ui::events::{format_time, render_session};
+use crate::ui::events::{format_time, render_session, session_preview};
 use crate::ui::theme;
 use crate::ui::tree::{self, short_id};
 
@@ -16,11 +16,12 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
             ctx.renderer
                 .write_line(&format!("recent sessions ({}):", sessions.len()), c_agent())?;
             for s in &sessions {
-                let last = s
-                    .messages
-                    .last()
-                    .map(|m| format!("...{}", &m.content.chars().take(30).collect::<String>()))
-                    .unwrap_or_default();
+                // dirge-jhky: prefer the Active Task / first-user-
+                // message preview over the last-message tail. The
+                // tail is usually noise on short test sessions and
+                // assistant follow-ups; the preview answers "what
+                // was this session about".
+                let preview = session_preview(s, 60);
                 let time = format_time(&s.updated_at);
                 ctx.renderer.write_line(
                     &format!(
@@ -29,7 +30,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                         time,
                         s.messages.len(),
                         s.model,
-                        last
+                        preview
                     ),
                     c_result(),
                 )?;
@@ -65,11 +66,12 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 c_agent(),
             )?;
             for s in &sessions {
-                let last = s
-                    .messages
-                    .last()
-                    .map(|m| format!("...{}", &m.content.chars().take(30).collect::<String>()))
-                    .unwrap_or_default();
+                // dirge-jhky: prefer the Active Task / first-user-
+                // message preview over the last-message tail. The
+                // tail is usually noise on short test sessions and
+                // assistant follow-ups; the preview answers "what
+                // was this session about".
+                let preview = session_preview(s, 60);
                 let time = format_time(&s.updated_at);
                 ctx.renderer.write_line(
                     &format!(
@@ -78,7 +80,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                         time,
                         s.messages.len(),
                         s.model,
-                        last
+                        preview
                     ),
                     c_result(),
                 )?;
@@ -170,11 +172,12 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
             ctx.renderer
                 .write_line(&format!("multiple sessions match '{}':", prefix), c_agent())?;
             for s in &sessions {
-                let last = s
-                    .messages
-                    .last()
-                    .map(|m| format!("...{}", &m.content.chars().take(30).collect::<String>()))
-                    .unwrap_or_default();
+                // dirge-jhky: prefer the Active Task / first-user-
+                // message preview over the last-message tail. The
+                // tail is usually noise on short test sessions and
+                // assistant follow-ups; the preview answers "what
+                // was this session about".
+                let preview = session_preview(s, 60);
                 let time = format_time(&s.updated_at);
                 ctx.renderer.write_line(
                     &format!(
@@ -183,7 +186,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                         time,
                         s.messages.len(),
                         s.model,
-                        last
+                        preview
                     ),
                     c_result(),
                 )?;
