@@ -175,6 +175,7 @@ pub(super) async fn cmd_cd(ctx: &mut SlashCtx<'_>, text: &str) -> anyhow::Result
                 ctx.mcp_manager,
                 #[cfg(feature = "semantic")]
                 ctx.semantic_manager,
+                Some(ctx.session.id.to_string()),
             )
             .await;
             render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;

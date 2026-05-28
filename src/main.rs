@@ -766,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager.as_ref(),
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
+            Some(session.id.to_string()),
         )
         .await;
         let msg = cli.message.join(" ");
@@ -856,6 +857,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager.as_ref(),
                     #[cfg(feature = "semantic")]
                     semantic_manager.as_ref(),
+                    Some(session.id.to_string()),
                 )
                 .await
             };
@@ -893,6 +895,7 @@ async fn main() -> anyhow::Result<()> {
                             mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager.as_ref(),
+                            Some(session.id.to_string()),
                         )
                         .await;
                     }
@@ -917,6 +920,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager.as_ref(),
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
+            Some(session.id.to_string()),
         )
         .await;
 

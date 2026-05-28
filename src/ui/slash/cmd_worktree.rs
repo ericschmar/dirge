@@ -63,6 +63,7 @@ pub(super) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 ctx.mcp_manager,
                 #[cfg(feature = "semantic")]
                 ctx.semantic_manager,
+                Some(ctx.session.id.to_string()),
             )
             .await;
             render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;

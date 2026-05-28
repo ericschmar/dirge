@@ -1474,6 +1474,9 @@ pub async fn build_agent(
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    // Live session id forwarded to SessionSearchTool so the model's
+    // session_search calls exclude the current session. See dirge-502b.
+    session_id: Option<String>,
 ) -> AnyAgent {
     let parent_model = model.clone();
     // Resolve the per-provider chunk timeout once here so every
@@ -1521,6 +1524,7 @@ pub async fn build_agent(
                 mcp_manager,
                 #[cfg(feature = "semantic")]
                 semantic_manager,
+                session_id.clone(),
             )
             .await;
 
@@ -1552,6 +1556,7 @@ pub async fn build_agent(
                 semantic_manager,
                 cli,
                 cfg,
+                session_id.clone(),
             )
             .await;
 

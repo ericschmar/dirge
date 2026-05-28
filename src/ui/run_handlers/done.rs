@@ -568,6 +568,7 @@ pub(crate) async fn handle_done(
                     mcp_manager,
                     #[cfg(feature = "semantic")]
                     semantic_manager,
+                    Some(ctx.session.id.to_string()),
                 )
                 .await;
                 render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, context)?;

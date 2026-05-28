@@ -34,6 +34,7 @@ pub(super) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
             ctx.mcp_manager,
             #[cfg(feature = "semantic")]
             ctx.semantic_manager,
+            Some(ctx.session.id.to_string()),
         )
         .await;
         ctx.session.model = new_model.clone();
@@ -210,6 +211,7 @@ pub(super) async fn cmd_toggle(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
                 ctx.mcp_manager,
                 #[cfg(feature = "semantic")]
                 ctx.semantic_manager,
+                Some(ctx.session.id.to_string()),
             )
             .await;
             ctx.renderer.write_line(
@@ -294,6 +296,7 @@ pub(super) async fn cmd_prompt(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
                 ctx.mcp_manager,
                 #[cfg(feature = "semantic")]
                 ctx.semantic_manager,
+                Some(ctx.session.id.to_string()),
             )
             .await;
         }
@@ -326,6 +329,7 @@ pub(super) async fn cmd_prompt(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
                 ctx.mcp_manager,
                 #[cfg(feature = "semantic")]
                 ctx.semantic_manager,
+                Some(ctx.session.id.to_string()),
             )
             .await;
             ctx.renderer
@@ -376,6 +380,7 @@ pub(super) async fn cmd_regen_prompts(ctx: &mut SlashCtx<'_>) -> anyhow::Result<
                 ctx.mcp_manager,
                 #[cfg(feature = "semantic")]
                 ctx.semantic_manager,
+                Some(ctx.session.id.to_string()),
             )
             .await;
             ctx.renderer.write_line(

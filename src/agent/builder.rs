@@ -21,6 +21,20 @@ use crate::sandbox::Sandbox;
 use crate::semantic::SemanticManager;
 use crate::skill::{self, Skill};
 
+/// Factory for the `SessionSearchTool` instance plumbed into both the
+/// rig-side tool registry and the new agent_loop registry. Lives here
+/// (rather than inline at each construction site) so the threading of
+/// `session_id` is testable without downcasting through `dyn LoopTool`.
+/// See dirge-502b.
+pub(crate) fn build_session_search_tool(
+    db_path: std::path::PathBuf,
+    session_id: Option<String>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) -> tools::SessionSearchTool {
+    tools::SessionSearchTool::new(db_path, session_id, permission, ask_tx)
+}
+
 /// Wrap every tool with `HookedToolDyn` so plugins can intercept calls.
 /// On non-plugin builds this is a no-op identity, so callers can use it
 /// unconditionally. The global PluginManager is read at tool-call time;
@@ -60,6 +74,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     parent_model: Option<AnyModel>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    // Active session id. Passed through to `SessionSearchTool` so the
+    // model's `session_search` calls exclude the live session's own
+    // turns. `None` is only correct for one-shot non-session runs.
+    // See dirge-502b.
+    session_id: Option<String>,
 ) -> (Agent<M>, ToolCache) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let skills: Arc<[Skill]> = Arc::from(
@@ -332,9 +351,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 permission.clone(),
                 ask_tx.clone(),
             )),
-            Box::new(tools::SessionSearchTool::new(
+            Box::new(build_session_search_tool(
                 paths.session_db_path(),
-                None,
+                session_id.clone(),
                 permission.clone(),
                 ask_tx.clone(),
             )),
@@ -579,6 +598,9 @@ pub async fn build_loop_tools(
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     cli: &Cli,
     cfg: &Config,
+    // Active session id forwarded to SessionSearchTool — see
+    // dirge-502b. Mirrors the same param on `build_agent_inner`.
+    session_id: Option<String>,
 ) -> (
     Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
@@ -741,9 +763,9 @@ pub async fn build_loop_tools(
         .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
     tools.push(
         wrap(
-            tools::SessionSearchTool::new(
+            build_session_search_tool(
                 session_db_path,
-                None,
+                session_id.clone(),
                 permission.clone(),
                 ask_tx.clone(),
             ),
@@ -1130,6 +1152,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
 
@@ -1141,6 +1164,30 @@ mod reminder_tests {
                 "missing built-in {expected} in {names:?}"
             );
         }
+    }
+
+    /// dirge-502b — the shared factory used by both `build_agent_inner`
+    /// and `build_loop_tools` actually carries the session id through
+    /// to the constructed `SessionSearchTool`. Exercising the factory
+    /// directly (rather than fishing the tool out of a `dyn LoopTool`
+    /// registry) lets us assert on the concrete type.
+    #[test]
+    fn build_session_search_tool_threads_session_id() {
+        let db_path = std::path::PathBuf::from("/tmp/dirge-502b-test.db");
+        let tool =
+            build_session_search_tool(db_path.clone(), Some("sess-test-id".into()), None, None);
+        assert_eq!(
+            tool.current_session_id(),
+            Some("sess-test-id"),
+            "factory must thread session_id into SessionSearchTool"
+        );
+
+        // And `None` truly means None (no silent default).
+        let tool_none = build_session_search_tool(db_path, None, None, None);
+        assert!(
+            tool_none.current_session_id().is_none(),
+            "factory must not invent a session id when called with None"
+        );
     }
 
     /// `--no-tools` (or equivalent config) yields an empty
@@ -1168,6 +1215,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
         assert!(tools.is_empty(), "--no-tools should yield empty registry");
@@ -1202,6 +1250,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
 
@@ -1245,6 +1294,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
 

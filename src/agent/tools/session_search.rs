@@ -33,6 +33,13 @@ impl SessionSearchTool {
         }
     }
 
+    /// Test/diagnostic accessor — the live session id this tool excludes
+    /// from its results. `None` means no exclusion (a bug at the
+    /// builder layer; see dirge-502b).
+    pub fn current_session_id(&self) -> Option<&str> {
+        self.current_session_id.as_deref()
+    }
+
     fn open_search(&self) -> Result<SessionSearch, String> {
         let db = SessionDb::open(&self.db_path)?;
         let mut search = SessionSearch::new(db);
@@ -258,5 +265,79 @@ mod tests {
         assert!(def.description.contains("DISCOVERY"));
         assert!(def.description.contains("SCROLL"));
         assert!(def.description.contains("BROWSE"));
+    }
+
+    /// Discovery excludes the configured current session — proves the
+    /// `current_session_id` wiring from the tool wrapper down through
+    /// `SessionSearch::with_current_session` is intact. See dirge-502b.
+    #[test]
+    fn discover_excludes_current_session() {
+        let db_path = temp_db_path();
+        seed_session(&db_path, "sess-current");
+        seed_session(&db_path, "sess-other");
+
+        let rt = make_runtime();
+
+        // With no current_session_id, both sessions appear.
+        let no_excl = SessionSearchTool::new(db_path.clone(), None, None, None);
+        let both: serde_json::Value = serde_json::from_str(
+            &rt.block_on(no_excl.call(SearchArgs {
+                query: Some("database migrations".into()),
+                session_id: None,
+                around_message_id: None,
+                window: 5,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let session_ids: Vec<String> = both
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|h| {
+                h.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(
+            session_ids.iter().any(|s| s == "sess-current"),
+            "without exclusion, sess-current should appear; got {:?}",
+            session_ids
+        );
+
+        // With current_session_id=Some("sess-current"), it must be
+        // filtered out — the model should not see its own turns.
+        let excl = SessionSearchTool::new(db_path, Some("sess-current".into()), None, None);
+        let filtered: serde_json::Value = serde_json::from_str(
+            &rt.block_on(excl.call(SearchArgs {
+                query: Some("database migrations".into()),
+                session_id: None,
+                around_message_id: None,
+                window: 5,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let filtered_ids: Vec<String> = filtered
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|h| {
+                h.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(
+            !filtered_ids.iter().any(|s| s == "sess-current"),
+            "with exclusion, sess-current must NOT appear; got {:?}",
+            filtered_ids
+        );
+        assert!(
+            filtered_ids.iter().any(|s| s == "sess-other"),
+            "with exclusion, sess-other should still appear; got {:?}",
+            filtered_ids
+        );
     }
 }

@@ -294,6 +294,7 @@ pub async fn handle_compress(
         mcp_manager,
         #[cfg(feature = "semantic")]
         semantic_manager,
+        Some(session.id.to_string()),
     )
     .await;
     renderer.write_line("prompt cleared (back to default behavior)", c_agent())?;

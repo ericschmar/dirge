@@ -1452,6 +1452,7 @@ pub async fn run_interactive(
                                                 sandbox.clone(),
                                                 #[cfg(feature = "mcp")] mcp_manager,
                                                 #[cfg(feature = "semantic")] semantic_manager,
+                                                Some(session.id.to_string()),
                                             ).await;
                                             render_session(&mut renderer, session, cli, cfg, context)?;
                                             renderer.write_line(
@@ -3686,6 +3687,7 @@ pub async fn run_interactive(
                         mcp_manager,
                         #[cfg(feature = "semantic")]
                         semantic_manager,
+                        Some(session.id.to_string()),
                     )
                     .await;
 

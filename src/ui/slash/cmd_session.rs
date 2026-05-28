@@ -108,27 +108,36 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                         ctx.permission,
                         &ctx.context.current_prompt_deny_tools,
                     );
-                    let model = ctx.client.completion_model(ctx.session.model.to_string());
-                    *ctx.agent = crate::provider::build_agent(
-                        model,
-                        ctx.cli,
-                        ctx.cfg,
-                        ctx.context,
-                        ctx.permission.clone(),
-                        ctx.ask_tx.clone(),
-                        ctx.question_tx.clone(),
-                        ctx.plan_tx.clone(),
-                        ctx.bg_store.clone(),
-                        #[cfg(feature = "lsp")]
-                        ctx.lsp_manager.cloned(),
-                        ctx.sandbox.clone(),
-                        #[cfg(feature = "mcp")]
-                        ctx.mcp_manager,
-                        #[cfg(feature = "semantic")]
-                        ctx.semantic_manager,
-                    )
-                    .await;
                 }
+                // dirge-502b: rebuild the agent unconditionally after a
+                // session swap, so `SessionSearchTool` picks up the new
+                // session id and stops including the live session's
+                // own turns. Pre-fix the rebuild was gated on a prompt
+                // restore, which left the agent holding the previous
+                // session's id (or the very session the model is
+                // now in) — exact regression of the bug this branch
+                // fixes for the initial-build path.
+                let model = ctx.client.completion_model(ctx.session.model.to_string());
+                *ctx.agent = crate::provider::build_agent(
+                    model,
+                    ctx.cli,
+                    ctx.cfg,
+                    ctx.context,
+                    ctx.permission.clone(),
+                    ctx.ask_tx.clone(),
+                    ctx.question_tx.clone(),
+                    ctx.plan_tx.clone(),
+                    ctx.bg_store.clone(),
+                    #[cfg(feature = "lsp")]
+                    ctx.lsp_manager.cloned(),
+                    ctx.sandbox.clone(),
+                    #[cfg(feature = "mcp")]
+                    ctx.mcp_manager,
+                    #[cfg(feature = "semantic")]
+                    ctx.semantic_manager,
+                    Some(ctx.session.id.to_string()),
+                )
+                .await;
                 render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
                 let prompt_note = restored
                     .map(|n| format!("; prompt: {}", n))
