@@ -668,7 +668,7 @@ pub async fn run_interactive(
             };
             let mut any_session_replaced = false;
             for op in ops {
-                let effect = plugin_tree::apply_tree_op(op, session, &mut input);
+                let effect = plugin_tree::apply_tree_op(op, session, &mut input, Some(&agent));
                 match effect {
                     plugin_tree::TreeOpEffect::Applied(msg) => {
                         renderer.write_line(&msg, theme::dim())?;

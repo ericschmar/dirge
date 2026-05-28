@@ -31,7 +31,19 @@ pub enum TreeOpEffect {
 /// Apply one op. Returns the UI-visible effect. Restored editor text
 /// (for fork :before / navigate-tree on user messages) is pushed
 /// straight into `input`.
-pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor) -> TreeOpEffect {
+/// dirge-dp24: optional `agent` parameter wired so plugin-driven
+/// session resets (`TreeOp::NewSession`) and switches
+/// (`TreeOp::SwitchSession`) fire the same lifecycle hooks the
+/// `/clear` / `/session` slash commands do. Tests pass `None` to
+/// skip the hook fires (they're testing the tree-op semantics, not
+/// the lifecycle wiring). Production call site at
+/// `ui/mod.rs::run_interactive` passes `Some(&agent)`.
+pub fn apply_tree_op(
+    op: TreeOp,
+    session: &mut Session,
+    input: &mut InputEditor,
+    agent: Option<&crate::provider::AnyAgent>,
+) -> TreeOpEffect {
     match op {
         TreeOp::SetLabel { id, label } => {
             let cid = CompactString::new(id.clone());
@@ -97,8 +109,24 @@ pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor)
             // it before the destructive reset takes effect.
             let prev_id = session.id.to_string();
             let parent_id = parent.as_deref().unwrap_or(&prev_id);
+            // dirge-dp24: fire on_session_end BEFORE save (the
+            // hook receives a transcript built from the still-live
+            // session) and on_session_switch AFTER reset_to_new
+            // gives us the new id. reset=true because this is a
+            // genuinely fresh conversation from the provider's POV.
+            if let Some(a) = agent {
+                crate::agent::review::maybe_fire_session_end(a, session);
+            }
             let save_err = crate::session::storage::save_session(session).err();
             session.reset_to_new(Some(parent_id));
+            if let Some(a) = agent {
+                crate::agent::review::maybe_fire_session_switch(
+                    a,
+                    &session.id,
+                    &prev_id,
+                    /* reset = */ true,
+                );
+            }
             input.set_text("");
             let mut msg = format!(
                 "[plugin] new session started (parent: {})",
@@ -120,10 +148,28 @@ pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor)
                         id_prefix
                     )),
                     1 => {
+                        // dirge-dp24: fire on_session_end on the
+                        // outgoing session BEFORE we overwrite it,
+                        // then on_session_switch with the loaded id.
+                        // reset=false because switch-session restores
+                        // an existing logical conversation rather
+                        // than starting fresh.
+                        if let Some(a) = agent {
+                            crate::agent::review::maybe_fire_session_end(a, session);
+                        }
+                        let prev_id = session.id.to_string();
                         let save_err = crate::session::storage::save_session(session).err();
                         let loaded = matches.into_iter().next().expect("len == 1");
                         let new_id = loaded.id.clone();
                         *session = loaded;
+                        if let Some(a) = agent {
+                            crate::agent::review::maybe_fire_session_switch(
+                                a,
+                                &session.id,
+                                &prev_id,
+                                /* reset = */ false,
+                            );
+                        }
                         input.set_text("");
                         let mut msg =
                             format!("[plugin] switched to session {}", short(new_id.as_str()),);
@@ -189,6 +235,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         assert!(matches!(effect, TreeOpEffect::Applied(_)));
         let node_label = s
@@ -214,6 +261,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         assert_eq!(s.tree.entries[&id].label, None);
     }
@@ -237,6 +285,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         assert!(matches!(effect, TreeOpEffect::Applied(_)));
         assert_eq!(input.buffer.as_str(), "what's 2+2?");
@@ -260,6 +309,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         // Editor untouched.
         assert_eq!(input.buffer.as_str(), "user-was-typing");
@@ -277,6 +327,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         assert!(matches!(effect, TreeOpEffect::Failed(_)));
     }
@@ -290,7 +341,12 @@ mod tests {
         s.add_message(MessageRole::Assistant, "won't survive");
         let user_id = s.messages[0].id.to_string();
         let mut input = fresh_input();
-        apply_tree_op(TreeOp::NavigateTree { id: user_id }, &mut s, &mut input);
+        apply_tree_op(
+            TreeOp::NavigateTree { id: user_id },
+            &mut s,
+            &mut input,
+            None,
+        );
         assert_eq!(input.buffer.as_str(), "redo me");
         assert!(s.messages.is_empty());
     }
@@ -312,6 +368,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         assert_eq!(input.buffer.as_str(), "hands-off");
         assert_eq!(s.tree.leaf_id.as_deref(), Some(asst_id.as_str()));
@@ -331,6 +388,7 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         assert!(matches!(effect, TreeOpEffect::Failed(_)));
     }
@@ -343,7 +401,12 @@ mod tests {
         s.add_message(MessageRole::User, "stale");
         let old_id = s.id.clone();
         let mut input = fresh_input();
-        let effect = apply_tree_op(TreeOp::NewSession { parent: None }, &mut s, &mut input);
+        let effect = apply_tree_op(
+            TreeOp::NewSession { parent: None },
+            &mut s,
+            &mut input,
+            None,
+        );
         assert!(matches!(effect, TreeOpEffect::SessionReplaced(_)));
         assert!(s.messages.is_empty());
         assert_ne!(s.id, old_id);
@@ -364,11 +427,133 @@ mod tests {
             },
             &mut s,
             &mut input,
+            None,
         );
         // No matching session on disk -> Failed.
         assert!(matches!(effect, TreeOpEffect::Failed(_)));
         // Session untouched.
         assert_eq!(s.id, id_before);
         assert_eq!(s.messages.len(), msg_count_before);
+    }
+
+    // ── dirge-dp24: plugin-driven session boundaries fire hooks ──
+
+    use crate::agent::tools::ToolCache;
+    use crate::extras::memory_provider::MemoryProvider;
+    use crate::provider::{AnyAgent, AnyAgentInner};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingProvider {
+        ends: Mutex<Vec<String>>,
+        switches: Mutex<Vec<(String, String, bool)>>,
+    }
+    impl MemoryProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn view(&self, _: &str) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        fn on_session_end(&self, t: &str) {
+            self.ends.lock().unwrap().push(t.to_string());
+        }
+        fn on_session_switch(&self, new_id: &str, parent_id: &str, reset: bool) {
+            self.switches
+                .lock()
+                .unwrap()
+                .push((new_id.into(), parent_id.into(), reset));
+        }
+    }
+
+    fn agent_with_provider() -> (AnyAgent, Arc<RecordingProvider>) {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+        let client = openai::Client::new("test-key")
+            .expect("openai client")
+            .completions_api();
+        let model = client.completion_model("gpt-4o");
+        let inner = rig::agent::AgentBuilder::new(model).build();
+        let provider = Arc::new(RecordingProvider::default());
+        let provider_dyn: Arc<dyn MemoryProvider> = provider.clone();
+        let agent = AnyAgent::new(
+            AnyAgentInner::OpenAI(inner),
+            ToolCache::new(),
+            std::time::Duration::from_secs(300),
+            Vec::new(),
+            String::new(),
+            "gpt-4o".to_string(),
+        )
+        .with_memory_provider(provider_dyn);
+        (agent, provider)
+    }
+
+    /// dirge-dp24 — `TreeOp::NewSession` fires on_session_end on the
+    /// outgoing session AND on_session_switch on the rotated id.
+    /// `reset=true` because new-session is a fresh chat.
+    #[test]
+    fn new_session_fires_end_and_switch_with_reset_true() {
+        let (agent, provider) = agent_with_provider();
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "outgoing");
+        let old_id = s.id.to_string();
+        let mut input = fresh_input();
+
+        let effect = apply_tree_op(
+            TreeOp::NewSession { parent: None },
+            &mut s,
+            &mut input,
+            Some(&agent),
+        );
+        assert!(matches!(effect, TreeOpEffect::SessionReplaced(_)));
+
+        let ends = provider.ends.lock().unwrap();
+        assert_eq!(ends.len(), 1, "exactly one on_session_end fire");
+        assert!(ends[0].contains("User: outgoing"));
+
+        let switches = provider.switches.lock().unwrap();
+        assert_eq!(switches.len(), 1, "exactly one on_session_switch fire");
+        let (new_id, parent_id, reset) = &switches[0];
+        assert_ne!(new_id, &old_id, "switch must report the new id");
+        assert_eq!(parent_id, &old_id, "switch must carry the old id as parent");
+        assert!(*reset, "new-session implies reset=true");
+    }
+
+    /// dirge-dp24 — `TreeOp::SwitchSession` against a non-matching
+    /// prefix returns Failed and fires NO hooks.
+    #[test]
+    fn switch_session_no_match_fires_no_hooks() {
+        let (agent, provider) = agent_with_provider();
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "stays");
+        let mut input = fresh_input();
+
+        let effect = apply_tree_op(
+            TreeOp::SwitchSession {
+                id_prefix: "zzzz-no-match".into(),
+            },
+            &mut s,
+            &mut input,
+            Some(&agent),
+        );
+        assert!(matches!(effect, TreeOpEffect::Failed(_)));
+
+        assert!(
+            provider.ends.lock().unwrap().is_empty(),
+            "failed switch must NOT fire on_session_end"
+        );
+        assert!(
+            provider.switches.lock().unwrap().is_empty(),
+            "failed switch must NOT fire on_session_switch"
+        );
     }
 }
