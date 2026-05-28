@@ -1719,3 +1719,184 @@ async fn dirge_k6be_oversized_tool_result_capped_before_next_model_call() {
         "capped result must carry the truncation marker",
     );
 }
+
+// ============================================================
+// dirge-el3n — proactive turn-start fold wiring
+// ============================================================
+
+/// dirge-el3n end-to-end: when the message log is loaded with
+/// content over 90% of the context window AT TURN START, the
+/// proactive fold fires before the next model call. Without
+/// the fix the warning was logged but nothing was shrunk.
+/// Asserts the second LLM call sees a SMALLER context than
+/// the loaded one — proving the fold actually ran.
+#[tokio::test]
+async fn dirge_el3n_proactive_fold_fires_when_threshold_crossed_at_turn_start() {
+    use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Pre-load a context that's well over 90% of the
+    // 128_000-token default ctx window. 130_000 chars / 4 ≈
+    // 32_500 tokens. To cross 0.9 ratio (= 115_200 tokens) we
+    // need ~460_000 chars of content.
+    let huge_text = "x".repeat(500_000);
+    let preloaded = vec![serde_json::json!({
+        "role": "toolResult",
+        "content": [{"type": "text", "text": huge_text}],
+        "toolName": "read",
+    })];
+
+    // Capture the message count the second model call sees.
+    // After the fold, oversized tool results in the middle
+    // section should have been pruned to 1-liners — total
+    // string content should drop materially.
+    let observed_second_call_total_chars: std::sync::Arc<Mutex<Option<usize>>> =
+        std::sync::Arc::new(Mutex::new(None));
+    let observed_clone = observed_second_call_total_chars.clone();
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+
+    let factory: StreamFn = std::sync::Arc::new(move |ctx: LlmContext, _opts| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // Total content text on the FIRST call (the call
+            // that's supposed to be preceded by the fold).
+            let total: usize = ctx
+                .messages
+                .iter()
+                .map(|m| match m.get("content") {
+                    Some(serde_json::Value::String(s)) => s.len(),
+                    Some(serde_json::Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .map(|t| t.len())
+                        .sum(),
+                    _ => 0,
+                })
+                .sum();
+            *observed_clone.lock().unwrap() = Some(total);
+        }
+        let msg = text_response("ok");
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![
+            crate::agent::agent_loop::message::StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            },
+        ]))
+    });
+
+    let mut ctx = empty_context();
+    ctx.messages = preloaded;
+    let mut cfg = build_config();
+    cfg.tool_execution = ToolExecutionMode::Sequential;
+    // The proactive fold uses ctx_max from the model's known
+    // window. With no model_name set, it defaults to 128_000.
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let _ = run_agent_loop(
+        vec![user("start")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    let observed = observed_second_call_total_chars.lock().unwrap();
+    let total_after_fold = observed.expect("first model call must have happened");
+    // The fold should have shrunk the 500 KB tool-result text
+    // dramatically — pruning replaces oversized tool results
+    // with 1-line summaries. Pre-fix this value would have
+    // been ~500_000 (no fold fired). Post-fix it must be way
+    // smaller because prune_tool_outputs ran.
+    assert!(
+        total_after_fold < 100_000,
+        "proactive fold should have shrunk the preloaded transcript; saw {total_after_fold} chars",
+    );
+}
+
+/// dirge-el3n: the proactive fold does NOT fire when the
+/// ratio is comfortably under threshold. Guards against
+/// over-aggressive folding that would shrink useful context.
+#[tokio::test]
+async fn dirge_el3n_proactive_fold_does_not_fire_under_threshold() {
+    use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Modest tool result — well under 90% of 128k token window.
+    let modest = "y".repeat(4_000);
+    let preloaded = vec![serde_json::json!({
+        "role": "toolResult",
+        "content": [{"type": "text", "text": modest}],
+        "toolName": "read",
+    })];
+
+    let observed_first_call_chars: std::sync::Arc<Mutex<Option<usize>>> =
+        std::sync::Arc::new(Mutex::new(None));
+    let observed_clone = observed_first_call_chars.clone();
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+
+    let factory: StreamFn = std::sync::Arc::new(move |ctx: LlmContext, _opts| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            let total: usize = ctx
+                .messages
+                .iter()
+                .map(|m| match m.get("content") {
+                    Some(serde_json::Value::String(s)) => s.len(),
+                    Some(serde_json::Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .map(|t| t.len())
+                        .sum(),
+                    _ => 0,
+                })
+                .sum();
+            *observed_clone.lock().unwrap() = Some(total);
+        }
+        let msg = text_response("ok");
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![
+            crate::agent::agent_loop::message::StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            },
+        ]))
+    });
+
+    let mut ctx = empty_context();
+    ctx.messages = preloaded;
+    let mut cfg = build_config();
+    cfg.tool_execution = ToolExecutionMode::Sequential;
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let _ = run_agent_loop(
+        vec![user("start")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    // Under-threshold: tool-result content must be present in
+    // full (modulo the dirge-k6be cap which only fires above
+    // 3000 tokens = ~12 KB; 4 KB is well under that). The
+    // fold must NOT have shrunk the transcript.
+    let observed = observed_first_call_chars.lock().unwrap();
+    let total = observed.expect("first model call must have happened");
+    assert!(
+        total >= 4_000,
+        "under-threshold ratio must not trigger fold; saw {total} chars (input was 4000)",
+    );
+}

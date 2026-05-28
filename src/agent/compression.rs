@@ -100,17 +100,27 @@ pub fn should_compress(prompt_tokens: u64, context_window: u64) -> bool {
 
 /// Estimate tokens for a slice of messages by summing content
 /// lengths and dividing by CHARS_PER_TOKEN.
+///
+/// dirge-el3n: handles both content shapes:
+/// - `content: "string"` (heal-on-load / OpenAI shape)
+/// - `content: [{type: "text", text: "..."}, ...]` (Anthropic /
+///   dirge's production tool-result shape). Non-text blocks
+///   contribute zero — they reach the model as opaque references
+///   (image SHA256, tool_use stubs), not raw text.
 pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
     let total_chars: usize = messages
         .iter()
-        .map(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| s.len())
-                .unwrap_or(0)
-        })
+        .map(|m| content_chars(m.get("content")))
         .sum();
     (total_chars as u64).div_ceil(CHARS_PER_TOKEN)
+}
+
+fn content_chars(content: Option<&Value>) -> usize {
+    match content {
+        Some(Value::String(s)) => s.len(),
+        Some(Value::Array(blocks)) => blocks.iter().filter_map(text_of_block).map(str::len).sum(),
+        _ => 0,
+    }
 }
 
 /// dirge-k6be: per-tool-result token cap. Truncates any
@@ -995,6 +1005,56 @@ mod tests {
     fn estimate_tokens_handles_missing_content() {
         let msgs = vec![serde_json::json!({"role": "system"})];
         assert_eq!(estimate_messages_tokens(&msgs), 0);
+    }
+
+    /// dirge-el3n: the estimator must count block-shaped content
+    /// (production tool-result shape), not just scalar strings.
+    /// Without this, a turn that's 95% tool-result-blocks looks
+    /// like 0 tokens and the proactive fold never fires.
+    #[test]
+    fn estimate_tokens_counts_text_inside_block_arrays() {
+        let big = "x".repeat(40);
+        let msgs = vec![serde_json::json!({
+            "role": "toolResult",
+            "content": [{"type": "text", "text": big.clone()}],
+            "toolName": "read",
+        })];
+        // 40 chars / 4 = 10 tokens.
+        assert_eq!(estimate_messages_tokens(&msgs), 10);
+    }
+
+    /// Multi-block content sums across all text blocks; non-text
+    /// blocks (image, tool_use) contribute zero.
+    #[test]
+    fn estimate_tokens_sums_multi_block_skipping_non_text() {
+        let msgs = vec![serde_json::json!({
+            "role": "toolResult",
+            "content": [
+                {"type": "text", "text": "a".repeat(20)},
+                {"type": "image", "source": "ignored"},
+                {"type": "text", "text": "b".repeat(20)},
+            ],
+            "toolName": "bash",
+        })];
+        // 40 chars / 4 = 10 tokens.
+        assert_eq!(estimate_messages_tokens(&msgs), 10);
+    }
+
+    /// Mix of string-content + block-content messages — both
+    /// shapes contribute. (Realistic transcript: user/assistant
+    /// strings + tool-result blocks.)
+    #[test]
+    fn estimate_tokens_mixed_string_and_block_messages() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "hello"}), // 5 chars
+            serde_json::json!({
+                "role": "toolResult",
+                "content": [{"type": "text", "text": "x".repeat(11)}],
+                "toolName": "read",
+            }), // 11 chars
+        ];
+        // (5 + 11) / 4 = 4 tokens.
+        assert_eq!(estimate_messages_tokens(&msgs), 4);
     }
 
     // ── validate_summary ────────────────────────────────

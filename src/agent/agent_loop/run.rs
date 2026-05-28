@@ -439,41 +439,51 @@ pub async fn run_loop(
                 first_turn = false;
             }
 
-            // Reasonix loop.ts:656-684 — turn-start fold estimate.
-            // Covers cases the post-response fold can't see:
-            // terminal prior turn, session restore, huge paste.
-            // Estimate is approximate (no tokenizer); defaults to
-            // no-fold when data is unavailable.
-            {
+            // dirge-el3n: turn-start (proactive) fold. Reasonix
+            // parity at `loop.ts:656-684`. Covers cases the
+            // post-response fold can't see — terminal prior turn,
+            // session restore, huge paste, long multi-iter turn
+            // that crossed the threshold inside one assistant
+            // response. Fires when the rough token estimate
+            // exceeds `TURN_START_FOLD_THRESHOLD` AND we haven't
+            // already folded this turn (the post-response site
+            // owns the same flag and is idempotent w.r.t. it).
+            //
+            // Before-fix: this block only LOGGED — no actual
+            // compaction. Long turns ran past the 75/80/90%
+            // thresholds without the fold ever firing.
+            //
+            // Uses the widened `estimate_messages_tokens` so
+            // production block-shaped tool results actually
+            // count (otherwise array content was 0 and the
+            // estimate stayed at 0% forever).
+            if !folded_this_turn {
                 let ctx_max = config
                     .model_name
                     .as_deref()
                     .and_then(crate::config::context_window_for_model)
                     .unwrap_or(128_000);
-                // Rough estimate from message count × avg content length.
-                let rough_estimate: u64 = current_context
-                    .messages
-                    .iter()
-                    .map(|m| {
-                        let content = m
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .len() as u64;
-                        // ~4 chars per token heuristic
-                        content / 4
-                    })
-                    .sum();
+                let rough_estimate =
+                    crate::agent::compression::estimate_messages_tokens(&current_context.messages);
                 let estimate = context_manager::estimate_turn_start(rough_estimate, ctx_max);
                 if estimate.ratio > context_manager::TURN_START_FOLD_THRESHOLD {
-                    tracing::warn!(
+                    tracing::info!(
                         target: "dirge::agent_loop",
                         estimate_tokens = %estimate.estimate_tokens,
                         ctx_max = %estimate.ctx_max,
                         ratio = %estimate.ratio,
-                        "context-manager: turn-start fold recommended ({}% of context)",
+                        "context-manager: turn-start fold firing ({}% of context)",
                         (estimate.ratio * 100.0) as u32,
                     );
+                    run_compaction_pass(
+                        &mut current_context,
+                        &summarize_fn,
+                        5, // protect last 5 messages
+                        &memory_provider,
+                        emit,
+                    )
+                    .await;
+                    folded_this_turn = true;
                 }
             }
 
