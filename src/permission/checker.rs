@@ -374,6 +374,25 @@ impl PermissionChecker {
         names.iter().any(|n| self.is_prompt_denied(n))
     }
 
+    /// dirge-mzs4: like [`Self::check`] for the `bash` tool, but
+    /// upgrades a final `Ask` outcome to `Allowed` when the caller
+    /// has established that the segment's ONLY filesystem-touching
+    /// effect is a `/dev/null` redirect. Writing to `/dev/null`
+    /// discards data with no observable side effect, so there's no
+    /// reason to prompt for that subset of commands.
+    ///
+    /// Deny rules still fire (the default `rm -rf /**` deny will
+    /// reject `rm -rf / > /dev/null`), as does the doom-loop tracker;
+    /// the only behavioural difference is the post-step that converts
+    /// `Ask → Allowed`. Mode coercions, prompt-level deny lists, and
+    /// the session allowlist all run through unchanged.
+    pub fn check_bash_dev_null_softallow(&mut self, input: &str) -> CheckResult {
+        match self.check("bash", input) {
+            CheckResult::Ask => CheckResult::Allowed,
+            other => other,
+        }
+    }
+
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
         // Prompt-level deny list runs BEFORE every other gate,
         // including Yolo mode's blanket allow. This is the

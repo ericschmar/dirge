@@ -369,6 +369,51 @@ impl Tool for BashTool {
     }
 }
 
+/// dirge-mzs4: bash-segment check with `Ask → Allow` soft-allow
+/// for segments whose only filesystem-touching effect is a redirect
+/// to `/dev/null`. Deny rules and the doom-loop detector still fire
+/// — the only divergence from the normal `enforce(..., "bash", ...)`
+/// path is that an `Ask` outcome is converted to `Allowed` instead
+/// of prompting the user.
+///
+/// Routes through `PermissionChecker::check_bash_dev_null_softallow`
+/// rather than the generic `enforce` chokepoint because the
+/// Ask-upgrade is intentionally scoped to ONE call site (the bash
+/// segment loop after the dev-null parser flagged the segment) and
+/// MUST NOT leak into other tools.
+#[cfg(feature = "semantic-bash")]
+async fn check_bash_segment_dev_null(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    segment: &str,
+) -> Result<(), ToolError> {
+    use crate::permission::checker::CheckResult;
+
+    let Some(perm) = permission else {
+        return Ok(());
+    };
+
+    let result = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.check_bash_dev_null_softallow(segment)
+    };
+
+    match result {
+        CheckResult::Allowed => Ok(()),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        // Unreachable: `check_bash_dev_null_softallow` converts Ask
+        // to Allowed before returning. Fall back to the standard
+        // enforce chokepoint defensively — if a future refactor
+        // breaks the conversion, behaviour degrades to "prompt the
+        // user", which is the conservative default.
+        CheckResult::Ask => enforce(permission, ask_tx, "bash", Scope::Raw(segment))
+            .await
+            .map(|_| ()),
+    }
+}
+
 async fn check_bash_segments(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
@@ -384,8 +429,17 @@ async fn check_bash_segments(
     // path-string inputs and fell through to default Allow.
     #[cfg(feature = "semantic-bash")]
     {
-        let (segments, complex) = bash::parse_bash_segments_full(command)
-            .unwrap_or_else(|_| (vec![command.to_string()], false));
+        // dirge-mzs4: use the dev-null-aware parser. Each segment is
+        // paired with a boolean flag indicating whether its enclosing
+        // `redirected_statement` had at least one file_redirect AND
+        // all those redirects targeted `/dev/null`. Segments with the
+        // flag set get an `Ask → Allow` soft-allow on the bash rule
+        // check — writing to /dev/null has no observable side effect
+        // so prompting on `<cmd> > /dev/null` is pure noise. Deny
+        // rules (default `rm -rf /**` etc.) still fire, and the
+        // doom-loop tracker still runs.
+        let (segments_with_flag, complex) = bash::parse_bash_segments_with_dev_null(command)
+            .unwrap_or_else(|_| (vec![(command.to_string(), false)], false));
 
         if complex {
             // Subshell / command substitution / process substitution /
@@ -407,8 +461,12 @@ async fn check_bash_segments(
             return Ok(());
         }
 
-        for segment in &segments {
-            enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
+        for (segment, dev_null_only) in &segments_with_flag {
+            if *dev_null_only {
+                check_bash_segment_dev_null(permission, ask_tx, segment).await?;
+            } else {
+                enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
+            }
         }
 
         // M3 fix to the C4 redirect-target gap: route targets through
@@ -996,6 +1054,144 @@ mod tests {
         assert!(
             result.is_ok(),
             "redirect to an explicitly-allowed target should pass; got {result:?}",
+        );
+    }
+
+    // dirge-mzs4: /dev/null redirect whitelist. Commands whose only
+    // filesystem-touching effect is a `/dev/null` redirect are
+    // auto-allowed — writing to /dev/null discards data with no
+    // observable side effect, so prompting on that pattern is pure
+    // noise. Deny rules and the doom-loop detector still fire; the
+    // only behavioural change is `Ask → Allow` for the bash segment
+    // check.
+
+    /// Each of the 5 whitelisted patterns must pass without prompting,
+    /// even when the underlying command (`unfamiliar_cmd`) doesn't
+    /// match any default bash allow rule and would otherwise route
+    /// to `Ask` (and fail in `--no-ask-tx` test mode).
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_redirects_to_dev_null_auto_allowed() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let cases = [
+            "unfamiliar_cmd > /dev/null",
+            "unfamiliar_cmd 2> /dev/null",
+            "unfamiliar_cmd &> /dev/null",
+            "unfamiliar_cmd > /dev/null 2>&1",
+            "unfamiliar_cmd &>/dev/null",
+        ];
+
+        for cmd in &cases {
+            let config = PermissionConfig::default();
+            let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+            let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+            let result = check_bash_segments(&Some(perm), &None, cmd).await;
+            assert!(
+                result.is_ok(),
+                "{cmd:?}: /dev/null redirect should auto-allow without prompting; got {result:?}",
+            );
+        }
+    }
+
+    /// Compound redirects (one to /dev/null, one to a real file) must
+    /// NOT slip through the whitelist — the real-file destination
+    /// still routes through the write rules, and the bash segment
+    /// check still applies. Pre-fix, naively whitelisting any
+    /// /dev/null mention would let `cmd > file.txt > /dev/null`
+    /// silently write to file.txt.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_redirect_to_file_and_dev_null_still_prompts() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        // No ask_tx is wired, so any `Ask` outcome surfaces as an
+        // error from `enforce`. If the whitelist mistakenly applied,
+        // this would succeed silently.
+        let result = check_bash_segments(
+            &Some(perm),
+            &None,
+            "unfamiliar_cmd > /tmp/dirge-mzs4-real.log 2> /dev/null",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "compound redirect (real file + /dev/null) must NOT auto-allow; got {result:?}",
+        );
+    }
+
+    /// Baseline: a command with NO /dev/null redirect and no default
+    /// allow rule must still prompt. Pins that the whitelist does
+    /// not bleed into the unredirected case.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_other_destination_still_prompts() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        // `unfamiliar_cmd` doesn't match any default bash allow
+        // rule. No ask_tx is wired so the `Ask` outcome surfaces
+        // as an error. The whitelist is dormant — falls through to
+        // the standard enforce path.
+        let result =
+            check_bash_segments(&Some(perm), &None, "unfamiliar_cmd > /tmp/elsewhere.log").await;
+        assert!(
+            result.is_err(),
+            "non-/dev/null redirect must still prompt; got {result:?}",
+        );
+    }
+
+    /// Deny rules still fire even for /dev/null-redirected commands.
+    /// `rm -rf / > /dev/null` must be denied by the default
+    /// `rm -rf /**` rule — the dev/null whitelist must NOT bypass
+    /// the deny gate.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_dev_null_does_not_bypass_deny_rules() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result = check_bash_segments(&Some(perm), &None, "rm -rf / > /dev/null").await;
+        assert!(
+            result.is_err(),
+            "dev/null redirect must not bypass `rm -rf /**` deny; got {result:?}",
+        );
+    }
+
+    /// In a compound (`&&`-separated) statement, the dev/null
+    /// soft-allow applies ONLY to the segment with the /dev/null
+    /// redirect — other segments still go through the normal
+    /// gate. `unfamiliar_cmd > /dev/null && other_unfamiliar_cmd`
+    /// auto-allows the first but prompts on the second.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_dev_null_per_segment_scope() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result = check_bash_segments(
+            &Some(perm),
+            &None,
+            "unfamiliar_cmd > /dev/null && other_unfamiliar_cmd",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "second segment without /dev/null redirect must still prompt; got {result:?}",
         );
     }
 }
