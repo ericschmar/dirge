@@ -898,7 +898,16 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
                 match exit {
-                    HeadlessLoopExit::MaxIterations => return Ok(()),
+                    HeadlessLoopExit::MaxIterations => {
+                        // dirge-jmc9: fire on_session_end before
+                        // returning from --loop mode. session.messages
+                        // is typically empty here (run_print doesn't
+                        // populate it) but the hook still serves as a
+                        // "flush buffered state" signal for plugin
+                        // providers.
+                        crate::agent::review::maybe_fire_session_end(&current_agent, &session);
+                        return Ok(());
+                    }
                     #[cfg(feature = "plugin")]
                     HeadlessLoopExit::ModelSwap(new_model) => {
                         let m = client.completion_model(new_model);

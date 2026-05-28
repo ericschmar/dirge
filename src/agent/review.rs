@@ -336,20 +336,22 @@ pub fn spawn_curator_review(
 }
 
 /// dirge-5cm9 / dirge-5gn6 / dirge-bx4g — fire the provider's
-/// `on_session_end` hook iff (a) a memory provider is attached
-/// and (b) the session has messages to report. The hook receives
-/// the full transcript built from `session.messages`.
+/// `on_session_end` hook when a memory provider is attached. The
+/// hook receives the full transcript built from `session.messages`
+/// (empty string for sessions that never accumulated any messages,
+/// e.g. headless `--loop` runs whose state lives in `LoopState`,
+/// not in `session.messages`).
 ///
-/// Skip on empty sessions so /clear-then-/clear and other
-/// no-message sequences don't fire a useless empty-transcript
-/// hook every time.
+/// dirge-2t18: previously skipped on empty sessions to avoid
+/// "useless empty-transcript hooks". The skip was wrong — providers
+/// that use `on_session_end` as a "session closing, flush buffered
+/// state" signal (independent of transcript content) lost the event
+/// on every empty boundary, including every `--loop` exit. The
+/// provider can cheaply check `transcript.is_empty()` itself.
 pub fn maybe_fire_session_end(
     agent: &crate::provider::AnyAgent,
     session: &crate::session::Session,
 ) {
-    if session.messages.is_empty() {
-        return;
-    }
     let Some(provider) = agent.memory_provider() else {
         return;
     };
@@ -513,16 +515,29 @@ mod tests {
         assert!(ends[0].contains("Assistant: hi back"));
     }
 
+    /// dirge-2t18 — empty sessions still fire the hook (with an
+    /// empty transcript). Providers use on_session_end as a
+    /// "flush buffered state" signal independent of transcript
+    /// content; suppressing the fire on empty sessions lost the
+    /// signal on every --loop exit (whose state lives in
+    /// LoopState, not session.messages).
     #[test]
-    fn maybe_fire_session_end_skips_empty_sessions() {
+    fn maybe_fire_session_end_fires_even_on_empty_sessions() {
         let (agent, provider) = agent_with_recording_provider();
         let session = make_session(); // no messages
 
         maybe_fire_session_end(&agent, &session);
 
+        let ends = provider.ends.lock().unwrap();
+        assert_eq!(
+            ends.len(),
+            1,
+            "empty session must still fire the hook (dirge-2t18)"
+        );
         assert!(
-            provider.ends.lock().unwrap().is_empty(),
-            "empty session must not fire the hook"
+            ends[0].is_empty(),
+            "transcript for an empty session must be empty: {:?}",
+            ends[0]
         );
     }
 

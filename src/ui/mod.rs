@@ -1469,6 +1469,17 @@ pub async fn run_interactive(
                                     }
                                     Err(e) => {
                                         if e.downcast_ref::<std::io::Error>().is_some_and(|e: &std::io::Error| e.kind() == std::io::ErrorKind::Interrupted) {
+                                            // dirge-ygxx: /quit (cmd_quit returns
+                                            // Interrupted) and any other slash
+                                            // command that bubbles Interrupted
+                                            // also reaches this break. Fire the
+                                            // session-end hook so plugin providers
+                                            // see the boundary — the dirge-bx4g
+                                            // hook at the Ctrl+C/D handler only
+                                            // covers idle-keypress exits.
+                                            crate::agent::review::maybe_fire_session_end(
+                                                &agent, session,
+                                            );
                                             break;
                                         }
                                         renderer.write_line(&format!("error: {}", e), c_error())?;
