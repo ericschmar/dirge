@@ -238,6 +238,7 @@ pub(crate) async fn handle_done(
                     mcp_manager,
                     #[cfg(feature = "semantic")]
                     semantic_manager,
+                    Some(ctx.session.id.to_string()),
                 )
                 .await;
                 let old_model = ctx.session.model.clone();
