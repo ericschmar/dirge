@@ -317,6 +317,12 @@ pub async fn run_interactive(
     // don't remove (so the user can scroll back later).
     let mut subagent_chat_map: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // dirge-781c: reverse mapping (chat-idx → subagent-id) so the
+    // Ctrl+K handler can resolve the focused tab back to a subagent
+    // id and forward it to `kill_subagent`. Built in lockstep with
+    // `subagent_chat_map` at Spawn time.
+    let mut chat_idx_to_subagent: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
 
     // dirge-gek: per-subagent state for the left-gutter panel.
     // Ordered by insertion so the most-recently-spawned tasks sit
@@ -1056,6 +1062,52 @@ pub async fn run_interactive(
                                 is_running,
                             )?;
                             continue;
+                        }
+
+                        // dirge-781c: Ctrl+K kills the subagent on the
+                        // focused tab (if any). Only fires when the
+                        // input buffer is empty so it doesn't shadow
+                        // ordinary character input.
+                        let ctrl_k = key.code == KeyCode::Char('k')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_k && input.expanded().is_empty() {
+                            let active = renderer.active_chat();
+                            if let Some(sub_id) = chat_idx_to_subagent.get(&active).cloned() {
+                                use crate::agent::tools::task::{KillOutcome, kill_subagent};
+                                match kill_subagent(&sub_id) {
+                                    KillOutcome::Killed(id) => {
+                                        let _ = renderer.write_line_to_chat(
+                                            active,
+                                            &format!(
+                                                "(/kill triggered — aborting {})",
+                                                id.chars().take(8).collect::<String>()
+                                            ),
+                                            theme::dim(),
+                                        );
+                                    }
+                                    KillOutcome::NotFound => {
+                                        // Already finished — leave the
+                                        // tab alone; nothing to abort.
+                                    }
+                                    KillOutcome::Ambiguous(_) => {
+                                        // Exact full-id passed in
+                                        // shouldn't be ambiguous; if
+                                        // it ever is, surface it.
+                                        let _ = renderer.write_line_to_chat(
+                                            active,
+                                            "(/kill: ambiguous id — supply more characters)",
+                                            c_error(),
+                                        );
+                                    }
+                                }
+                                renderer.render_viewport()?;
+                                renderer.draw_bottom(
+                                    &input,
+                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.lock().unwrap().len()),
+                                    is_running,
+                                )?;
+                                continue;
+                            }
                         }
 
                         match key.code {
@@ -2877,7 +2929,8 @@ pub async fn run_interactive(
                         while chat_ui_states.len() < renderer.chat_count() {
                             chat_ui_states.push(ChatUiState::empty());
                         }
-                        subagent_chat_map.insert(id, idx);
+                        subagent_chat_map.insert(id.clone(), idx);
+                        chat_idx_to_subagent.insert(idx, id);
                         // Seed the new chat with the prompt so when
                         // the user switches to it they can see what
                         // the subagent was asked to do.
@@ -2892,12 +2945,18 @@ pub async fn run_interactive(
                             theme::dim(),
                         );
                     }
-                    E::Complete { id, result } => {
+                    E::Complete { id, result: _ } => {
+                        // dirge-781c: the per-stream Token event has
+                        // already written the full text into the
+                        // chat slot. `Complete` just removes the
+                        // "(subagent running…)" placeholder by
+                        // appending a terminator the user can
+                        // visually anchor on.
                         if let Some(&idx) = subagent_chat_map.get(&id) {
                             let _ = renderer.write_line_to_chat(
                                 idx,
-                                &format!("<dirge> {}", sanitize_output(&result)),
-                                c_agent(),
+                                "(subagent done)",
+                                theme::dim(),
                             );
                         }
                     }
@@ -2906,6 +2965,86 @@ pub async fn run_interactive(
                             let _ = renderer.write_line_to_chat(
                                 idx,
                                 &format!("subagent error: {}", sanitize_output(&error)),
+                                c_error(),
+                            );
+                        }
+                    }
+                    // dirge-781c: streaming token from the subagent.
+                    // Renders in the agent color so the subagent tab
+                    // matches the parent chat's reply style.
+                    E::Token { id, text } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                &format!("<dirge> {}", sanitize_output(&text)),
+                                c_agent(),
+                            );
+                        }
+                    }
+                    // dirge-781c: streaming reasoning text — dim so
+                    // it's distinguishable from the reply body, same
+                    // visual register the parent chat's reasoning
+                    // uses (DarkMagenta in the live stream, dim
+                    // here because we get it post-hoc).
+                    E::Reasoning { id, text } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                &format!("(reasoning) {}", sanitize_output(&text)),
+                                theme::dim(),
+                            );
+                        }
+                    }
+                    // dirge-781c: tool call announcement. Tool color
+                    // matches the parent chat's tool header style.
+                    E::ToolCall {
+                        id,
+                        tool_name,
+                        args_summary,
+                    } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let line = if args_summary.is_empty() {
+                                format!("[tool] {}", tool_name)
+                            } else {
+                                format!("[tool] {} {}", tool_name, args_summary)
+                            };
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                &sanitize_output(&line),
+                                c_tool(),
+                            );
+                        }
+                    }
+                    // dirge-781c: tool result preview — dim so it
+                    // reads as ancillary context. The subagent's
+                    // chat tab gets the truncated summary, not the
+                    // full output (which would dwarf the prompt /
+                    // reply).
+                    E::ToolResult {
+                        id,
+                        tool_name,
+                        output_summary,
+                    } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let line = format!(
+                                "[tool: {}] {}",
+                                tool_name, output_summary,
+                            );
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                &sanitize_output(&line),
+                                theme::dim(),
+                            );
+                        }
+                    }
+                    // dirge-781c: subagent killed by `/kill` or
+                    // Ctrl+K — write `(aborted)` so the user sees
+                    // why the tab stopped.
+                    E::Aborted { id } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                "(aborted)",
                                 c_error(),
                             );
                         }

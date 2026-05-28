@@ -67,6 +67,45 @@ pub(super) async fn cmd_mcp(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::R
     Ok(())
 }
 
+/// dirge-781c: `/kill <id-prefix>` — abort a running subagent.
+///
+/// Resolves `id-prefix` against the in-flight subagent registry
+/// (populated by `TaskTool::call` at spawn time). On a unique match
+/// triggers the subagent's `AbortSignal`; the subagent's task tool
+/// observes it within ~100ms and emits `SubagentChatEvent::Aborted`,
+/// which the UI renders as `(aborted)` in the matching chat tab.
+///
+/// Usage echoes back one of:
+///   - `killed <full-id>` — success.
+///   - `no subagent matches <prefix>` — nothing in flight.
+///   - `ambiguous prefix: <id1> <id2> ...` — supply more chars.
+pub(super) async fn cmd_kill(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+    use crate::agent::tools::task::{KillOutcome, kill_subagent};
+    let prefix = parts.get(1).copied().unwrap_or("").trim();
+    if prefix.is_empty() {
+        ctx.renderer
+            .write_line("usage: /kill <id-prefix>", c_error())?;
+        return Ok(());
+    }
+    match kill_subagent(prefix) {
+        KillOutcome::Killed(id) => {
+            ctx.renderer
+                .write_line(&format!("killed {}", id), c_agent())?;
+        }
+        KillOutcome::NotFound => {
+            ctx.renderer
+                .write_line(&format!("no subagent matches '{}'", prefix), c_error())?;
+        }
+        KillOutcome::Ambiguous(ids) => {
+            ctx.renderer.write_line(
+                &format!("ambiguous prefix '{}'; matches: {}", prefix, ids.join(" "),),
+                c_error(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn cmd_btw(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     let query = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
     if query.is_empty() {

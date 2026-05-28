@@ -14,6 +14,7 @@ use crate::agent::tools::task::SubagentChatEvent;
 #[cfg(feature = "plugin")]
 use crate::plugin::PluginManager;
 use crate::session::{self, MessageRole, Session, ToolCallEntry, ToolCallState};
+#[cfg(feature = "plugin")]
 use crate::ui::events::sanitize_output;
 use crate::ui::markdown;
 use crate::ui::panel_data;
@@ -44,9 +45,16 @@ pub(crate) fn apply_subagent_panel_event(
             let files = panel_data::extract_file_paths_from_prompt(prompt);
             rows.insert(id.clone(), ("running".to_string(), prompt.clone(), files));
         }
-        E::Complete { id, .. } | E::Failed { id, .. } => {
+        // Terminal events evict the row — the chat tab keeps the
+        // full transcript, so leaving the panel row in would just
+        // accumulate stale finished entries.
+        E::Complete { id, .. } | E::Failed { id, .. } | E::Aborted { id } => {
             rows.shift_remove(id);
         }
+        // dirge-781c: streaming events DON'T mutate the panel — the
+        // row's lifecycle is Spawn → terminal. The chat-tab side of
+        // the UI handles the per-token / per-tool rendering.
+        E::Token { .. } | E::Reasoning { .. } | E::ToolCall { .. } | E::ToolResult { .. } => {}
     }
 }
 

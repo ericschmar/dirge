@@ -434,6 +434,7 @@ pub async fn handle_slash(
         "/retry" => cmd_session::cmd_retry(&mut ctx).await?,
         "/allow" => cmd_misc::cmd_allow(&mut ctx, &parts, text).await?,
         "/help" => cmd_misc::cmd_help(&mut ctx).await?,
+        "/kill" => cmd_misc::cmd_kill(&mut ctx, &parts).await?,
         _ => {
             // If `slash_command_names()` advertised this command
             // but no match arm above caught it, the lists drifted
@@ -625,6 +626,7 @@ pub fn slash_command_names() -> Vec<&'static str> {
         "/compress",
         "/fork",
         "/help",
+        "/kill",
         "/mode",
         "/model",
         "/panel",

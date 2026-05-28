@@ -1,9 +1,12 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent::agent_loop::tool::AbortSignal;
 use crate::agent::tools::background::{BackgroundStore, TaskState};
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 use crate::provider::AnyModel;
@@ -25,6 +28,16 @@ use crate::provider::AnyModel;
 /// tool set. Phase A-C laid the multi-chat infrastructure that
 /// rewrite needs; Phase D ships visibility today.
 #[derive(Debug, Clone)]
+// dirge-781c: Reasoning / ToolCall / ToolResult variants are part of
+// the streaming surface the chat-tab routes; production producers
+// (`btw_query`-based foreground/background subagents) emit only
+// Token + Complete + Failed + Aborted today. Sub-runner migration
+// will fire the rest. The `Complete.result` field is also kept for
+// the same reason — the UI handler currently reads only `id` (the
+// Token event carries the text) but a future runner can populate
+// it with the final assembled reply when a separate Token stream
+// isn't used.
+#[allow(dead_code)]
 pub enum SubagentChatEvent {
     /// A new subagent is starting. UI loop creates a chat window
     /// named after a short truncation of the prompt and writes the
@@ -36,6 +49,33 @@ pub enum SubagentChatEvent {
     /// Subagent errored or timed out. UI loop writes the failure
     /// reason in error color.
     Failed { id: String, error: String },
+    /// dirge-781c: streaming assistant token from the subagent.
+    /// Currently emitted as a single chunk when `btw_query` returns
+    /// (one-shot model has no per-token stream); when the task tool
+    /// migrates to a sub-runner this fires per chunk so the user can
+    /// watch the reply build up in the subagent's chat slot.
+    Token { id: String, text: String },
+    /// dirge-781c: streaming reasoning text from the subagent.
+    /// Renders dim to mirror the parent chat's reasoning style.
+    Reasoning { id: String, text: String },
+    /// dirge-781c: subagent emitted a tool call. `args_summary` is a
+    /// short, human-readable rendering of the args (one-liner).
+    ToolCall {
+        id: String,
+        tool_name: String,
+        args_summary: String,
+    },
+    /// dirge-781c: subagent tool result. `output_summary` is a short
+    /// human-readable preview (single line, truncated) so the tab
+    /// shows progress without dumping multi-KB blobs.
+    ToolResult {
+        id: String,
+        tool_name: String,
+        output_summary: String,
+    },
+    /// dirge-781c: subagent was killed via `/kill` or Ctrl+K. UI
+    /// writes `(aborted)` to the matching chat slot.
+    Aborted { id: String },
 }
 
 pub type SubagentChatSender = mpsc::UnboundedSender<SubagentChatEvent>;
@@ -69,6 +109,107 @@ pub fn set_subagent_chat_sink(sink: SubagentChatSender) {
 
 pub fn subagent_chat_sink() -> Option<SubagentChatSender> {
     SUBAGENT_CHAT_SINK.get().cloned()
+}
+
+/// dirge-781c: process-global registry mapping in-flight subagent ids
+/// to their `AbortSignal`. Populated when a `TaskTool::call` spawns a
+/// subagent; cleared on terminal events (complete / failed / aborted).
+///
+/// Used by `/kill <id-prefix>` and Ctrl+K to find a live subagent and
+/// trigger its abort signal. The map is keyed on the FULL subagent id
+/// (UUID for background, freshly-minted UUID for foreground). Prefix
+/// resolution lives in `kill_subagent`.
+static SUBAGENT_ABORT_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, AbortSignal>>> =
+    std::sync::OnceLock::new();
+
+fn abort_registry() -> &'static Mutex<HashMap<String, AbortSignal>> {
+    SUBAGENT_ABORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a subagent's abort signal so `/kill` can find it later.
+/// Idempotent — re-registering replaces the previous signal (which
+/// shouldn't happen in practice since ids are fresh UUIDs).
+pub fn register_subagent_abort(id: &str, signal: AbortSignal) {
+    let mut map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(id.to_string(), signal);
+}
+
+/// Remove a subagent's abort entry. Called at terminal lifecycle
+/// events so the registry doesn't accumulate stale ids.
+pub fn unregister_subagent_abort(id: &str) {
+    let mut map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(id);
+}
+
+/// Outcome of a `/kill <id-prefix>` resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// No in-flight subagent matched the prefix.
+    NotFound,
+    /// Multiple in-flight subagents matched the prefix — ambiguous;
+    /// the caller should ask the user to supply more characters.
+    /// Carries the matching full ids so the UI can list them.
+    Ambiguous(Vec<String>),
+    /// Exactly one match — its `AbortSignal::cancel()` was triggered.
+    /// Carries the full id so the UI can echo back what got killed.
+    Killed(String),
+}
+
+/// Resolve `id_prefix` against the in-flight subagent registry and,
+/// when it matches exactly one entry, fire the abort signal.
+///
+/// Resolution rules:
+///   - Empty prefix → `NotFound` (refuse to kill blindly).
+///   - Exact match on a full id → kill that one even if other ids
+///     also start with the same string.
+///   - One id starts with the prefix → kill it.
+///   - Multiple ids start with the prefix → `Ambiguous` (no-op).
+///   - Zero matches → `NotFound`.
+pub fn kill_subagent(id_prefix: &str) -> KillOutcome {
+    let trimmed = id_prefix.trim();
+    if trimmed.is_empty() {
+        return KillOutcome::NotFound;
+    }
+    let map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    // Exact match wins outright.
+    if let Some(sig) = map.get(trimmed) {
+        sig.cancel();
+        return KillOutcome::Killed(trimmed.to_string());
+    }
+    let matches: Vec<String> = map
+        .keys()
+        .filter(|k| k.starts_with(trimmed))
+        .cloned()
+        .collect();
+    match matches.len() {
+        0 => KillOutcome::NotFound,
+        1 => {
+            let id = matches.into_iter().next().unwrap();
+            if let Some(sig) = map.get(&id) {
+                sig.cancel();
+            }
+            KillOutcome::Killed(id)
+        }
+        _ => KillOutcome::Ambiguous(matches),
+    }
+}
+
+/// Snapshot of currently-registered in-flight subagent ids. Used by
+/// the UI to drive Ctrl+K (resolve the focused-tab's id back to a
+/// full registry key) without exposing the mutex.
+#[allow(dead_code)]
+pub fn registered_subagent_ids() -> Vec<String> {
+    let map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    map.keys().cloned().collect()
+}
+
+/// Test-only helper: clear the abort registry between cases. Tests
+/// run in parallel by default; without this they'd leak ids across
+/// test invocations and corrupt prefix-resolution assertions.
+#[cfg(test)]
+pub fn clear_abort_registry_for_test() {
+    let mut map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    map.clear();
 }
 
 pub struct TaskTool {
@@ -198,11 +339,19 @@ impl Tool for TaskTool {
                 prompt: args.prompt.clone(),
             });
 
+            // dirge-781c: per-subagent AbortSignal so `/kill <id>` or
+            // Ctrl+K on the focused tab can interrupt it. Registered
+            // in the process-global registry; cleared on terminal
+            // event below.
+            let abort = AbortSignal::new();
+            register_subagent_abort(&task_id, abort.clone());
+
             let model = self.model.clone();
             let prompt = args.prompt;
             let store = self.bg_store.clone();
             let tid = task_id.clone();
             let chat_sink = self.chat_sink.clone();
+            let abort_for_task = abort.clone();
 
             // Cap the background subagent at 10 minutes. Without a
             // timeout, a stuck subagent (provider hang, runaway
@@ -220,22 +369,50 @@ impl Tool for TaskTool {
                     "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
                     prompt
                 ));
-                let result = tokio::time::timeout(SUBAGENT_TIMEOUT, fut).await;
-                let (state, chat_event) = match result {
-                    Ok(Ok(text)) => (
+                // dirge-781c: race btw_query against the abort signal.
+                // `btw_query` is one-shot so we can't propagate the
+                // signal into the provider; instead we poll the flag
+                // and bail out of the await at the next tick.
+                let abort_check = abort_for_task.clone();
+                let raced = async {
+                    tokio::pin!(fut);
+                    loop {
+                        tokio::select! {
+                            r = &mut fut => break Ok::<_, ()>(r),
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                if abort_check.is_cancelled() {
+                                    break Err(());
+                                }
+                            }
+                        }
+                    }
+                };
+                let outer = tokio::time::timeout(SUBAGENT_TIMEOUT, raced).await;
+                let (state, chat_event) = match outer {
+                    Ok(Ok(Ok(text))) => (
                         TaskState::Completed(text.clone()),
-                        SubagentChatEvent::Complete {
+                        SubagentChatEvent::Token {
                             id: tid_for_task.clone(),
-                            result: text,
+                            text: text.clone(),
                         },
                     ),
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         let msg = e.to_string();
                         (
                             TaskState::Failed(msg.clone()),
                             SubagentChatEvent::Failed {
                                 id: tid_for_task.clone(),
                                 error: msg,
+                            },
+                        )
+                    }
+                    Ok(Err(())) => {
+                        // dirge-781c: aborted via /kill.
+                        let msg = "aborted by user".to_string();
+                        (
+                            TaskState::Failed(msg.clone()),
+                            SubagentChatEvent::Aborted {
+                                id: tid_for_task.clone(),
                             },
                         )
                     }
@@ -251,9 +428,30 @@ impl Tool for TaskTool {
                         )
                     }
                 };
+                // dirge-781c: emit the streaming Token first (if any),
+                // then the terminal Complete. Lets the UI render the
+                // payload through the same Token-handling code path
+                // that a real per-token stream would use.
+                let final_event = match &chat_event {
+                    SubagentChatEvent::Token { id, text } => {
+                        if let Some(sink) = &chat_sink {
+                            let _ = sink.send(chat_event.clone());
+                        } else if let Some(sink) = subagent_chat_sink() {
+                            let _ = sink.send(chat_event.clone());
+                        }
+                        SubagentChatEvent::Complete {
+                            id: id.clone(),
+                            result: text.clone(),
+                        }
+                    }
+                    _ => chat_event.clone(),
+                };
                 if let Some(sink) = chat_sink {
-                    let _ = sink.send(chat_event);
+                    let _ = sink.send(final_event);
+                } else if let Some(sink) = subagent_chat_sink() {
+                    let _ = sink.send(final_event);
                 }
+                unregister_subagent_abort(&tid_for_task);
                 store_for_task.notify(&tid_for_task, state);
             });
             // Register the handle so `BackgroundStore::cancel_all` (called
@@ -277,15 +475,35 @@ impl Tool for TaskTool {
                 id: task_id.clone(),
                 prompt: args.prompt.clone(),
             });
-            let result = self
-                .model
-                .btw_query(format!(
-                    "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
-                    args.prompt
-                ))
-                .await;
+            // dirge-781c: register an AbortSignal so `/kill` / Ctrl+K
+            // can interrupt the foreground subagent. Registered for
+            // the duration of the btw_query call and removed on
+            // every exit path.
+            let abort = AbortSignal::new();
+            register_subagent_abort(&task_id, abort.clone());
+
+            let fut = self.model.btw_query(format!(
+                "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                args.prompt
+            ));
+            let abort_check = abort.clone();
+            let raced = async {
+                tokio::pin!(fut);
+                loop {
+                    tokio::select! {
+                        r = &mut fut => break Ok::<_, ()>(r),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                            if abort_check.is_cancelled() {
+                                break Err(());
+                            }
+                        }
+                    }
+                }
+            };
+            let result = raced.await;
+            unregister_subagent_abort(&task_id);
             match result {
-                Ok(text) => {
+                Ok(Ok(text)) => {
                     // dirge-nmv5: the chat window always gets the FULL
                     // text so the user sees the complete subagent
                     // answer in its Ctrl-N/P window. The parent agent
@@ -296,6 +514,10 @@ impl Tool for TaskTool {
                     // Replaces the prior "drop everything past 3000
                     // chars" behavior that silently lost subagent
                     // output on the background path.
+                    self.emit_chat(SubagentChatEvent::Token {
+                        id: task_id.clone(),
+                        text: text.clone(),
+                    });
                     self.emit_chat(SubagentChatEvent::Complete {
                         id: task_id,
                         result: text.clone(),
@@ -304,13 +526,21 @@ impl Tool for TaskTool {
                         crate::agent::tools::output_relay::relay_if_large("task", text, "");
                     Ok(outcome.text)
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let msg = e.to_string();
                     self.emit_chat(SubagentChatEvent::Failed {
                         id: task_id,
                         error: msg.clone(),
                     });
                     Err(ToolError::Msg(format!("Subagent error: {}", msg)))
+                }
+                Err(()) => {
+                    // dirge-781c: aborted via /kill or Ctrl+K. The
+                    // parent agent sees an `aborted` error so the
+                    // cancellation is visible in its loop, NOT a
+                    // silent "subagent finished" with no payload.
+                    self.emit_chat(SubagentChatEvent::Aborted { id: task_id });
+                    Err(ToolError::Msg("Subagent aborted by user".to_string()))
                 }
             }
         }
@@ -440,5 +670,232 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_file(path);
+    }
+
+    // dirge-781c: registry-backed kill resolution. These tests use a
+    // serial mutex to ensure they don't trample each other's
+    // registry state when run in parallel (cargo's default).
+    fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `/kill` against an empty registry or a never-spawned prefix
+    /// must be a NoOp — never panic, never cancel anything.
+    #[test]
+    fn kill_unknown_id_no_op() {
+        let _guard = registry_test_lock();
+        clear_abort_registry_for_test();
+        // Empty registry, any prefix → NotFound.
+        assert_eq!(kill_subagent("abc"), KillOutcome::NotFound);
+        assert_eq!(kill_subagent(""), KillOutcome::NotFound);
+        // Populated registry, prefix doesn't match anything.
+        let sig = AbortSignal::new();
+        register_subagent_abort("aaa-1111", sig.clone());
+        assert_eq!(kill_subagent("zzz"), KillOutcome::NotFound);
+        assert!(
+            !sig.is_cancelled(),
+            "unmatched kill must NOT cancel the surviving subagent",
+        );
+        unregister_subagent_abort("aaa-1111");
+    }
+
+    /// `/kill <prefix>` with exactly one matching id resolves to
+    /// `Killed(full_id)` and fires the abort signal.
+    #[test]
+    fn kill_resolves_by_prefix_unique_match() {
+        let _guard = registry_test_lock();
+        clear_abort_registry_for_test();
+        let sig_a = AbortSignal::new();
+        let sig_b = AbortSignal::new();
+        register_subagent_abort("aa11-deadbeef", sig_a.clone());
+        register_subagent_abort("bb22-cafef00d", sig_b.clone());
+
+        // Unique 2-char prefix → kill exactly that one.
+        match kill_subagent("aa") {
+            KillOutcome::Killed(id) => assert_eq!(id, "aa11-deadbeef"),
+            other => panic!("expected Killed; got {:?}", other),
+        }
+        assert!(sig_a.is_cancelled(), "matched signal must be cancelled");
+        assert!(!sig_b.is_cancelled(), "unmatched signal must survive");
+
+        // Ambiguous prefix (registering a second `aa…` id) → Ambiguous.
+        let sig_a2 = AbortSignal::new();
+        register_subagent_abort("aa99-othertask", sig_a2.clone());
+        // sig_a already cancelled from previous step; check ambiguity
+        // returns BOTH matching ids.
+        match kill_subagent("aa") {
+            KillOutcome::Ambiguous(ids) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.iter().any(|i| i == "aa11-deadbeef"));
+                assert!(ids.iter().any(|i| i == "aa99-othertask"));
+            }
+            other => panic!("expected Ambiguous; got {:?}", other),
+        }
+        assert!(
+            !sig_a2.is_cancelled(),
+            "ambiguous kill must NOT cancel any signal",
+        );
+
+        // Exact-id match wins over prefix collision: passing the
+        // FULL id of one entry kills exactly that one even though
+        // it's a prefix of itself.
+        clear_abort_registry_for_test();
+        let s1 = AbortSignal::new();
+        let s2 = AbortSignal::new();
+        register_subagent_abort("abc", s1.clone());
+        register_subagent_abort("abcdef", s2.clone());
+        match kill_subagent("abc") {
+            KillOutcome::Killed(id) => assert_eq!(id, "abc"),
+            other => panic!("expected exact-match Killed; got {:?}", other),
+        }
+        assert!(s1.is_cancelled());
+        assert!(!s2.is_cancelled());
+
+        clear_abort_registry_for_test();
+    }
+
+    /// `subagent_complete_after_kill_returns_aborted_result`: when
+    /// `/kill` fires while the subagent's `btw_query` future is
+    /// awaiting, the task tool emits an `Aborted` chat event and
+    /// returns a `ToolError` containing "aborted" so the parent
+    /// agent's tool-result block reflects the cancellation.
+    ///
+    /// The test exercises the racer directly because `btw_query`
+    /// requires a real provider. The racer is the same code path
+    /// the production `call()` runs.
+    #[tokio::test]
+    async fn subagent_complete_after_kill_returns_aborted_result() {
+        let _guard = registry_test_lock();
+        clear_abort_registry_for_test();
+        let tid = "t-abort-1";
+        let abort = AbortSignal::new();
+        register_subagent_abort(tid, abort.clone());
+
+        // Simulate a long-running btw_query future that never
+        // returns. The select! racer polls the abort signal every
+        // 100ms; cancelling here should make it bail out within ~200ms.
+        let abort_check = abort.clone();
+        let fut = async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<String, anyhow::Error>("never-arrives".to_string())
+        };
+        let raced = async {
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    r = &mut fut => break Ok::<_, ()>(r),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if abort_check.is_cancelled() {
+                            break Err(());
+                        }
+                    }
+                }
+            }
+        };
+
+        // Fire /kill in parallel; the racer should observe it on
+        // its next 50ms poll.
+        let killer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            assert!(matches!(kill_subagent("t-abort"), KillOutcome::Killed(_)));
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), raced)
+            .await
+            .expect("racer must exit before the 2s test timeout");
+        killer.await.unwrap();
+
+        match result {
+            Err(()) => { /* expected — aborted */ }
+            Ok(other) => panic!("expected abort; got Ok({:?})", other),
+        }
+        unregister_subagent_abort(tid);
+        clear_abort_registry_for_test();
+    }
+
+    /// dirge-781c: Token / Reasoning / ToolCall / ToolResult /
+    /// Aborted events round-trip through the chat sink — the UI
+    /// receiver sees them with the same id payload the producer
+    /// sent. Guards the variant additions against accidental
+    /// silent drops when the dispatch is refactored.
+    #[test]
+    fn subagent_token_event_routes_to_chat_slot() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentChatEvent>();
+        tx.send(SubagentChatEvent::Token {
+            id: "a1".into(),
+            text: "hello world".into(),
+        })
+        .unwrap();
+        tx.send(SubagentChatEvent::Reasoning {
+            id: "a1".into(),
+            text: "thinking".into(),
+        })
+        .unwrap();
+        tx.send(SubagentChatEvent::Aborted { id: "a1".into() })
+            .unwrap();
+
+        match rx.try_recv().unwrap() {
+            SubagentChatEvent::Token { id, text } => {
+                assert_eq!(id, "a1");
+                assert_eq!(text, "hello world");
+            }
+            other => panic!("expected Token; got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            SubagentChatEvent::Reasoning { id, text } => {
+                assert_eq!(id, "a1");
+                assert_eq!(text, "thinking");
+            }
+            other => panic!("expected Reasoning; got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            SubagentChatEvent::Aborted { id } => assert_eq!(id, "a1"),
+            other => panic!("expected Aborted; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subagent_tool_call_event_routes_to_chat_slot() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentChatEvent>();
+        tx.send(SubagentChatEvent::ToolCall {
+            id: "a1".into(),
+            tool_name: "read".into(),
+            args_summary: "path=/tmp/x".into(),
+        })
+        .unwrap();
+        tx.send(SubagentChatEvent::ToolResult {
+            id: "a1".into(),
+            tool_name: "read".into(),
+            output_summary: "12 lines".into(),
+        })
+        .unwrap();
+
+        match rx.try_recv().unwrap() {
+            SubagentChatEvent::ToolCall {
+                id,
+                tool_name,
+                args_summary,
+            } => {
+                assert_eq!(id, "a1");
+                assert_eq!(tool_name, "read");
+                assert_eq!(args_summary, "path=/tmp/x");
+            }
+            other => panic!("expected ToolCall; got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            SubagentChatEvent::ToolResult {
+                id,
+                tool_name,
+                output_summary,
+            } => {
+                assert_eq!(id, "a1");
+                assert_eq!(tool_name, "read");
+                assert_eq!(output_summary, "12 lines");
+            }
+            other => panic!("expected ToolResult; got {:?}", other),
+        }
     }
 }
