@@ -847,3 +847,297 @@ fn default_bash_rules_keep_high_risk_gated() {
         );
     }
 }
+
+// ── dirge-yevn regression coverage ──────────────────────────────
+//
+// Complaint #1: Accept mode is documented as "auto-approves inside
+// the working directory" but users still get permission dialogs on
+// edit/write for files INSIDE cwd. The CWD-scoped builtin-allow
+// rule installer uses `canonicalize_for_cache` so its pattern is
+// the canonical form (e.g. /private/tmp/proj on macOS where /tmp
+// symlinks to /private/tmp). But `check_path` matches both the
+// canonical AND the literal raw path against installed rules — and
+// `is_external_path` ALREADY handles the symlink-root case for
+// path classification. The Accept-mode short-circuit, however,
+// is shaped: `match base { Ask => ... if !external ... Allow }`.
+// If `base = Ask` (e.g. due to a user-supplied catch-all `*: ask`
+// rule that wins last-match-wins), the short-circuit fires. But
+// when the cwd-allow rule is present AND no other rule intercepts,
+// `base` is already Allow.  The actually-reported friction in
+// Accept mode appears when the user lands inside the CWD via a
+// symlink (working_dir is the symlink path, but the canonicalized
+// path comes back as the realpath form, or vice versa) — in that
+// case the CWD-allow pattern (`canonical/**`) and the path under
+// check don't both line up.
+
+/// Complaint #1, direct repro: in Accept mode, an edit to a file
+/// inside the working directory must be auto-allowed without any
+/// permission dialog. This is the documented contract.
+#[test]
+fn accept_mode_auto_approves_edit_inside_cwd() {
+    let dir = std::env::temp_dir().join(format!("dirge-yevn-edit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Accept,
+        Some(dir.clone()),
+    );
+    let target = dir.join("src").join("foo.rs");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "").unwrap();
+
+    let result = checker.check_path("edit", target.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "Accept mode must auto-approve edit inside cwd; got {:?}",
+        result,
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Complaint #1, direct repro: Accept mode must auto-approve
+/// write inside cwd. Same shape as the edit test — pin both
+/// since the F2 alias merge in `enforce` makes write go through
+/// both rule sets.
+#[test]
+fn accept_mode_auto_approves_write_inside_cwd() {
+    let dir = std::env::temp_dir().join(format!("dirge-yevn-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Accept,
+        Some(dir.clone()),
+    );
+
+    // Existing file
+    let existing = dir.join("src").join("foo.rs");
+    std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+    std::fs::write(&existing, "").unwrap();
+    assert!(
+        matches!(
+            checker.check_path("write", existing.to_str().unwrap()),
+            CheckResult::Allowed
+        ),
+        "Accept mode must auto-approve write to existing file inside cwd",
+    );
+
+    // New file (path does not yet exist on disk — common case)
+    let newfile = dir.join("src").join("new-file.rs");
+    let result = checker.check_path("write", newfile.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "Accept mode must auto-approve write to new file inside cwd; got {:?}",
+        result,
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Complaint #1 with the symlinked-cwd shape: the working_dir is a
+/// SYMLINK to a real directory. The user passes file paths in
+/// whichever form (symlinked or real). Either way, the file is
+/// inside the project — Accept mode must auto-approve.
+///
+/// This is the realistic macOS scenario: `/tmp` symlinks to
+/// `/private/tmp`. If a user starts dirge with `--accept-all` in
+/// `/tmp/proj`, but the LLM/agent ends up passing
+/// `/private/tmp/proj/...` (canonicalized), the check must still
+/// say Allow.
+#[test]
+fn accept_mode_auto_approves_edit_inside_cwd_through_symlink() {
+    // Build:  /tmp/dirge-yevn-symlink-<pid>/real/        (real cwd)
+    //         /tmp/dirge-yevn-symlink-<pid>/link  ->  real
+    // Then check writes via BOTH the symlink form and the real form.
+    let root = std::env::temp_dir().join(format!("dirge-yevn-symlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let real = root.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = root.join("link");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&real, &link).unwrap();
+
+    // Start dirge with cwd = the symlink form (what a user types).
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Accept,
+        Some(link.clone()),
+    );
+
+    // A file inside the project, addressed via the symlink path.
+    let src = real.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let via_link = link.join("src").join("foo.rs");
+    std::fs::write(real.join("src").join("foo.rs"), "").unwrap();
+
+    let result = checker.check_path("edit", via_link.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "edit via symlinked cwd path must Allow in Accept mode; got {:?}",
+        result,
+    );
+
+    // Same file addressed via the canonical (real) path.
+    let via_real = real.join("src").join("foo.rs");
+    let result = checker.check_path("edit", via_real.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "edit via canonical cwd path must Allow in Accept mode; got {:?}",
+        result,
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Complaint #2, direct repro: pick "Allow always" for a folder
+/// (folder-glob pattern `/folder/**`), and the next write into the
+/// SAME folder must hit the session allowlist — no re-prompt.
+#[test]
+fn allow_always_folder_persists_in_session_allowlist() {
+    let mut cfg = PermissionConfig::default();
+    cfg.default = Some(Action::Ask);
+    // Use a working_dir OUTSIDE the test paths so the CWD-allow
+    // installer doesn't intercept and mask the session allowlist
+    // under test.
+    let mut checker = PermissionChecker::new(
+        &cfg,
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+    );
+
+    // User picks "Allow always" for /project/src/foo.rs. The UI
+    // calls `suggest_pattern` which yields `/project/src/**`,
+    // then `add_session_allowlist`.
+    checker.add_session_allowlist("write".to_string(), "/project/src/**");
+
+    // First write that triggered the dialog — same path — must Allow.
+    assert!(matches!(
+        checker.check_path("write", "/project/src/foo.rs"),
+        CheckResult::Allowed
+    ));
+    // Subsequent writes to the SAME folder must Allow.
+    assert!(matches!(
+        checker.check_path("write", "/project/src/bar.rs"),
+        CheckResult::Allowed
+    ));
+}
+
+/// Complaint #2, the exact user-reported behavior: after picking
+/// "Allow always" for a write in `<cwd>/src/foo.rs`, the next
+/// write to `<cwd>/src/bar.rs` must also Allow — no re-prompt.
+/// The session allowlist entry is `<cwd>/src/**`.
+#[test]
+fn allow_always_folder_covers_subsequent_writes_to_same_folder() {
+    let mut cfg = PermissionConfig::default();
+    cfg.default = Some(Action::Ask);
+    let mut checker = PermissionChecker::new(
+        &cfg,
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+    );
+    checker.add_session_allowlist("write".to_string(), "/project/src/**");
+
+    // First write that the user dialog approved.
+    assert!(matches!(
+        checker.check_path("write", "/project/src/foo.rs"),
+        CheckResult::Allowed
+    ));
+    // The complaint: same folder, different file → must NOT re-prompt.
+    let result = checker.check_path("write", "/project/src/bar.rs");
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "subsequent write to same folder must hit allowlist (no re-prompt); got {:?}",
+        result,
+    );
+    // And nested writes (deeper subdirs of the same folder) also Allow.
+    let result = checker.check_path("write", "/project/src/agent/baz.rs");
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "nested write under allowlisted folder must Allow; got {:?}",
+        result,
+    );
+
+    // Edit / apply_patch must also Allow (write↔edit alias).
+    assert!(matches!(
+        checker.check_path("edit", "/project/src/bar.rs"),
+        CheckResult::Allowed
+    ));
+    assert!(matches!(
+        checker.check_path("apply_patch", "/project/src/bar.rs"),
+        CheckResult::Allowed
+    ));
+}
+
+/// Complaint #2 with symlinked working dir: the user picks "Allow
+/// always" for a write inside `<symlinked-cwd>/src/`. The
+/// pattern stored is whatever `suggest_pattern` derived from the
+/// input the LLM passed. The NEXT write to the same folder may
+/// arrive in the CANONICAL form (after canonicalization upstream)
+/// or vice versa — the session-allowlist check must still hit.
+#[test]
+fn allow_always_folder_resolves_through_symlinks() {
+    let root = std::env::temp_dir().join(format!(
+        "dirge-yevn-allowlist-symlink-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let real = root.join("real");
+    let src = real.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let link = root.join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&real, &link).unwrap();
+
+    let mut cfg = PermissionConfig::default();
+    cfg.default = Some(Action::Ask);
+    // Put the cwd somewhere OFF the test paths so the CWD-allow
+    // rule doesn't mask the allowlist behavior under test.
+    let mut checker = PermissionChecker::new(
+        &cfg,
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+    );
+
+    // User approves a write to a file addressed via the symlink.
+    // `suggest_pattern` for `<link>/src/foo.rs` would derive
+    // `<link>/src/**`.
+    let approved_input = link.join("src").join("foo.rs");
+    let approved_parent = approved_input.parent().unwrap();
+    let approved_pattern = format!("{}/**", approved_parent.display());
+    checker.add_session_allowlist("write".to_string(), &approved_pattern);
+
+    // Original file (created so canonicalize succeeds) addressed
+    // via the CANONICAL (real) form — must Allow despite the
+    // allowlist pattern being keyed on the symlink form.
+    let probe_existing = real.join("src").join("foo.rs");
+    std::fs::write(&probe_existing, "").unwrap();
+    let via_real = real.join("src").join("foo.rs");
+    let result = checker.check_path("write", via_real.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "write to canonical-form path must Allow via symlinked allowlist entry; got {:?}",
+        result,
+    );
+
+    // And the original symlinked form still allows.
+    let via_link = link.join("src").join("foo.rs");
+    let result = checker.check_path("write", via_link.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "write to symlinked-form path must Allow via symlinked allowlist entry; got {:?}",
+        result,
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

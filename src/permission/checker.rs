@@ -631,22 +631,50 @@ impl PermissionChecker {
     }
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
-        allowlist::add(&mut self.session_allowlist, &tool, pattern_str);
+        // dirge-yevn fix #1: register the pattern AND a
+        // canonicalized variant for path-tool entries so the check
+        // hits whichever form the upstream path arrives in (raw vs
+        // canonical, symlinked vs realpath). The UI's
+        // `suggest_pattern` derives the pattern from the input the
+        // LLM passed (often the symlinked form), but `check_path`
+        // canonicalizes the probe path via `resolve_absolute`. Prior
+        // to this fix, a user who "Allow always"'d a write under
+        // `/tmp/proj/src/` on macOS got the pattern stored as
+        // `/tmp/proj/src/**` while subsequent checks compared against
+        // `/private/tmp/proj/src/foo.rs` — no match, re-prompt.
+        register_with_canonical_variant(
+            &mut self.session_allowlist,
+            &tool,
+            pattern_str,
+            &self.working_dir,
+        );
         // F2 write↔edit↔apply_patch aliasing: when the user "always
         // allows" any of these three, also register the pattern under
-        // the other two so the alias check in enforce() doesn't
+        // the OTHER TWO so the alias check in enforce() doesn't
         // re-prompt. Without this, a user who "always allows" write
         // gets asked again on the next write because the edit-alias
         // check returns Ask with no allowlist match.
-        match tool.as_str() {
-            "write" | "apply_patch" => {
-                allowlist::add(&mut self.session_allowlist, "edit", pattern_str);
-            }
-            "edit" => {
-                allowlist::add(&mut self.session_allowlist, "write", pattern_str);
-                allowlist::add(&mut self.session_allowlist, "apply_patch", pattern_str);
-            }
-            _ => {}
+        //
+        // dirge-yevn fix #2: previously this only mirrored
+        // write→edit and edit→{write,apply_patch}, leaving
+        // apply_patch→write unmirrored. Result: an "Allow always" on
+        // a write left apply_patch's own rules (in the checker's
+        // `check_path("apply_patch", ...)`) with no allowlist entry,
+        // so a subsequent apply_patch call re-prompted. The fix is
+        // full bidirectional mirroring across the three aliases.
+        let aliases: &[&str] = match tool.as_str() {
+            "write" => &["edit", "apply_patch"],
+            "edit" => &["write", "apply_patch"],
+            "apply_patch" => &["write", "edit"],
+            _ => &[],
+        };
+        for alias in aliases {
+            register_with_canonical_variant(
+                &mut self.session_allowlist,
+                alias,
+                pattern_str,
+                &self.working_dir,
+            );
         }
     }
 
@@ -885,6 +913,91 @@ fn install_dev_null_allow(rules: &mut HashMap<String, Vec<(Pattern, Action)>>) {
 
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     path::resolve_absolute(path, working_dir)
+}
+
+/// Register `pattern_str` under `tool` in the session allowlist,
+/// and ALSO register a canonicalized variant when the pattern is a
+/// path-tool entry whose literal prefix differs from its canonical
+/// form. Closes the symlink-mismatch bug: a pattern derived from
+/// the symlinked working_dir (e.g. `/tmp/proj/src/**`) wouldn't
+/// otherwise match a canonicalized probe path (e.g.
+/// `/private/tmp/proj/src/foo.rs`).
+///
+/// Non-path tools (`bash`, `mcp_tool`, etc.) skip the second
+/// registration since their patterns aren't filesystem paths and
+/// canonicalization is meaningless.
+///
+/// Dedup is handled by `allowlist::add`, so a no-op when the
+/// canonical form already equals the original.
+fn register_with_canonical_variant(
+    allowlist: &mut Vec<(String, crate::permission::pattern::Pattern)>,
+    tool: &str,
+    pattern_str: &str,
+    working_dir: &str,
+) {
+    allowlist::add(allowlist, tool, pattern_str);
+    if !is_path_tool_name(tool) {
+        return;
+    }
+    if let Some(canonical_pat) = canonicalize_path_pattern(pattern_str, working_dir)
+        && canonical_pat != pattern_str
+    {
+        allowlist::add(allowlist, tool, &canonical_pat);
+    }
+}
+
+/// Best-effort canonicalize the literal-prefix portion of a path
+/// glob pattern. Splits on the first glob metacharacter (`*`, `?`,
+/// `[`, `{`); canonicalizes the prefix; reassembles the pattern.
+/// Used by `register_with_canonical_variant` to add a realpath-form
+/// twin to a symlink-form session-allowlist pattern.
+///
+/// Returns `None` when:
+///   - the literal prefix is empty (pattern starts with a glob),
+///   - `canonicalize` fails AND the prefix doesn't resolve via
+///     `resolve_absolute` (relative path that doesn't exist on
+///     disk and `working_dir` itself is bogus).
+fn canonicalize_path_pattern(pattern_str: &str, working_dir: &str) -> Option<String> {
+    let split_idx = pattern_str
+        .find(|c: char| matches!(c, '*' | '?' | '[' | '{'))
+        .unwrap_or(pattern_str.len());
+    if split_idx == 0 {
+        return None;
+    }
+    let (head, tail) = pattern_str.split_at(split_idx);
+    // Trim a trailing `/` from the head so the canonicalize call
+    // operates on the directory itself; we re-attach the slash
+    // when reassembling. Without this, a head like
+    // `/tmp/proj/src/` would round-trip as `/private/tmp/proj/src`
+    // (no trailing slash) and the reassembled pattern would lose
+    // a slash compared to the original.
+    let (head_trimmed, had_trailing_slash) = match head.strip_suffix('/') {
+        Some(stripped) => (stripped, true),
+        None => (head, false),
+    };
+    if head_trimmed.is_empty() {
+        return None;
+    }
+    let canonical_head = std::fs::canonicalize(head_trimmed)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| {
+            // Fallback: try resolving as a possibly-relative path
+            // anchored at working_dir. Only useful when the head
+            // exists on disk; resolve_absolute is best-effort.
+            let resolved = resolve_absolute(head_trimmed, working_dir);
+            if resolved != head_trimmed {
+                Some(resolved)
+            } else {
+                None
+            }
+        })?;
+    let mut out = canonical_head;
+    if had_trailing_slash {
+        out.push('/');
+    }
+    out.push_str(tail);
+    Some(out)
 }
 
 #[cfg(test)]
