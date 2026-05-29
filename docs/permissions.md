@@ -115,10 +115,12 @@ to `match`, and the `effect`. Reading top-to-bottom, **last match wins**:
   one operation, so one rule governs all three.
 - **Narrow to a tool** with an optional `"tool": "<name>"` field when a
   rule should apply to a single concrete tool rather than the whole op.
-- **Glob semantics** are inferred from the op: read/edit/`*` use
-  path-style globs (`*` is one path segment, `**` spans directories);
-  execute/network/mcp use shell-style (`*` matches anything, trailing
-  ` *` makes args optional).
+- **Glob semantics** are inferred from the op: read/edit use path-style
+  globs (`*` is one path segment, `**` spans directories);
+  execute/network/mcp use shell-style (`*` matches anything including
+  `/`, trailing ` *` makes args optional). The `*` (any) op uses
+  shell-style too, since it can match commands and MCP keys as well as
+  paths.
 - **Last-match-wins** across the ordered `rules` list — put general
   rules first, specific overrides last.
 - `external_directory` is itself a `rules` list (op defaults to `*`)
@@ -141,9 +143,17 @@ Set with `--standard` (default), `--accept-all`, `--restrictive`, or
 
 Choosing **(a) allow always** at a prompt adds a session-scoped grant
 (op-scoped, so one "allow always" on an edit covers write/edit/apply_patch).
-Manage it with `/allow list`, `/allow remove <n>`, `/allow clear`. Grants
-are dropped when you change the working directory (no privilege
-carry-over between projects).
+Manage it with the `/allow` command:
+
+| Command | Effect |
+|---------|--------|
+| `/allow` or `/allow list` | List the current grants, each with a `[n]` index |
+| `/allow add <tool> <pattern>` | Add a grant manually, e.g. `/allow add bash 'cargo *'` |
+| `/allow remove <n>` | Drop the grant at index `n` (from `/allow list`) |
+| `/allow clear` | Drop all grants |
+
+Bare `/allow` is shorthand for `/allow list`. Grants are dropped when you
+change the working directory (no privilege carry-over between projects).
 
 ## `/why` — explain a decision
 
