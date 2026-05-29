@@ -1,22 +1,13 @@
-//! Path resolution helpers for the permission checker.
+//! Path resolution helpers for the permission engine.
 //!
-//! Provides canonicalisation, symlink resolution, and
-//! builtin-allow rule installation (CWD-scoped write/edit/apply_patch
-//! and /dev/null exemption). Extracted from `checker.rs`.
-//!
-//! `resolve_absolute` is the public entry point — resolves a
-//! possibly-relative path through the working directory, follows
-//! symlinks, and normalises `..` / `.` components. Used by
-//! `PermissionChecker` and by external callers that need the same
-//! canonical path the permission check ran against (closing the
-//! symlink-swap TOCTOU between check and open).
+//! Provides canonicalisation and symlink resolution. `resolve_absolute`
+//! is the entry point — resolves a possibly-relative path through the
+//! working directory, follows symlinks, and normalises `..` / `.`
+//! components. Used by the engine's path classifier and by external
+//! callers that need the same canonical path the permission check ran
+//! against (closing the symlink-swap TOCTOU between check and open).
 
-use std::collections::HashMap;
 use std::path::Path;
-
-use crate::permission::Action;
-use crate::permission::engine;
-use crate::permission::pattern::Pattern;
 
 /// One-shot canonicalize for the working-directory cache. Best
 /// effort: if canonicalize fails (cwd doesn't exist on disk, e.g.
@@ -28,83 +19,6 @@ pub(crate) fn canonicalize_for_cache(working_dir: &str) -> String {
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| working_dir.to_string())
-}
-
-/// Install the CWD-scoped builtin-allow rule on `rules` for the
-/// mutating filesystem tools (write/edit/apply_patch). Returns the
-/// pattern string installed (`Some`) so `set_working_dir` can find
-/// and remove it on cd; `None` when the working_dir is too
-/// degenerate to install safely.
-///
-/// Refuses to install when:
-///   - `working_dir` is empty (config-only init w/o cwd resolution).
-///   - The canonical form is `/` or shorter than 2 chars — the
-///     resulting pattern (`/**`) would silently allow writes anywhere
-///     on the filesystem, defeating the "permissive only inside the
-///     project" intent.
-///   - `working_dir` contains glob metacharacters (`*`, `?`, `[`,
-///     `{`). Such characters would be re-interpreted by the glob
-///     compiler rather than matched literally; a user starting dirge
-///     from `/tmp/[odd]` would get a character-class pattern matching
-///     unintended paths.
-///
-/// Uses `canonicalize_for_cache` so the pattern matches the canonical
-/// form `resolve_absolute` produces. Without this, macOS users whose
-/// `/var` / `/tmp` resolve to `/private/var` / `/private/tmp` would
-/// see the rule silently fail to match for any abs_path the checker
-/// computed.
-pub(crate) fn install_cwd_allow_rules(
-    rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
-    working_dir: &str,
-) -> Option<String> {
-    if working_dir.is_empty() {
-        return None;
-    }
-    let canonical = canonicalize_for_cache(working_dir);
-    let trimmed = canonical.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" || canonical.len() < 2 {
-        return None;
-    }
-    if trimmed.chars().any(|c| matches!(c, '*' | '?' | '[' | '{')) {
-        return None;
-    }
-    let cwd_glob = format!("{}/**", trimmed);
-    for tool in ["write", "edit", "apply_patch"] {
-        rules
-            .entry(tool.to_string())
-            .or_default()
-            .push((engine::pattern_for_tool(tool, &cwd_glob), Action::Allow));
-    }
-    Some(cwd_glob)
-}
-
-/// Install a builtin-allow for `/dev/null` on every tool so the
-/// harmless bit-bucket never triggers a permission prompt. Writes
-/// to `/dev/null` discard data; reads return immediate EOF — no
-/// side effects, no security risk, no reason to ask.
-pub(crate) fn install_dev_null_allow(rules: &mut HashMap<String, Vec<(Pattern, Action)>>) {
-    for tool in [
-        "read",
-        "write",
-        "edit",
-        "apply_patch",
-        "glob",
-        "grep",
-        "find_files",
-        "list_dir",
-        "list_symbols",
-        "find_definition",
-        "find_callers",
-        "find_callees",
-        "get_symbol_body",
-        "repo_overview",
-        "lsp",
-    ] {
-        rules
-            .entry(tool.to_string())
-            .or_default()
-            .push((engine::pattern_for_tool(tool, "/dev/null"), Action::Allow));
-    }
 }
 
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {

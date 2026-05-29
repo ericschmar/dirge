@@ -6,6 +6,7 @@ For configuration keys and provider setup, see [CONFIG.md](../CONFIG.md).
 
 | Document | Topic |
 |---|---|
+| [permissions.md](permissions.md) | Authorization engine — the single decision point, operations/claims, policy precedence, sane defaults, config, security modes, `/why` |
 | [agent-loop.md](agent-loop.md) | Multi-turn agent execution loop — turn structure, hooks, stream pipeline, tool dispatch |
 | [tool-input-repair.md](tool-input-repair.md) | Repair layer for malformed tool calls — repair kinds, `dirge-hints` schema annotations, telemetry |
 | [plugins.md](plugins.md) | Janet plugin authoring — hook reference, `harness/*` API, examples |

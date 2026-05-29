@@ -226,6 +226,12 @@ impl Engine {
 
         let default: Effect = config.default.unwrap_or(Action::Ask).into();
 
+        let deny_rules = rules
+            .iter()
+            .chain(ext_rules.iter())
+            .filter(|r| r.effect == Effect::Deny)
+            .count();
+
         let deciders: Vec<Box<dyn Decider>> = vec![
             Box::new(PromptDenyPolicy),
             Box::new(YoloPolicy),
@@ -235,11 +241,19 @@ impl Engine {
             Box::new(ExternalDirPolicy { rules: ext_rules }),
             Box::new(DefaultActionPolicy { default }),
         ];
-        let modifiers: Vec<Box<dyn Modifier>> = vec![Box::new(LoopGuardPolicy {
-            threshold: LOOP_GUARD_THRESHOLD,
-        })];
+        // `doom_loop: "allow"` opts out of the retry-loop guard
+        // entirely (no hard-deny); otherwise the guard hard-denies a
+        // genuine retry loop at the threshold.
+        let threshold = if config.doom_loop == Some(Action::Allow) {
+            u32::MAX
+        } else {
+            LOOP_GUARD_THRESHOLD
+        };
+        let modifiers: Vec<Box<dyn Modifier>> = vec![Box::new(LoopGuardPolicy { threshold })];
 
-        Engine::new(deciders, modifiers, PolicyCtx::default())
+        let mut engine = Engine::new(deciders, modifiers, PolicyCtx::default());
+        engine.deny_rules = deny_rules;
+        engine
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::permission::PermissionConfig;
+use crate::permission::{Action, PermissionConfig};
 
 fn fresh_checker() -> PermissionChecker {
     PermissionChecker::new(
@@ -754,9 +754,9 @@ fn regression_load_session_allowlist_preserves_command_semantics() {
 
 #[test]
 fn pattern_for_tool_distinguishes_path_and_command_tools() {
-    assert!(pattern_for_tool("bash", "cd *").matches("cd /a/b/c"));
-    assert!(!pattern_for_tool("read", "cd *").matches("cd /a/b/c"));
-    assert!(pattern_for_tool("read", "cd *").matches("cd file"));
+    assert!(crate::permission::engine::pattern_for_tool("bash", "cd *").matches("cd /a/b/c"));
+    assert!(!crate::permission::engine::pattern_for_tool("read", "cd *").matches("cd /a/b/c"));
+    assert!(crate::permission::engine::pattern_for_tool("read", "cd *").matches("cd file"));
 }
 
 /// Regression: the prior bash defaults used exact patterns

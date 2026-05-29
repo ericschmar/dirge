@@ -40,10 +40,8 @@ pub mod types;
 
 pub use build::{classify_path, tool_operation};
 
-// Re-export the classification helpers so existing call sites
-// (`engine::pattern_for_tool`, `engine::is_path_tool_name`,
-// `engine::is_high_risk_non_path_tool`) keep resolving unchanged.
-pub(crate) use classify::is_high_risk_non_path_tool;
+// Re-export the classification helpers used across the permission
+// module (`engine::pattern_for_tool`, `engine::is_path_tool_name`).
 pub use classify::{is_path_tool_name, pattern_for_tool};
 
 use policy::{Decider, Modifier, PolicyCtx};
@@ -75,6 +73,10 @@ pub struct Engine {
     deciders: Vec<Box<dyn Decider>>,
     modifiers: Vec<Box<dyn Modifier>>,
     ctx: PolicyCtx,
+    /// Count of configured `Deny` rules (configured + external_directory),
+    /// for the Yolo-mode "your deny rules are inert" startup warning.
+    /// Set by `from_config`.
+    pub(super) deny_rules: usize,
 }
 
 impl Engine {
@@ -92,7 +94,14 @@ impl Engine {
             deciders,
             modifiers,
             ctx,
+            deny_rules: 0,
         }
+    }
+
+    /// Number of configured `Deny` rules — used to warn when Yolo mode
+    /// renders them inert.
+    pub fn deny_rule_count(&self) -> usize {
+        self.deny_rules
     }
 
     /// Read-only access to the mutable context (for the UI's
