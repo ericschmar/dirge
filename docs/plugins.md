@@ -59,6 +59,11 @@ ignored or used by the host as noted.
 | `on-message-update` | Every ~16 streamed tokens during a turn. `ctx` = `{:index :partial}` | Ignored |
 | `on-turn-end` | After this turn's tool results return. `ctx` = `{:index :message}` | Ignored |
 | `prepare-next-run` | Between completed run and the next prompt. Place to call `harness/set-next-model`, `harness/add-steering`, `harness/add-followup` | Ignored |
+| `before-agent-start` | Once before the agent starts, with the assembled system prompt. `ctx` = `{:system-prompt}` | Ignored. Use `harness/append-system-prompt` to add to the preamble (append-only) |
+| `transform-context` | Before every LLM call, with the current messages. `ctx` = `{:messages}` (JSON array string) | Ignored. Use `harness/replace-context` to prune/inject for that call (transcript unchanged) |
+| `message-end` | After the assistant message finalizes, before it is stored. `ctx` = `{:message}` | Ignored. Use `harness/rewrite-message` to rewrite the stored/persisted text |
+| `on-before-compact` | Before a compaction fold. `ctx` = `{:message-count :tokens}` | Ignored — **observe-only, cannot cancel** (cancelling an emergency fold would overflow the context) |
+| `on-compact` | When summarizing the middle slice during a fold. `ctx` = `{:messages}` (JSON array string) | Ignored. Use `harness/set-compact-summary` to supply a summary instead of the LLM (validated; invalid falls through) |
 
 ### Dispatch rules
 
@@ -98,6 +103,15 @@ file without imports.
 | `harness/replace-prompt` | `(text)` | Rewrites the current user message before the LLM sees it. Meaningful only in `on-prompt` |
 | `harness/request-prompt` | `(text)` | Queues a follow-up prompt to run as a fresh turn after the current one |
 | `harness/store-response` | `(text)` | Sets the `harness-response` binding so the next `on-prompt` can read the prior assistant message. The host calls this automatically after every turn; plugins normally only read `harness-response` |
+
+### System prompt, context, message & compaction control
+
+| Function | Signature | Effect |
+|----------|-----------|--------|
+| `harness/append-system-prompt` | `(text)` | Appends `text` to the assembled system prompt. Meaningful only in `before-agent-start`. Append-only — the model-identity + tool-docs preamble is preserved. Multiple calls in one hook concatenate |
+| `harness/replace-context` | `(json-array)` | Replaces the message array for the next LLM call with a parsed JSON array. Meaningful only in `transform-context`. Affects that one call; the persisted transcript is unchanged. Malformed JSON is ignored (original context kept) |
+| `harness/rewrite-message` | `(text)` | Replaces the finalized assistant text before it is stored/persisted. Meaningful only in `message-end`. The text already streamed to screen; this rewrites stored history (e.g. redaction) |
+| `harness/set-compact-summary` | `(text)` | Supplies a compaction summary used instead of the LLM summarizer. Meaningful only in `on-compact`. Validated like any summary; an invalid value falls through to the LLM |
 
 ### Tool interception
 
@@ -291,6 +305,32 @@ Janet runs on a single dedicated worker thread.
   does not.
 - `harness/block` only takes effect inside `on-tool-start`. Calling it
   from a slash command does nothing.
+
+## Divergences from pi
+
+dirge's plugin surface is modeled on pi's extension API but differs
+in a few deliberate ways (dirge-2n4r):
+
+- **Steering / follow-up are push-only.** Plugins call
+  `harness/add-steering` / `harness/add-followup` to queue messages.
+  There is no pull-style `get-steering-messages` / `get-followup-messages`
+  hook a plugin can *define* — a plugin defining those names is not
+  dispatched. Use the `harness/add-*` calls from any hook instead.
+- **`harness/register-provider` covers base-URL / type override only.**
+  Unlike pi's `registerProvider`, it does not support custom model
+  lists, OAuth flows, or custom stream handlers. It's for pointing an
+  existing provider type at a different endpoint (proxy / local LLM).
+- **Model swaps are run-boundary, not mid-run.** `harness/set-next-model`
+  takes effect on the next run (the agent is rebuilt at the run
+  boundary). A mid-run, between-turns model swap is not wired — the
+  request is applied at the next run boundary. (`harness/set-next-thinking-level`,
+  by contrast, DOES apply between turns within a run.)
+- **The plugin runtime is opt-in at build time.** It requires the
+  `plugin` Cargo feature (Janet runtime). The project `build.sh`
+  enables it by default, but a bare `cargo build` compiles the plugin
+  layer to no-op stubs — so a plugin-less build is valid and runs with
+  zero Janet dependency. If you build dirge yourself and want plugins,
+  build with `--features plugin` (or use `build.sh`).
 
 ## Reference plugins
 
