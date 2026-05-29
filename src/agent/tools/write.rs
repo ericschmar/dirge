@@ -86,17 +86,13 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        // Reject non-absolute paths immediately with a clear error.
-        // The schema says "must be absolute, not relative" — without
-        // this guard the tool silently resolves "1" to "{cwd}/1" and
+        // Reject non-absolute paths immediately with a clear error
+        // (shared guard; the schema requires an absolute path).
+        // Without it the tool silently resolves "1" to "{cwd}/1" and
         // creates the file, confusing the model into thinking it wrote
         // to a real project path.
-        if !Path::new(&args.path).is_absolute() {
-            return Err(ToolError::Msg(format!(
-                "Path '{}' is not absolute. Write takes an absolute path like '/home/user/project/file.txt', not a relative path or bare filename.",
-                args.path,
-            )));
-        }
+        crate::agent::tools::require_absolute_path(&args.path, "the write path")
+            .map_err(ToolError::Msg)?;
         // Audit H12: pin file operations to the canonical path the
         // permission check ran against, so a symlink swap can't
         // redirect the write to an unauthorized target.
@@ -280,7 +276,7 @@ mod tests {
                 .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("not absolute"),
+                msg.contains("absolute path"),
                 "path {path:?}: expected absolute-path rejection; got: {msg}",
             );
         }

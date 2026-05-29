@@ -273,19 +273,16 @@ impl Tool for ApplyPatchTool {
                 | PatchOp::Delete { path }
                 | PatchOp::Rename { path, .. } => path,
             };
-            if !std::path::Path::new(op_path).is_absolute() {
-                return Err(ToolError::Msg(format!(
-                    "apply_patch requires an absolute path, got: {}",
-                    op_path
-                )));
-            }
-            if let PatchOp::Rename { new_path, .. } = op
-                && !std::path::Path::new(new_path).is_absolute()
-            {
-                return Err(ToolError::Msg(format!(
-                    "apply_patch rename requires an absolute new_path, got: {}",
-                    new_path
-                )));
+            // Shared absolute-path guard (the schema requires absolute
+            // paths for both fields).
+            crate::agent::tools::require_absolute_path(op_path, "the apply_patch path")
+                .map_err(ToolError::Msg)?;
+            if let PatchOp::Rename { new_path, .. } = op {
+                crate::agent::tools::require_absolute_path(
+                    new_path,
+                    "the apply_patch rename target",
+                )
+                .map_err(ToolError::Msg)?;
             }
 
             // C1 (audit fix): resolve the path THROUGH the permission

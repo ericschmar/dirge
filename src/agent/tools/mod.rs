@@ -135,6 +135,26 @@ pub fn is_skip_dir(name: &str) -> bool {
     matches!(name, "node_modules" | "target")
 }
 
+/// Enforce that a tool argument is an absolute filesystem path.
+///
+/// Single source for the check + error message shared by read, write,
+/// edit, and apply_patch (dirge-e1r9). These tools all declare
+/// `dirge-hints.semantic = "absolute_path"` in their schema and used to
+/// each re-implement `Path::is_absolute()` with a slightly different
+/// error string. `subject` names the field for the message (e.g.
+/// `"read path"`, `"apply_patch rename target"`). Returns the message
+/// as a plain `String`; callers wrap it (`.map_err(ToolError::Msg)?`).
+pub fn require_absolute_path(path: &str, subject: &str) -> Result<(), String> {
+    if std::path::Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{subject} must be an absolute path like '/home/user/project/file.txt', \
+             not a relative path or bare filename — got {path:?}"
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ReadArgs {
     pub path: String,
@@ -443,6 +463,19 @@ mod tests {
             pattern: pattern.to_string(),
             effect,
             tool: None,
+        }
+    }
+
+    // dirge-e1r9: the shared absolute-path guard accepts absolute paths
+    // and rejects relative / bare ones with a single uniform message.
+    #[test]
+    fn require_absolute_path_accepts_absolute_rejects_relative() {
+        assert!(require_absolute_path("/home/user/x.rs", "read path").is_ok());
+        for bad in ["x.rs", "./x.rs", "../x.rs", "src/x.rs", "1"] {
+            let err = require_absolute_path(bad, "read path")
+                .expect_err("relative path must be rejected");
+            assert!(err.contains("absolute path"), "message: {err}");
+            assert!(err.contains(bad), "message names the offending path: {err}");
         }
     }
 
