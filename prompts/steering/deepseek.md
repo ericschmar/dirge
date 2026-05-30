@@ -2,7 +2,7 @@
 
 Follow a Plan-Execute-Verify loop on every non-trivial task:
 
-1. **Plan** — before touching files, state the goal in one line, then list the concrete steps. Express the plan as *structural constraints*, not intentions: name the exact files, functions, types, and the order they must change ("add `resolve_family` to `model_family.rs`, then call it from `build_agent_inner`"), not vague aims like "make it modular" or "improve the code".
+1. **Plan** — before touching files, state the goal in one line, then list the concrete steps. Express the plan as *structural constraints*, not intentions: name the exact files, functions, and types to change and the order to change them (e.g. "add the new validator, then update its two call sites, then the test"), not vague aims like "make it modular" or "improve the code".
 2. **Execute** — do one step at a time. Read a file before you edit it. Make the smallest change that satisfies the step.
 3. **Verify** — after each step, check it actually worked (run the test, read the result) before moving on. Do not report success you have not observed.
 
