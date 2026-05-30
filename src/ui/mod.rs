@@ -172,10 +172,20 @@ pub async fn run_interactive(
     let mut input = InputEditor::new();
     input.set_monochrome(cli.no_color);
     // Seed the editor's history from the session so Up/Down arrow
-    // navigation and Ctrl+R search work across restarts.
+    // navigation and Ctrl+F search work across restarts.
+    // Skip synthetic prompts (system-reminder wrappers, mid-turn
+    // steer wrappers, auto-continue messages) — only real user
+    // input belongs in the searchable history.
     for msg in &session.messages {
         if msg.role == MessageRole::User {
-            input.load_history_entry(&msg.content);
+            let content = strip_leading_system_reminder(&msg.content);
+            if content.is_empty()
+                || content.starts_with("[Mid-turn steer")
+                || content == "Continue based on the background task results above."
+            {
+                continue;
+            }
+            input.load_history_entry(content);
         }
     }
     let mut is_running = false;
@@ -907,6 +917,16 @@ pub async fn run_interactive(
                         }
 
                         if key.code == KeyCode::Esc && is_running {
+                            if input.is_in_search() {
+                                input.cancel_search();
+                                renderer.render_viewport()?;
+                                renderer.draw_bottom(
+                                    &input,
+                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                                    is_running,
+                                )?;
+                                continue;
+                            }
                             is_running = false;
                             if let Some(tx) = agent_cancel.take() {
                                 let _ = tx.try_send(());
@@ -964,6 +984,16 @@ pub async fn run_interactive(
                         }
 
                         if key.code == KeyCode::Esc && !is_running {
+                            if input.is_in_search() {
+                                input.cancel_search();
+                                renderer.render_viewport()?;
+                                renderer.draw_bottom(
+                                    &input,
+                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                                    is_running,
+                                )?;
+                                continue;
+                            }
                             let now = std::time::Instant::now();
                             if let Some(prev) = last_esc
                                 && now.duration_since(prev) < std::time::Duration::from_millis(1500) {
@@ -991,9 +1021,9 @@ pub async fn run_interactive(
                             last_esc = None;
                         }
 
-                        let ctrl_t = key.code == KeyCode::Char('t')
+                        let ctrl_r = key.code == KeyCode::Char('r')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_t {
+                        if ctrl_r {
                             show_reasoning = !show_reasoning;
                             renderer.write_line(
                                 &format!("reasoning visibility: {}", if show_reasoning { "on" } else { "off" }),

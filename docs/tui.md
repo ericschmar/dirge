@@ -12,7 +12,7 @@ slash-command list, see the top-level [README](../README.md#slash-commands).
 | Ctrl+A / Home | Start of line |
 | Ctrl+E / End | End of line |
 | Ctrl+B / Left | Char left |
-| Ctrl+F | Reverse-i-search through history (bash-style): type to narrow, Ctrl+F to cycle, Enter to accept, Esc to cancel |
+| Right | Char right |
 | Option+Left / Meta+B | Skip to previous word |
 | Option+Right / Meta+F | Skip to next word |
 | Ctrl+K | Kill to end of line |
@@ -24,6 +24,7 @@ slash-command list, see the top-level [README](../README.md#slash-commands).
 | Meta+Y | Yank-pop (cycle kill ring after yank) |
 | Ctrl+N / Down | History next (multi-line: next logical line, history at boundary) |
 | Ctrl+P / Up | History previous (multi-line: previous logical line, history at boundary) |
+| Ctrl+F | Reverse-i-search through history (bash-style): type to narrow, Ctrl+F to cycle, Enter to accept, Esc to cancel |
 | Shift+Enter / Meta+Enter / Ctrl+J | Insert newline (input box expands; Ctrl+J works in any terminal) |
 | Tab | Insert 2 spaces |
 | `@<query>` | File picker (Tab/Enter select, Esc cancel) |

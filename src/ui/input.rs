@@ -924,12 +924,9 @@ impl InputEditor {
                 None
             }
 
-            // Ctrl+F → right one char
+            // Ctrl+F → reverse-i-search
             KeyCode::Char('f') if ctrl => {
-                if self.cursor < self.buffer.len() {
-                    self.cursor = next_pos(&self.buffer, self.cursor);
-                }
-                self.reset_kill_accumulation();
+                self.enter_search();
                 None
             }
 
@@ -1003,12 +1000,6 @@ impl InputEditor {
             KeyCode::Char('p') if ctrl => {
                 self.history_up();
                 self.reset_kill_accumulation();
-                None
-            }
-
-            // Ctrl+R → reverse-i-search
-            KeyCode::Char('r') if ctrl => {
-                self.enter_search();
                 None
             }
 
@@ -1313,7 +1304,7 @@ impl InputEditor {
         }
     }
 
-    // ── Ctrl+R reverse-i-search ─────────────────────────────
+    // ── Ctrl+F reverse-i-search ─────────────────────────────
 
     pub fn is_in_search(&self) -> bool {
         self.search_mode
@@ -1324,6 +1315,7 @@ impl InputEditor {
         self.search_query.as_str()
     }
 
+    #[allow(dead_code)]
     pub fn search_match_text(&self) -> &str {
         match self.search_match_idx {
             Some(idx) => self.history.get(idx).map(|s| s.as_str()).unwrap_or(""),
@@ -1332,10 +1324,12 @@ impl InputEditor {
     }
 
     pub fn search_display(&self) -> (String, usize) {
-        let matched = self.search_match_text();
+        // Route through display() so paste markers are collapsed
+        // to placeholders (same as the normal editor buffer).
+        let (matched, matched_cursor) = self.display();
         let prefix = format!("(reverse-i-search)`{}': ", self.search_query);
         let full = format!("{}{}", prefix, matched);
-        (full, prefix.len() + matched.len())
+        (full, prefix.len() + matched_cursor)
     }
 
     fn enter_search(&mut self) {
@@ -1352,12 +1346,34 @@ impl InputEditor {
 
     fn search_find(&self, query: &str) -> Option<usize> {
         if query.is_empty() {
-            return Some(self.history.len().saturating_sub(1));
+            if self.history.is_empty() {
+                return None;
+            }
+            return Some(self.history.len() - 1);
         }
         let lower = query.to_lowercase();
         for (i, entry) in self.history.iter().enumerate().rev() {
             let entry_lower = entry.to_lowercase();
             if entry_lower.contains(lower.as_str()) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Narrow from the current match position backward so typing
+    /// after cycling doesn't teleport to the newest match.
+    fn search_refine(&self, query: &str) -> Option<usize> {
+        if query.is_empty() {
+            if self.history.is_empty() {
+                return None;
+            }
+            return Some(self.history.len() - 1);
+        }
+        let start = self.search_match_idx.unwrap_or(self.history.len() - 1);
+        let lower = query.to_lowercase();
+        for (i, entry) in self.history[..=start].iter().enumerate().rev() {
+            if entry.to_lowercase().contains(lower.as_str()) {
                 return Some(i);
             }
         }
@@ -1418,6 +1434,12 @@ impl InputEditor {
     }
 
     fn exit_search_accept(&mut self) {
+        if self.search_match_idx.is_none() {
+            if let Some((draft, cursor)) = self.search_draft.take() {
+                self.buffer = draft;
+                self.cursor = cursor.min(self.buffer.len());
+            }
+        }
         self.search_mode = false;
         self.search_query.clear();
         self.search_match_idx = None;
@@ -1459,7 +1481,7 @@ impl InputEditor {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
-            KeyCode::Char('r') if ctrl => {
+            KeyCode::Char('f') if ctrl => {
                 self.search_cycle_next();
                 None
             }
@@ -1482,6 +1504,7 @@ impl InputEditor {
                 if !self.search_query.is_empty() {
                     self.search_query.pop();
                 }
+                // Widening (shorter query) — find newest match.
                 if let Some(idx) = self.search_find(&self.search_query) {
                     self.search_match_idx = Some(idx);
                     self.buffer = self.history[idx].clone();
@@ -1496,7 +1519,7 @@ impl InputEditor {
 
             KeyCode::Char(c) if !ctrl => {
                 self.search_query.push(c);
-                if let Some(idx) = self.search_find(&self.search_query) {
+                if let Some(idx) = self.search_refine(&self.search_query) {
                     self.search_match_idx = Some(idx);
                     self.buffer = self.history[idx].clone();
                     self.cursor = self.buffer.len();
