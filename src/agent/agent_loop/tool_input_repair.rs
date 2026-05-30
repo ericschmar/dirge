@@ -401,10 +401,19 @@ pub fn contract_hint_for(tool_name: &str) -> Option<&'static str> {
             "CONTRACT: `path` is an absolute filesystem path, not a markdown link. \
              Pass both `offset` and `limit` together when paging, or omit both.",
         ),
-        "write" | "edit" | "apply_patch" => Some(
+        "write" => Some(
             "CONTRACT: `path` / `file_path` is an absolute filesystem path, not a \
              markdown link. `content` is a plain UTF-8 string, NOT a JSON object \
              or fenced code block.",
+        ),
+        "edit" | "apply_patch" => Some(
+            "CONTRACT: `path` / `file_path` is an absolute filesystem path, not a \
+             markdown link. `content` is a plain UTF-8 string, NOT a JSON object \
+             or fenced code block. \
+             WORKFLOW: read the file before editing it and match existing text \
+             exactly (including indentation). If a prior call failed or was \
+             denied, do NOT re-issue the same call — re-read the file and change \
+             your approach.",
         ),
         "bash" => Some(
             "CONTRACT: `command` is a literal shell command, not a JSON object. \
@@ -437,6 +446,34 @@ pub fn contract_hint_for(tool_name: &str) -> Option<&'static str> {
 mod phase2_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn edit_tools_carry_behavioral_workflow_rule() {
+        // Argument-shape contracts already exist; the gap is the
+        // behavioral rule that targets DeepSeek's #1 failure mode
+        // (re-issuing a failed call). Dual-encode it at the action
+        // boundary, in the tool description itself.
+        for tool in ["edit", "apply_patch"] {
+            let hint = contract_hint_for(tool).unwrap_or_else(|| panic!("{tool} has no hint"));
+            let lower = hint.to_lowercase();
+            assert!(
+                lower.contains("read the file"),
+                "{tool} hint should carry read-before-edit: {hint}"
+            );
+            assert!(
+                lower.contains("re-issue"),
+                "{tool} hint should carry the no-repeat rule: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_hint_has_no_read_before_edit_rule() {
+        // `write` creates/overwrites whole files — read-before-edit
+        // doesn't apply, so it keeps only the arg-shape contract.
+        let hint = contract_hint_for("write").unwrap();
+        assert!(!hint.to_lowercase().contains("read the file"));
+    }
 
     #[test]
     fn relational_defaults_fills_missing_offset() {
