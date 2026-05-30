@@ -16,7 +16,7 @@ mod tests;
 use std::collections::HashMap;
 
 use worker::Worker;
-pub use worker::{DialogReply, DialogRequest};
+pub use worker::{DialogReply, DialogRequest, LspRequest};
 
 #[cfg(feature = "plugin")]
 pub mod extension;
@@ -53,6 +53,25 @@ pub fn spawn_headless_dialog_responder(
                     let _ = reply.send(DialogReply::Select(picked));
                 }
             }
+        }
+    })
+}
+
+/// Drain `harness/lsp` requests from the plugin worker and answer them
+/// against the `LspManager`. Each request carries a JSON query and a
+/// one-shot reply channel back to the (blocked) worker thread; we run the
+/// async LSP query and send the JSON result. Runs until the channel
+/// closes (worker shutdown). Spawned once at startup when both the
+/// `plugin` and `lsp` features are active and a manager exists.
+#[cfg(all(feature = "plugin", feature = "lsp"))]
+pub fn spawn_lsp_responder(
+    mut lsp_rx: tokio::sync::mpsc::UnboundedReceiver<LspRequest>,
+    manager: std::sync::Arc<crate::lsp::manager::LspManager>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(req) = lsp_rx.recv().await {
+            let json = crate::lsp::harness::run_query(&manager, &req.request).await;
+            let _ = req.reply.send(json);
         }
     })
 }
@@ -161,6 +180,13 @@ pub struct PluginManager {
     /// `take_dialog_rx` on first call so the UI can register it in its
     /// `tokio::select!`. After that, the field is `None`.
     dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DialogRequest>>,
+    /// One-shot consumer end of the LSP-request channel (the
+    /// `harness/lsp` bridge). Taken by `take_lsp_rx` so the host spawns a
+    /// drainer that owns the `LspManager`. `None` after the first take.
+    /// Only consumed when the `lsp` feature is also on; held regardless so
+    /// the worker handshake stays uniform.
+    #[cfg_attr(not(feature = "lsp"), allow(dead_code))]
+    lsp_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LspRequest>>,
 }
 
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
@@ -169,11 +195,12 @@ impl PluginManager {
     /// harness API. Returns Err if Janet VM init fails so the host can
     /// fall back to a no-plugin path rather than panicking.
     pub fn try_new() -> Result<Self, String> {
-        let (worker, dialog_rx) = Worker::try_spawn()?;
+        let (worker, dialog_rx, lsp_rx) = Worker::try_spawn()?;
         Ok(PluginManager {
             hooks: HashMap::new(),
             worker,
             dialog_rx: Some(dialog_rx),
+            lsp_rx: Some(lsp_rx),
         })
     }
 
@@ -184,6 +211,15 @@ impl PluginManager {
         &mut self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<DialogRequest>> {
         self.dialog_rx.take()
+    }
+
+    /// Consume the LSP-request consumer end so the host can spawn a drainer
+    /// that owns the `LspManager` and answers `harness/lsp` queries. Only
+    /// succeeds once (single owner). Only called when the `lsp` feature is
+    /// also on; held regardless to keep the worker handshake uniform.
+    #[cfg_attr(not(feature = "lsp"), allow(dead_code))]
+    pub fn take_lsp_rx(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<LspRequest>> {
+        self.lsp_rx.take()
     }
 
     pub fn load_file(&mut self, path: &std::path::Path) -> Result<(), String> {

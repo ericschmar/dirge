@@ -770,6 +770,23 @@ async fn main() -> anyhow::Result<()> {
     // (the checker is built inside `build_channels`).
     crate::permission::apply_prompt_deny(&permission, &context.current_prompt_deny_tools);
 
+    // Spawn the LSP responder for plugins: drains `harness/lsp` requests
+    // from the worker thread and answers them against the LspManager.
+    // Unlike dialogs this needs no UI, so it runs in every mode
+    // (interactive, --print, --loop). Lives until the worker shuts down
+    // and closes the channel. Held in `_lsp_responder` so the JoinHandle
+    // isn't dropped (which would abort the task).
+    #[cfg(all(feature = "plugin", feature = "lsp"))]
+    let _lsp_responder: Option<tokio::task::JoinHandle<()>> = {
+        let lsp_rx = plugin_manager
+            .as_ref()
+            .and_then(|pm| pm.lock().unwrap_or_else(|e| e.into_inner()).take_lsp_rx());
+        match (lsp_rx, lsp_manager.clone()) {
+            (Some(rx), Some(mgr)) => Some(plugin::spawn_lsp_responder(rx, mgr)),
+            _ => None,
+        }
+    };
+
     let completion_model = client.completion_model(model.to_string());
 
     if cli.print {

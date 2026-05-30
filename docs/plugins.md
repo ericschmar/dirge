@@ -223,6 +223,39 @@ hook or command.
 | `harness/confirm` | `(title question)` | Returns `true` on confirm, `false` on Cancel/Esc |
 | `harness/select` | `(title options)` | Shows a picker; returns the chosen string or `nil` on cancel |
 
+### Language servers (LSP)
+
+Query the running language servers from a plugin. Like dialogs these
+block the Janet worker until the async query returns, so they are safe to
+call from any hook or command. They are only available when dirge is
+built with the `lsp` feature; feature-detect with `(harness/lsp?)` and
+fall back gracefully — every function returns `nil` when LSP is off.
+
+Positions are **1-based** line/column (matching the `lsp` tool and most
+editors). The result is a **JSON string** of the underlying LSP response
+(parse with `(json/decode result)`); errors come back as
+`{"error": "..."}` rather than raising.
+
+| Function | Signature | Effect |
+|----------|-----------|--------|
+| `harness/lsp?` | `()` | `true` when the LSP bridge is built in, else `false` |
+| `harness/lsp` | `(op file &opt line char query)` | Generic query. `op` ∈ `"definition"`, `"references"`, `"hover"`, `"documentSymbol"`, `"workspaceSymbol"`, `"implementation"`, `"incomingCalls"`, `"outgoingCalls"`, `"diagnostics"`. Returns a JSON string or `nil` |
+| `harness/lsp-definition` | `(file line char)` | Go-to-definition at the position |
+| `harness/lsp-references` | `(file line char)` | All references to the symbol at the position |
+| `harness/lsp-hover` | `(file line char)` | Hover (type/doc) for the symbol |
+| `harness/lsp-implementation` | `(file line char)` | Implementations of the symbol |
+| `harness/lsp-incoming-calls` | `(file line char)` | Call-hierarchy callers of the symbol |
+| `harness/lsp-outgoing-calls` | `(file line char)` | Call-hierarchy callees of the symbol |
+| `harness/lsp-document-symbols` | `(file)` | Symbol outline for the whole file |
+| `harness/lsp-workspace-symbols` | `(file query)` | Workspace symbol search (`file` anchors the server set) |
+| `harness/lsp-diagnostics` | `(file)` | Currently published diagnostics for the file (does not wait for fresh ones) |
+
+```janet
+(when (harness/lsp?)
+  (def defs (json/decode (harness/lsp-definition "src/main.rs" 42 7)))
+  (harness/notify (string "definition sites: " (length defs))))
+```
+
 ### Custom LLM providers
 
 | Function | Signature | Effect |

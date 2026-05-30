@@ -2,6 +2,8 @@
 
 pub mod client;
 pub mod diagnostic;
+#[cfg(feature = "plugin")]
+pub mod harness;
 pub mod init;
 pub mod jsonrpc;
 pub mod language;

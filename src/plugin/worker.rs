@@ -584,6 +584,64 @@ const HARNESS_DIALOG_INIT: &str = r#"
     (harness/__select title opts)))
 "#;
 
+/// Janet wrappers for the LSP bridge. Installed after the C function is
+/// (conditionally) registered. Every wrapper guards on the presence of
+/// `harness/__lsp` so that on a build without the `lsp` feature the
+/// functions exist but return `nil` instead of erroring — plugins can
+/// feature-detect with `(harness/lsp? )`.
+///
+/// `harness/lsp` returns a JSON string (the LSP result) or nil. The
+/// typed wrappers fill in the operation name. Positions are 1-based
+/// line/column to match the `lsp` tool.
+#[cfg(feature = "plugin")]
+const HARNESS_LSP_INIT: &str = r#"
+(defn harness/lsp?
+  "True when the LSP bridge is available (the `lsp` feature is built in)."
+  []
+  (truthy? (get (curenv) 'harness/__lsp)))
+
+(defn harness/lsp
+  "Query the language servers. `op` is one of definition, references,
+   hover, documentSymbol, workspaceSymbol, implementation,
+   incomingCalls, outgoingCalls, diagnostics. Returns a JSON string of
+   the result, or nil when LSP is unavailable. line/char are 1-based;
+   query is the search string for workspaceSymbol."
+  [op file &opt line char query]
+  (if (harness/lsp?)
+    (harness/__lsp (string op) (string file)
+                   (if line line 1) (if char char 1)
+                   (if query (string query) ""))
+    nil))
+
+(defn harness/lsp-definition [file line char] (harness/lsp "definition" file line char))
+(defn harness/lsp-references [file line char] (harness/lsp "references" file line char))
+(defn harness/lsp-hover [file line char] (harness/lsp "hover" file line char))
+(defn harness/lsp-implementation [file line char] (harness/lsp "implementation" file line char))
+(defn harness/lsp-incoming-calls [file line char] (harness/lsp "incomingCalls" file line char))
+(defn harness/lsp-outgoing-calls [file line char] (harness/lsp "outgoingCalls" file line char))
+(defn harness/lsp-document-symbols [file] (harness/lsp "documentSymbol" file))
+(defn harness/lsp-workspace-symbols [file query] (harness/lsp "workspaceSymbol" file 1 1 query))
+(defn harness/lsp-diagnostics [file] (harness/lsp "diagnostics" file))
+"#;
+
+/// A plugin LSP query, forwarded from the worker thread to the tokio-side
+/// drainer (which owns the `LspManager`). `request` is a JSON object
+/// `{op, file, line, char, query}`; the drainer runs the query and sends
+/// the JSON-encoded result back on `reply`. Mirrors the dialog bridge so
+/// a synchronous Janet `(harness/lsp …)` call can drive async LSP work.
+/// Referenced unconditionally by the UI channel signature (like
+/// `DialogRequest`), so the type isn't feature-gated.
+#[derive(Debug)]
+// The fields are only produced (worker `send_lsp`) and consumed
+// (`lsp::harness::run_query`) when BOTH `plugin` and `lsp` are on; the
+// type itself stays in the channel signature regardless, like
+// `DialogRequest`.
+#[cfg_attr(not(all(feature = "plugin", feature = "lsp")), allow(dead_code))]
+pub struct LspRequest {
+    pub request: String,
+    pub reply: mpsc::Sender<String>,
+}
+
 /// What the UI is being asked to render. Carries a one-shot reply
 /// channel back so the worker can resume once the user answers.
 ///
@@ -620,6 +678,10 @@ thread_local! {
     /// dialog requests to the UI. `RefCell<Option<...>>` so we can
     /// install at startup and tests can clear/set.
     static DIALOG_TX: RefCell<Option<tmpsc::UnboundedSender<DialogRequest>>> = const { RefCell::new(None) };
+
+    /// Set once at worker init (mirrors `DIALOG_TX`). The `harness/__lsp`
+    /// C-function reads this to forward LSP queries to the tokio drainer.
+    static LSP_TX: RefCell<Option<tmpsc::UnboundedSender<LspRequest>>> = const { RefCell::new(None) };
 
     /// Shared with the Worker handle. The cfns poll this every
     /// `DIALOG_POLL` while blocked on a dialog reply so that
@@ -662,16 +724,25 @@ impl Worker {
     /// the UI loop should drain. It's only returned once because we want
     /// a single owner.
     #[cfg(feature = "plugin")]
-    pub fn try_spawn() -> Result<(Self, tmpsc::UnboundedReceiver<DialogRequest>), String> {
+    #[allow(clippy::type_complexity)]
+    pub fn try_spawn() -> Result<
+        (
+            Self,
+            tmpsc::UnboundedReceiver<DialogRequest>,
+            tmpsc::UnboundedReceiver<LspRequest>,
+        ),
+        String,
+    > {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (dialog_tx, dialog_rx) = tmpsc::unbounded_channel::<DialogRequest>();
+        let (lsp_tx, lsp_rx) = tmpsc::unbounded_channel::<LspRequest>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
         let join = thread::Builder::new()
             .name("dirge-janet".to_string())
-            .spawn(move || worker_loop(cmd_rx, dialog_tx, init_tx, shutdown_clone))
+            .spawn(move || worker_loop(cmd_rx, dialog_tx, lsp_tx, init_tx, shutdown_clone))
             .map_err(|e| format!("spawn janet worker: {e}"))?;
 
         // Block (with a watchdog timeout) until worker confirms init.
@@ -685,6 +756,7 @@ impl Worker {
                     shutdown,
                 },
                 dialog_rx,
+                lsp_rx,
             )),
             Ok(Err(e)) => Err(e),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -697,11 +769,20 @@ impl Worker {
     }
 
     #[cfg(not(feature = "plugin"))]
-    pub fn try_spawn() -> Result<(Self, tmpsc::UnboundedReceiver<DialogRequest>), String> {
+    #[allow(clippy::type_complexity)]
+    pub fn try_spawn() -> Result<
+        (
+            Self,
+            tmpsc::UnboundedReceiver<DialogRequest>,
+            tmpsc::UnboundedReceiver<LspRequest>,
+        ),
+        String,
+    > {
         // No-op worker for non-plugin builds. cmd_rx is dropped immediately
         // when the thread exits; cmd_tx writes will Err out cleanly.
         let (cmd_tx, _cmd_rx) = mpsc::channel::<Cmd>();
         let (_dialog_tx, dialog_rx) = tmpsc::unbounded_channel::<DialogRequest>();
+        let (_lsp_tx, lsp_rx) = tmpsc::unbounded_channel::<LspRequest>();
         Ok((
             Self {
                 cmd_tx,
@@ -709,6 +790,7 @@ impl Worker {
                 shutdown: Arc::new(AtomicBool::new(false)),
             },
             dialog_rx,
+            lsp_rx,
         ))
     }
 
@@ -803,6 +885,7 @@ impl Drop for Worker {
 fn worker_loop(
     rx: mpsc::Receiver<Cmd>,
     dialog_tx: tmpsc::UnboundedSender<DialogRequest>,
+    lsp_tx: tmpsc::UnboundedSender<LspRequest>,
     init_tx: mpsc::Sender<Result<(), String>>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -810,6 +893,7 @@ fn worker_loop(
     // before we run any plugin code, otherwise harness/confirm/select
     // would no-op and shutdown couldn't cancel an in-flight dialog.
     DIALOG_TX.with(|cell| *cell.borrow_mut() = Some(dialog_tx));
+    LSP_TX.with(|cell| *cell.borrow_mut() = Some(lsp_tx));
     SHUTDOWN.with(|cell| *cell.borrow_mut() = Some(shutdown));
 
     let mut client = match JanetClient::init_with_default_env() {
@@ -829,6 +913,11 @@ fn worker_loop(
     if let Some(env) = client.env_mut() {
         env.add_c_fn(CFunOptions::new(c"__confirm", janet_confirm_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__select", janet_select_cfn).namespace(c"harness"));
+        // Only register the LSP bridge when the lsp feature is compiled
+        // in. The Janet `harness/lsp` wrappers (HARNESS_LSP_INIT) guard on
+        // this symbol's existence and degrade to nil when it's absent.
+        #[cfg(feature = "lsp")]
+        env.add_c_fn(CFunOptions::new(c"__lsp", janet_lsp_cfn).namespace(c"harness"));
     }
 
     if let Err(e) = client.run(HARNESS_INIT) {
@@ -837,6 +926,10 @@ fn worker_loop(
     }
     if let Err(e) = client.run(HARNESS_DIALOG_INIT) {
         let _ = init_tx.send(Err(format!("harness dialog init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_LSP_INIT) {
+        let _ = init_tx.send(Err(format!("harness lsp init failed: {e}")));
         return;
     }
 
@@ -861,6 +954,7 @@ fn worker_loop(
 fn worker_loop(
     _rx: mpsc::Receiver<Cmd>,
     _dialog_tx: tmpsc::UnboundedSender<DialogRequest>,
+    _lsp_tx: tmpsc::UnboundedSender<LspRequest>,
     _init_tx: mpsc::Sender<Result<(), String>>,
     _shutdown: Arc<AtomicBool>,
 ) {
@@ -1147,20 +1241,132 @@ unsafe fn wrap_string(s: &str) -> janetrs::lowlevel::Janet {
     unsafe { janet_wrap_string(raw) }
 }
 
+/// Read a Janet number at argv[i] as a u32 (clamped at 0). Returns None
+/// for non-number args. Used for the LSP line/char position arguments.
+#[cfg(all(feature = "plugin", feature = "lsp"))]
+unsafe fn read_uint_arg(argv: *mut janetrs::lowlevel::Janet, i: i32) -> Option<u32> {
+    use janetrs::lowlevel::*;
+    let v = unsafe { *argv.offset(i as isize) };
+    if unsafe { janet_checktype(v, JanetType_JANET_NUMBER) } == 0 {
+        return None;
+    }
+    let n = unsafe { janet_unwrap_number(v) };
+    if n.is_finite() && n >= 0.0 {
+        Some(n as u32)
+    } else {
+        Some(0)
+    }
+}
+
+/// C-function backing `harness/__lsp`. Reads (op, file, line, char,
+/// query), forwards a JSON request to the tokio drainer via `LSP_TX`,
+/// blocks on the reply (polling the shutdown flag like the dialog cfns),
+/// and returns the JSON result string. Panics are caught at the FFI
+/// boundary and collapse to nil.
+#[cfg(all(feature = "plugin", feature = "lsp"))]
+unsafe extern "C-unwind" fn janet_lsp_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        lsp_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/lsp",
+                panic = %msg,
+                "FFI panic in lsp cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+#[cfg(all(feature = "plugin", feature = "lsp"))]
+unsafe fn lsp_body(argc: i32, argv: *mut janetrs::lowlevel::Janet) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 5 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let op = match unsafe { read_string_arg(argv, 0) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    let file = match unsafe { read_string_arg(argv, 1) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    let line = unsafe { read_uint_arg(argv, 2) }.unwrap_or(1);
+    let character = unsafe { read_uint_arg(argv, 3) }.unwrap_or(1);
+    let query = unsafe { read_string_arg(argv, 4) }.unwrap_or_default();
+
+    let request = serde_json::json!({
+        "op": op,
+        "file": file,
+        "line": line,
+        "char": character,
+        "query": query,
+    })
+    .to_string();
+
+    let answer = LSP_TX.with(|cell| match cell.borrow().as_ref() {
+        Some(tx) => send_lsp(tx, request),
+        None => None,
+    });
+    match answer {
+        Some(json) => unsafe { wrap_string(&json) },
+        None => unsafe { janet_wrap_nil() },
+    }
+}
+
+/// Send an LSP request and block on the JSON reply, polling the shutdown
+/// flag so `Worker::Drop` can unblock us (mirrors `send_dialog`).
+#[cfg(all(feature = "plugin", feature = "lsp"))]
+fn send_lsp(tx: &tmpsc::UnboundedSender<LspRequest>, request: String) -> Option<String> {
+    let (reply_tx, reply_rx) = mpsc::channel::<String>();
+    tx.send(LspRequest {
+        request,
+        reply: reply_tx,
+    })
+    .ok()?;
+    loop {
+        match reply_rx.recv_timeout(DIALOG_POLL) {
+            Ok(r) => return Some(r),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let shutting_down = SHUTDOWN.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|f| f.load(Ordering::SeqCst))
+                        .unwrap_or(false)
+                });
+                if shutting_down {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(all(test, feature = "plugin"))]
 mod tests {
     use super::*;
 
     #[test]
     fn worker_round_trips_an_eval() {
-        let (mut worker, _dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let r = worker.eval("(+ 1 2)").unwrap();
         assert_eq!(r, "3");
     }
 
     #[test]
     fn worker_surfaces_janet_errors_as_err() {
-        let (mut worker, _dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         // `undefined-fn` is genuinely unknown.
         let r = worker.eval("(undefined-fn 1)");
         assert!(r.is_err(), "expected Err, got {r:?}");
@@ -1168,7 +1374,7 @@ mod tests {
 
     #[test]
     fn worker_eval_returns_keyword_string() {
-        let (mut worker, _dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         // Verify the worker installed the harness defs.
         let r = worker
             .eval("(harness/has-symbol? \"harness/notify\")")
@@ -1176,9 +1382,36 @@ mod tests {
         assert_eq!(r, "true");
     }
 
+    #[cfg(feature = "lsp")]
+    #[test]
+    fn lsp_harness_is_available_and_wrappers_are_defined() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        // With the lsp feature the `__lsp` C-function is registered, so
+        // the predicate reports the bridge as available.
+        assert_eq!(worker.eval("(harness/lsp?)").unwrap(), "true");
+        // The core fn and every typed wrapper are installed.
+        for sym in [
+            "harness/lsp",
+            "harness/lsp-definition",
+            "harness/lsp-references",
+            "harness/lsp-hover",
+            "harness/lsp-implementation",
+            "harness/lsp-incoming-calls",
+            "harness/lsp-outgoing-calls",
+            "harness/lsp-document-symbols",
+            "harness/lsp-workspace-symbols",
+            "harness/lsp-diagnostics",
+        ] {
+            let r = worker
+                .eval(&format!("(harness/has-symbol? \"{sym}\")"))
+                .unwrap();
+            assert_eq!(r, "true", "{sym} should be defined");
+        }
+    }
+
     #[test]
     fn confirm_sends_a_dialog_request_with_title_and_question() {
-        let (mut worker, dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
 
         // Start a helper thread that auto-answers any confirm with `true`.
         let mut dialog_rx = dialog_rx;
@@ -1205,7 +1438,7 @@ mod tests {
 
     #[test]
     fn confirm_returns_false_when_dialog_replies_false() {
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Confirm { reply, .. }) => {
                 let _ = reply.send(DialogReply::Confirm(false));
@@ -1219,7 +1452,7 @@ mod tests {
 
     #[test]
     fn select_returns_picked_option_as_string() {
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Select {
                 title,
@@ -1242,7 +1475,7 @@ mod tests {
 
     #[test]
     fn select_returns_nil_on_cancel() {
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Select { reply, .. }) => {
                 let _ = reply.send(DialogReply::Select(None));
@@ -1257,7 +1490,7 @@ mod tests {
     #[test]
     fn dialog_rx_drains_when_no_request_pending() {
         // Sanity: a fresh worker doesn't emit phantom dialog requests.
-        let (_worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (_worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         assert!(matches!(
             dialog_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1278,7 +1511,7 @@ mod tests {
     fn shutdown_flag_aborts_in_flight_dialog() {
         use std::time::Instant;
 
-        let (worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let shutdown_handle = worker.shutdown.clone();
 
         // Kick off a confirm; it will block waiting for a reply we
@@ -1324,7 +1557,7 @@ mod tests {
         // Just verify Janet round-trips the empty string through
         // confirm's reply path. Catches any wrap_string regression
         // that miscounts zero-length input.
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Select { reply, .. }) => {
                 let _ = reply.send(DialogReply::Select(Some(String::new())));
@@ -1350,7 +1583,7 @@ mod tests {
     /// keywords this test fails.
     #[test]
     fn confirm_accepts_keyword_title() {
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Confirm {
                 title,
@@ -1377,7 +1610,7 @@ mod tests {
     /// we hit the cfn via __select directly.
     #[test]
     fn select_with_empty_options_returns_nil() {
-        let (mut worker, _dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         // Empty array should never even emit a dialog request.
         let r = worker.eval(r#"(harness/__select "pick" [])"#).unwrap();
         assert_eq!(r, "nil");
@@ -1388,7 +1621,7 @@ mod tests {
     /// `'("a")` produce tuples. Both should be accepted.
     #[test]
     fn select_accepts_tuple_options() {
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Select { options, reply, .. }) => {
                 assert_eq!(options, vec!["alpha".to_string(), "beta".to_string()]);
@@ -1409,7 +1642,7 @@ mod tests {
     /// would either truncate emoji or read past the slice.
     #[test]
     fn select_returns_multibyte_option_through_wrap_string() {
-        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Select { reply, .. }) => {
                 // Emoji + CJK + Cyrillic — all multibyte UTF-8.
