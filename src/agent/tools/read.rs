@@ -154,9 +154,10 @@ impl Tool for ReadTool {
                         "dirge-hints": {"semantic": "absolute_path"}
                     },
                     "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+                    "limit": { "type": "integer", "description": "Maximum number of lines to read" },
+                    "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted — don't read files for general orientation." }
                 },
-                "required": ["path"],
+                "required": ["path", "reason"],
                 // Phase-2: when `limit` is given but `offset` is
                 // not (or vice versa), the harness auto-fills the
                 // missing one with `offset = 0` and prepends a
@@ -228,6 +229,9 @@ impl Tool for ReadTool {
         if let Some(ref cache) = self.cache
             && let Some(cached) = cache.get(&cache_key)
         {
+            // A cache hit means the model has already seen this file's content
+            // this session — keep the read-before-edit gate satisfied.
+            cache.mark_read(std::path::Path::new(&resolved_path));
             return Ok(cached);
         }
 
@@ -392,6 +396,9 @@ impl Tool for ReadTool {
 
         if let Some(ref cache) = self.cache {
             cache.set(&cache_key, info.clone());
+            // Satisfy the read-before-edit gate (vix session_read_gate): the
+            // model has now seen the on-disk content.
+            cache.mark_read(std::path::Path::new(&resolved_path));
         }
 
         // Fire-and-forget LSP warmup so the server already has the file
