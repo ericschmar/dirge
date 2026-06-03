@@ -6,7 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-03
+
 ### Added
+- **Debug Adapter Protocol (DAP) integration**: step-through debugging
+  alongside the existing LSP client, hardened against the usual adapter
+  failure modes (UB, hangs, panics).
+- **Configurable terminal background**: themes can set a `background` color,
+  and the built-in phosphor theme defaults to a soft charcoal `#222222`. The
+  plain theme keeps the terminal's own background (`Reset`).
+- **Snap-to-bottom on input**: typing in the prompt or pressing Down on a
+  scrolled-up chat jumps straight back to the latest output instead of
+  requiring a manual scroll.
 - **Phased plan workflow** (`/plan <request>`, opt-in via
   `phased_workflow_enabled`): an explicit per-task command that runs
   explore → plan → implement → reviewer-runs-code loop. The explore and
@@ -31,6 +42,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Config keys `phased_workflow_enabled`, `phased_workflow_max_review_cycles`,
   and documentation for the pre-existing `dynamic_tool_search` and
   `context_depth_reminder_threshold` keys.
+
+### Fixed
+- **/plan busy indicator**: `/plan` now shows the standard busy state and
+  clears the submitted text from the input box while the explore/plan forks
+  run (previously it looked idle with the command still lingering), and the
+  busy flag can no longer be stranded "running" by a failed repaint.
+- **Resize scroll clamp**: enlarging the terminal while scrolled up no longer
+  leaves a stale scroll offset that hid the newest output behind blank rows.
+- **Idle Ctrl+C** now clears a typed-but-unsent draft instead of quitting
+  outright; only an empty input line exits.
+- **Home/End** moved to **Ctrl+Home/End** for chat scroll, freeing bare
+  Home/End for the input editor's line-start/line-end as documented.
+- Ctrl+J inside reverse-i-search no longer desyncs the search buffer.
 
 ### Acknowledgements
 - Added [vix](https://github.com/kirby88/vix) — the battle-tested Go coding
