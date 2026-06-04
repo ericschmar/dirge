@@ -1273,6 +1273,11 @@ async fn main() -> anyhow::Result<()> {
         if let Some(mgr) = lsp_manager_for_shutdown.as_ref() {
             mgr.close_all_files().await;
         }
+        // dirge-ixcw: tear down any active DAP session — DAP_MANAGER is a
+        // `static` whose Drop never runs at exit, so without this an
+        // adapter + debuggee can be orphaned in their own process group.
+        #[cfg(feature = "dap")]
+        crate::dap::session::shutdown_active_session().await;
         // dirge-x949: MCP shutdown moved INTO run_interactive — for the
         // interactive path the connected manager is now owned there
         // (delivered by the background loader), so it shuts the servers

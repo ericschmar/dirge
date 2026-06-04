@@ -965,6 +965,20 @@ impl DapSessionManager {
     }
 }
 
+/// Best-effort teardown of the active DAP session at process exit
+/// (dirge-ixcw). [`DAP_MANAGER`] is a `static`, so its `Drop` never runs
+/// on a normal exit — without an explicit call here a `setsid()`-isolated
+/// adapter + debuggee in their own process group could be orphaned. Mirrors
+/// the LSP `close_all_files` shutdown step. Force-terminates (the manager's
+/// `terminate_active` already attempts a 2s graceful disconnect, then drops
+/// to `kill_on_drop`) rather than blocking the exit on a slow adapter.
+pub async fn shutdown_active_session() {
+    let mgr = DAP_MANAGER.lock().ok().and_then(|guard| guard.clone());
+    if let Some(mgr) = mgr {
+        mgr.terminate_active().await;
+    }
+}
+
 impl Default for DapSessionManager {
     fn default() -> Self {
         Self::new()
