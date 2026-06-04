@@ -54,7 +54,11 @@ use types::{AccessRequest, Decision, Effect, Operation, Resource, TraceEntry};
 fn accept_eligible(op: Operation, resource: &Resource) -> bool {
     let high_risk = matches!(
         op,
-        Operation::Execute | Operation::Mcp | Operation::Network | Operation::Agent
+        Operation::Execute
+            | Operation::Mcp
+            | Operation::Network
+            | Operation::Agent
+            | Operation::Plugin
     );
     let external_path = matches!(
         resource,

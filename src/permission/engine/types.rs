@@ -43,7 +43,13 @@ pub enum Operation {
     /// Internal tools with no external effect (write_todo_list,
     /// task_status, question) — builtin-allowed.
     Meta,
-    /// Uncategorized / plugin tools. Not builtin-allowed; falls to the
+    /// Janet plugin-registered tool invocation. High-risk — a plugin
+    /// handler can run arbitrary file/network/shell code, so it is
+    /// never builtin-allowed and NOT coerced by Accept mode (it
+    /// confirms like `bash`/`task`/MCP). Falls to configured rules,
+    /// `deny_tools`, the session allowlist, or the default (Ask).
+    Plugin,
+    /// Uncategorized tools. Not builtin-allowed; falls to the
     /// configured rules or the default (Ask), and IS Accept-coercible.
     Other,
 }
@@ -60,6 +66,7 @@ impl Operation {
                 | Operation::Network
                 | Operation::Mcp
                 | Operation::Agent
+                | Operation::Plugin
         )
     }
 }

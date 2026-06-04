@@ -28,6 +28,9 @@ use serde_json::Value;
 use crate::agent::agent_loop::result::LoopToolResult;
 use crate::agent::agent_loop::tool::{AbortSignal, LoopTool, LoopToolUpdate};
 use crate::agent::agent_loop::types::ToolExecutionMode;
+use crate::agent::tools::{Scope, enforce};
+use crate::permission::ask::AskSender;
+use crate::permission::checker::PermCheck;
 
 use super::{PluginManager, PluginShortcutMeta, PluginToolMeta};
 
@@ -259,6 +262,13 @@ pub struct JanetLoopTool {
     /// (pi parity — `prepareArguments?` at extensions/types.ts:443).
     prepare_handler: Option<String>,
     pm: Arc<Mutex<PluginManager>>,
+    /// Permission checker + ask channel, threaded in so the plugin
+    /// tool routes through the SAME authorization chokepoint as every
+    /// built-in tool (dirge-rfix). `None` only when no checker is
+    /// installed (ACP / `--no-tools`), matching the built-in tools'
+    /// pass-through contract.
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
 }
 
 impl std::fmt::Debug for JanetLoopTool {
@@ -280,7 +290,12 @@ impl JanetLoopTool {
     /// `meta.parameters` isn't valid JSON — plugin authors who hand
     /// us a syntactically broken schema get a clear "tool dropped"
     /// rather than the LLM seeing a corrupt parameters object.
-    pub fn from_meta(meta: PluginToolMeta, pm: Arc<Mutex<PluginManager>>) -> Option<Self> {
+    pub fn from_meta(
+        meta: PluginToolMeta,
+        pm: Arc<Mutex<PluginManager>>,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+    ) -> Option<Self> {
         let parameters: Value = serde_json::from_str(&meta.parameters)
             .ok()
             .unwrap_or_else(|| {
@@ -306,6 +321,8 @@ impl JanetLoopTool {
             execution_mode,
             prepare_handler: meta.prepare_handler,
             pm,
+            permission,
+            ask_tx,
         })
     }
 }
@@ -389,6 +406,9 @@ impl LoopTool for JanetLoopTool {
         let pm = self.pm.clone();
         let handler = self.handler.clone();
         let tool_call_id_owned = tool_call_id.to_string();
+        let name = self.name.clone();
+        let permission = self.permission.clone();
+        let ask_tx = self.ask_tx.clone();
         Box::pin(async move {
             // Cancellation pre-flight. The dispatcher (tools.rs)
             // races this whole future against `wait_for_cancel` so
@@ -402,6 +422,37 @@ impl LoopTool for JanetLoopTool {
             if signal.is_cancelled() {
                 return Err("plugin tool aborted before execution".to_string());
             }
+
+            // dirge-rfix: PERMISSION GATE. A Janet handler can run
+            // arbitrary file/network/shell code, so the call MUST be
+            // authorized before any side effect — exactly like every
+            // built-in tool. Two checks, mirroring the MCP adapter:
+            //   1. `deny_tools` probe by the CONCRETE plugin name (and
+            //      the `plugin_tool` umbrella) — the engine's
+            //      PromptDenyPolicy keys on the tool string we pass to
+            //      `enforce` (`plugin_tool`), so a `deny_tools: [my-tool]`
+            //      entry would otherwise never match. Probe explicitly.
+            //   2. `enforce` under the `plugin_tool` umbrella → maps to
+            //      `Operation::Plugin` (high-risk: not builtin-allowed,
+            //      not Accept-coerced; Ask by default, Allow under Yolo,
+            //      Deny under a matching rule). The plugin tool name is
+            //      the scope text, so `/allow plugin_tool <name>` and
+            //      rules can target it precisely.
+            if let Some(perm) = permission.as_ref() {
+                let denied = {
+                    let guard = perm.lock_ignore_poison();
+                    guard.any_prompt_denied(&[name.as_str(), "plugin_tool"])
+                };
+                if denied {
+                    return Err(format!(
+                        "Plugin tool `{name}` is denied by the active prompt's `deny_tools` \
+                         frontmatter. Switch with `/prompt <other>` to use it."
+                    ));
+                }
+            }
+            enforce(&permission, &ask_tx, "plugin_tool", Scope::Raw(&name))
+                .await
+                .map_err(|e| e.to_string())?;
             let signal_in = signal.clone();
             let pm_for_blocking = pm.clone();
             let tcid_for_blocking = tool_call_id_owned.clone();
@@ -489,8 +540,9 @@ mod tests {
 
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
         assert_eq!(metas.len(), 1);
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone())
-            .expect("from_meta must succeed for valid schema");
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .expect("from_meta must succeed for valid schema");
 
         assert_eq!(tool.name(), "my-tool");
         assert_eq!(tool.label(), "MyTool");
@@ -528,8 +580,111 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
         assert_eq!(tool.execution_mode(), Some(ToolExecutionMode::Sequential));
+    }
+
+    // --- dirge-rfix: plugin tools route through the permission engine ---
+
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{PermissionConfig, SecurityMode};
+
+    /// Build a single-tool `JanetLoopTool` whose handler writes a
+    /// marker file when it runs, plus a `PermCheck` in `mode`. The
+    /// marker lets a test assert the handler did NOT execute when the
+    /// permission gate refuses.
+    fn tool_with_perm(
+        mode: SecurityMode,
+        deny: &[&str],
+    ) -> (JanetLoopTool, Arc<Mutex<PluginManager>>) {
+        let pm = {
+            let mut mgr = PluginManager::try_new().unwrap();
+            mgr.eval(
+                r#"(defn my-handler [args] (string "ran:" args))
+                   (harness/register-tool "my-tool" "Echo" "MyTool" "{}" "my-handler")"#,
+            )
+            .unwrap();
+            Arc::new(Mutex::new(mgr))
+        };
+        let mut checker = PermissionChecker::new(&PermissionConfig::default(), mode, None);
+        if !deny.is_empty() {
+            checker.set_prompt_deny_tools(deny.iter().map(|s| s.to_string()).collect());
+        }
+        let perm: PermCheck = Arc::new(Mutex::new(checker));
+        let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
+        let tool = JanetLoopTool::from_meta(
+            metas.into_iter().next().unwrap(),
+            pm.clone(),
+            Some(perm),
+            None, // ask_tx None → an `Ask` decision resolves to a non-interactive deny.
+        )
+        .unwrap();
+        (tool, pm)
+    }
+
+    /// `deny_tools: [<concrete plugin name>]` refuses the call before
+    /// the Janet handler runs — the engine keys deny on the umbrella
+    /// `plugin_tool`, so the concrete-name probe is what makes this
+    /// work. Regression for the dirge-rfix bypass.
+    #[tokio::test]
+    async fn plugin_tool_denied_by_prompt_deny_tools() {
+        let (tool, _pm) = tool_with_perm(SecurityMode::Standard, &["my-tool"]);
+        let err = tool
+            .execute(
+                "c1",
+                serde_json::json!({}),
+                AbortSignal::new(),
+                noop_update(),
+            )
+            .await
+            .expect_err("deny_tools must refuse the plugin tool");
+        assert!(err.contains("denied"), "message names the denial: {err}");
+        assert!(err.contains("my-tool"), "names the tool: {err}");
+    }
+
+    /// Standard mode with no allow rule and no ask channel: a plugin
+    /// tool is `Operation::Plugin` → default `Ask` → non-interactive
+    /// deny. Proves the call is gated, not silently executed.
+    #[tokio::test]
+    async fn plugin_tool_gated_ask_denies_noninteractive() {
+        let (tool, _pm) = tool_with_perm(SecurityMode::Standard, &[]);
+        let res = tool
+            .execute(
+                "c1",
+                serde_json::json!({}),
+                AbortSignal::new(),
+                noop_update(),
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "unauthorized plugin tool must not run in non-interactive mode; got {res:?}"
+        );
+    }
+
+    /// Yolo mode authorizes the call and the handler runs normally —
+    /// the gate doesn't break legitimate plugin-tool execution.
+    #[tokio::test]
+    async fn plugin_tool_runs_when_authorized() {
+        let (tool, _pm) = tool_with_perm(SecurityMode::Yolo, &[]);
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"x": 1}),
+                AbortSignal::new(),
+                noop_update(),
+            )
+            .await
+            .expect("yolo mode authorizes the plugin tool");
+        let text = result
+            .content
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, r#"ran:{"x":1}"#);
     }
 
     // --- P9d: custom-message renderer resolution ---------------------
@@ -726,7 +881,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
 
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
@@ -778,7 +935,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
 
         let original = serde_json::json!({"x": 1});
         let mutated = tool.prepare_arguments(original);
@@ -802,7 +961,9 @@ mod tests {
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
         assert_eq!(metas[0].prepare_handler, None);
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
 
         let original = serde_json::json!({"a": 1, "b": "two"});
         let out = tool.prepare_arguments(original.clone());
@@ -825,7 +986,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
         let original = serde_json::json!({"x": 1});
         let out = tool.prepare_arguments(original.clone());
         assert_eq!(out, original, "throw must fall back to original args");
@@ -846,7 +1009,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
         let original = serde_json::json!({"x": 1});
         let out = tool.prepare_arguments(original.clone());
         assert_eq!(out, original);
@@ -876,7 +1041,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
 
         let signal = AbortSignal::new();
         signal.cancel();
@@ -913,7 +1080,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
 
         let signal = AbortSignal::new(); // not cancelled
         let result = tool
@@ -950,7 +1119,9 @@ mod tests {
             Arc::new(Mutex::new(mgr))
         };
         let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
-        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let tool =
+            JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone(), None, None)
+                .unwrap();
         let err = tool
             .execute(
                 "c",

@@ -328,13 +328,14 @@ impl BuiltinAllowPolicy {
             // Internal/meta tools have no external effect.
             Operation::Meta => Some(Effect::Allow),
 
-            // Execute / Network / Mcp / Agent (recursive task) are
-            // never builtin-allowed; Other (unknown/plugin) falls to
+            // Execute / Network / Mcp / Agent (recursive task) / Plugin
+            // are never builtin-allowed; Other (unknown) falls to
             // configured rules or the default.
             Operation::Execute
             | Operation::Network
             | Operation::Mcp
             | Operation::Agent
+            | Operation::Plugin
             | Operation::Other => None,
         }
     }

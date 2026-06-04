@@ -505,6 +505,56 @@ fn accept_mode_does_not_coerce_mcp_to_allow() {
     );
 }
 
+/// dirge-rfix: a Janet plugin tool (umbrella `plugin_tool` →
+/// `Operation::Plugin`) is high-risk — Accept mode must NOT coerce
+/// its default-Ask to Allow, exactly like MCP. A plugin handler can
+/// run arbitrary shell/network code, so it confirms even in Accept.
+#[test]
+fn accept_mode_does_not_coerce_plugin_tool_to_allow() {
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Accept,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    let r = checker.check("plugin_tool", "my-plugin-tool");
+    assert!(
+        matches!(r, CheckResult::Ask),
+        "Accept mode must NOT bypass plugin_tool's default-Ask, got {:?}",
+        r,
+    );
+}
+
+/// dirge-rfix: Yolo authorizes a plugin tool (so legitimate use is
+/// unaffected) and a configured deny rule on the plugin op refuses it.
+#[test]
+fn plugin_tool_yolo_allows_default_asks() {
+    let mut yolo = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Yolo,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    assert!(
+        matches!(
+            yolo.check("plugin_tool", "my-plugin-tool"),
+            CheckResult::Allowed
+        ),
+        "Yolo must allow the plugin tool",
+    );
+
+    let mut standard = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    assert!(
+        matches!(
+            standard.check("plugin_tool", "my-plugin-tool"),
+            CheckResult::Ask
+        ),
+        "Standard mode defaults the plugin tool to Ask (no builtin-allow)",
+    );
+}
+
 /// Accept mode STILL coerces other non-path Ask tools to Allow —
 /// the special-case is targeted, not a wholesale change.
 /// `question` (a non-path tool with Ask semantics in some

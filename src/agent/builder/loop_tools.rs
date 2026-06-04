@@ -529,9 +529,12 @@ pub async fn build_loop_tools(
             if shadows_builtin(&meta.name, "plugin") {
                 continue;
             }
-            if let Some(adapter) =
-                crate::plugin::extension::JanetLoopTool::from_meta(meta, pm_arc.clone())
-            {
+            if let Some(adapter) = crate::plugin::extension::JanetLoopTool::from_meta(
+                meta,
+                pm_arc.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ) {
                 tools.push(Arc::new(adapter));
             }
         }

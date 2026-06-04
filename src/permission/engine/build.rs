@@ -49,6 +49,11 @@ pub fn tool_operation(tool: &str) -> Operation {
         "bash" | "shell" => Operation::Execute,
         "webfetch" | "websearch" => Operation::Network,
         "mcp_tool" => Operation::Mcp,
+        // Umbrella op for every Janet plugin-registered tool. The
+        // concrete plugin tool name is matched separately via
+        // `deny_tools` / the session allowlist; the engine sees this
+        // single high-risk operation. See `JanetLoopTool::execute`.
+        "plugin_tool" => Operation::Plugin,
         "memory" => Operation::Memory,
         "skill" => Operation::Skill,
         // Recursive sub-agent execution: high-risk, not auto-allowed.
@@ -254,6 +259,7 @@ mod tests {
         assert_eq!(tool_operation("bash"), Operation::Execute);
         assert_eq!(tool_operation("webfetch"), Operation::Network);
         assert_eq!(tool_operation("mcp_tool"), Operation::Mcp);
+        assert_eq!(tool_operation("plugin_tool"), Operation::Plugin);
         assert_eq!(tool_operation("memory"), Operation::Memory);
         assert_eq!(tool_operation("skill"), Operation::Skill);
         assert_eq!(tool_operation("question"), Operation::Meta);
