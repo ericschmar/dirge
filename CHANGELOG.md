@@ -6,6 +6,85 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-04
+
+### Security
+- **Plugin tools now route through the permission engine.** A Janet
+  plugin-registered tool previously ran its handler with **no**
+  allow/deny/ask check — arbitrary file/network/shell I/O bypassing
+  authorization entirely. Plugin tools now go through the same `enforce`
+  chokepoint as built-ins via a new high-risk `Operation::Plugin` (not
+  builtin-allowed, not Accept-coerced, like MCP/bash): they prompt by
+  default in standard mode, can be denied with `deny_tools`, and are
+  allowed under yolo or a `/allow plugin_tool …` grant.
+
+### Added
+- **Agent profiles** (opt-in): `/agent <name>` activates a named persona
+  that bundles a system prompt, a model, and a tool policy
+  (`.dirge/agents/*.md`, `~/.config/dirge/agents/*.md`, or config `agents`,
+  layered project > global > config). `/agent off` reverts. The `task` tool
+  can spawn a subagent under a profile via `task(agent="<name>")`. See
+  [docs/agents.md](docs/agents.md).
+- **Shell integration** (the `:` prefix, zsh): an optional plugin to run
+  `:<prompt>` from your normal shell — the answer prints and you stay in the
+  shell; `:` commands share one session. See
+  [shell-plugin/README.md](shell-plugin/README.md).
+- **`--session <id>`**: resumes the session with that id if it exists, and
+  **creates it under that exact id** otherwise — a stable id for scripts and
+  the shell plugin.
+- **`--no-color`**: collapses the entire TUI to the terminal's default
+  foreground through a single theme chokepoint.
+- **`Alt+X`**: drops queued mid-execution interjections without cancelling
+  the running agent (`Ctrl+C` still cancels both).
+- Role-routing keys `summarization_provider` and `subagent_provider` are now
+  actually consumed: the former routes the in-loop compaction summarizer, the
+  latter sets the default model for `task`-spawned subagents.
+
+### Changed
+- **Automatic compaction now runs LLM summarization.** Proactive
+  turn-boundary folds at the high context-ratio threshold now produce a
+  structured summary (via `summarization_provider` when configured, else the
+  main model) instead of silently degrading to a prune-only pass — the
+  in-loop summarizer was declared but never wired. The cheap tool-output
+  cap/prune still runs first with no LLM call.
+- **`/wt-merge` is now programmatic and conflict-safe.** It performs the
+  merge directly (refuses on a dirty tree, `git merge --abort` on conflict,
+  never force-deletes the worktree) instead of delegating to an unconstrained
+  LLM prompt, and only returns to the main repo on a clean merge.
+- **`/prompt` and `/agent` compose as independent layers.** Their
+  `deny_tools` now union (an agent can no longer silently re-enable a tool an
+  active prompt denied), and `/agent off` restores the prompt layer's prompt +
+  denies and the pre-agent model.
+- **`allow_tools` now caps MCP and plugin tools too** (via the `mcp_tool` /
+  `plugin_tool` umbrellas), not just built-ins.
+- **Phased `/plan`**: the plan phase now gets a true context reset
+  (findings-only), matching its documented isolation; explore→plan forks run
+  off the UI event loop.
+- Model-family steering now tracks the active (swapped) model rather than the
+  launch-time model, so `/model` and `/agent` swaps steer correctly.
+
+### Fixed
+- Compaction could leave an orphaned `tool_use`/`tool_result` pair
+  (unbalanced history → provider 400); the fold window now snaps to
+  user-message boundaries, and the tool-output prune handles block-array
+  content (previously a silent no-op on real tool results).
+- `edit_minified` is now classified as a mutating edit, so the
+  verify-before-done gate and the repeat-loop/storm breaker treat it like
+  `edit`/`apply_patch`.
+- `--no-color` no longer leaks hard-coded green/red diff backgrounds.
+- `/panel auto` threshold corrected to ≥152 cols (was documented as ≥100,
+  where no gutter actually fits).
+- The active DAP debug session is now torn down at process exit instead of
+  relying on `Drop` of a `static` that never runs.
+- Plugin `transform-context` / `on-compact` hooks no longer block a runtime
+  worker thread (now `spawn_blocking` + timeout), and `message-end` fires in
+  headless (`--print` / `--loop`) mode too.
+- Background-shell concurrency cap is enforced atomically; `/mode yolo` warns
+  at runtime when configured deny rules are made inert; `/allow add`
+  validates against the single tool-name source of truth; a leaked git
+  worktree is cleaned up if creation fails after `git worktree add`; an
+  ignored plugin-provider re-registration is now surfaced.
+
 ## [0.2.4] - 2026-06-03
 
 ### Added
