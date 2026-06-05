@@ -298,6 +298,11 @@ pub struct Renderer {
     lines: u16,
     col: u16,
     spinner_tick: bool,
+    /// #387: dirty flag for the single-paint-per-event model. Mutators
+    /// (write_line/write/scroll/render_viewport/set_bottom) set this
+    /// instead of painting inline; [`Renderer::flush`] performs the one
+    /// real `tui_redraw` per event iff it is set. See [`crate::ui::state`].
+    needs_paint: bool,
     buffer: Vec<LineEntry>,
     partial: CompactString,
     partial_color: Color,
@@ -460,6 +465,7 @@ impl Renderer {
             lines: 0,
             col: 0,
             spinner_tick: false,
+            needs_paint: false,
             buffer: Vec::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
@@ -787,6 +793,7 @@ impl Renderer {
     /// surface the new chat in the UI.
     pub fn add_chat(&mut self, name: impl Into<String>) -> usize {
         self.chats.push(ChatSnapshot::empty(name.into()));
+        self.needs_paint = true;
         self.chats.len() - 1
     }
 
@@ -801,6 +808,7 @@ impl Renderer {
         self.save_active();
         self.active_chat = idx;
         self.load_active();
+        self.needs_paint = true;
     }
 
     /// Cycle to the next chat (wraps from last → first).
@@ -850,6 +858,7 @@ impl Renderer {
         } else if idx == self.active_chat && self.active_chat >= self.chats.len() {
             self.active_chat = 0;
         }
+        self.needs_paint = true;
     }
 
     pub fn active_chat(&self) -> usize {
@@ -951,6 +960,7 @@ impl Renderer {
     pub fn set_avatar_state(&mut self, state: crate::ui::avatar::AvatarState) {
         if self.avatar_state != state {
             self.avatar_state = state;
+            self.needs_paint = true;
         }
     }
 
@@ -1045,11 +1055,13 @@ impl Renderer {
         if self.alert_title.is_empty() {
             self.alert_title = "[ALERT]".to_string();
         }
+        self.needs_paint = true;
     }
 
     pub fn clear_alert_overlay(&mut self) {
         self.alert_overlay = None;
         self.alert_title.clear();
+        self.needs_paint = true;
     }
 
     /// Set (or clear, with `None`) the rewind-mode list-picker overlay. The
@@ -1058,6 +1070,7 @@ impl Renderer {
     /// sets this explicitly on enter/update and clears it on exit [dirge-92em].
     pub fn set_rewind_overlay(&mut self, overlay: Option<crate::ui::picker::PickerOverlay>) {
         self.rewind_overlay = overlay;
+        self.needs_paint = true;
     }
 
     pub fn set_panel_data(&mut self, data: PanelData) {
@@ -1101,6 +1114,9 @@ impl Renderer {
         let next = next as usize;
         let changed = next != self.modified_offset;
         self.modified_offset = next;
+        if changed {
+            self.needs_paint = true;
+        }
         changed
     }
 
@@ -1203,6 +1219,12 @@ impl Renderer {
         } else if self.scroll_offset > max_offset {
             self.scroll_offset = max_offset;
         }
+        // #387: replacing displayed content is an explicit visible change —
+        // mark dirty so the render effect repaints. Without this the modal
+        // sub-loops (question/permission/dialog) that rebuild their content
+        // via `replace_from` each keystroke wouldn't repaint and would look
+        // frozen.
+        self.needs_paint = true;
     }
 
     /// Number of rows reserved for chat history above the input area.
@@ -1315,6 +1337,7 @@ impl Renderer {
         self.selection_active = false;
         self.selection_start = None;
         self.selection_end = None;
+        self.needs_paint = true;
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -1449,6 +1472,13 @@ impl Renderer {
             let max_offset = self.buffer.len().saturating_sub(visible);
             self.scroll_offset = (self.scroll_offset + 1).min(max_offset);
         }
+        // #387: centralize dirty-marking at the buffer primitive so no
+        // higher-level appender can forget it. Gated on being at the bottom
+        // (scrolled-up views don't auto-jump on new content, matching prior
+        // behavior).
+        if self.scroll_offset == 0 {
+            self.needs_paint = true;
+        }
     }
 
     pub fn is_scrolling(&self) -> bool {
@@ -1461,12 +1491,14 @@ impl Renderer {
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
         }
+        self.needs_paint = true;
     }
 
     pub fn scroll_line_down(&mut self) {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
         }
+        self.needs_paint = true;
     }
 
     /// True when the chat is scrolled up off the newest content
@@ -1481,6 +1513,7 @@ impl Renderer {
         let page = visible.saturating_sub(2).max(1);
         let max_offset = self.buffer.len().saturating_sub(visible);
         self.scroll_offset = (self.scroll_offset + page).min(max_offset);
+        self.needs_paint = true;
     }
 
     pub fn scroll_page_down(&mut self) {
@@ -1491,11 +1524,13 @@ impl Renderer {
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(page);
         }
+        self.needs_paint = true;
     }
 
     pub fn scroll_to_top(&mut self) {
         let visible = self.visible_lines();
         self.scroll_offset = self.buffer.len().saturating_sub(visible);
+        self.needs_paint = true;
     }
 
     pub fn scroll_to_bottom(&mut self) -> io::Result<()> {
@@ -1511,7 +1546,10 @@ impl Renderer {
     }
 
     pub fn render_viewport(&mut self) -> io::Result<()> {
-        self.tui_redraw()
+        // #387: defer. The event loop flushes once per event (model-driven
+        // render effect); this just marks the frame dirty.
+        self.needs_paint = true;
+        Ok(())
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
@@ -1526,11 +1564,11 @@ impl Renderer {
                 });
             }
         }
-        // ratatui path: state is mutated above; the redraw repaints
-        // the full chat region (no per-line direct stdout writes,
-        // no Clear(CurrentLine) wiping side-panel cols).
+        // #387: defer paint. Mark dirty only when at the bottom (scrolled-up
+        // views don't auto-jump on new content, matching prior behavior);
+        // the loop's render effect flushes once per event.
         if self.scroll_offset == 0 {
-            self.tui_redraw()?;
+            self.needs_paint = true;
         }
         Ok(())
     }
@@ -1591,11 +1629,11 @@ impl Renderer {
                 }
             }
         }
-        // Single redraw at the end of the streamed batch — repeated
-        // tokens within the batch land in the buffer + partial, and
-        // the diff engine in ratatui only emits cells that changed.
+        // #387: defer paint (see write_line). The token handler gates how
+        // often this lands a dirty frame (60 fps coalescing); the loop's
+        // render effect performs the single flush.
         if self.scroll_offset == 0 {
-            self.tui_redraw()?;
+            self.needs_paint = true;
         }
         Ok(())
     }
@@ -1614,12 +1652,18 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn draw_bottom(
+    /// Update the cached bottom-area state (input rows, status text,
+    /// ghost/preview, picker overlay, spinner) from the editor + status.
+    /// Does NOT paint — callers either paint immediately ([`draw_bottom`])
+    /// or defer to the next [`flush`] ([`set_bottom`], the #387 model-
+    /// driven path). Split out so the single-paint refactor can reuse the
+    /// exact cached-state derivation.
+    fn cache_bottom(
         &mut self,
         editor: &crate::ui::input::InputEditor,
         status: &str,
         is_running: bool,
-    ) -> io::Result<()> {
+    ) {
         // Use the editor's display projection so paste markers
         // (`\x01<idx>\x01` blocks) appear as `[N lines pasted]`
         // placeholders rather than bare digits between invisible
@@ -1627,6 +1671,20 @@ impl Renderer {
         // the projected string.
         // When Ctrl+R reverse-i-search is active, show the search
         // mini-buffer instead of the normal editor buffer.
+        // #387: snapshot the visible bottom state so we can mark the frame
+        // dirty ONLY when it actually changes. The loop calls this once per
+        // event via the render effect; without change-detection that would
+        // force a paint every iteration and defeat the token-stream
+        // coalescing (the spinner animation is driven separately by the
+        // timeout arm's request_repaint).
+        let prev_status = self.cached_status.clone();
+        let prev_running = self.cached_is_running;
+        let prev_rows = self.cached_input_rows.clone();
+        let prev_cursor = (self.cached_input_cursor_row, self.cached_input_cursor_col);
+        let prev_ghost = self.cached_input_ghost.clone();
+        let prev_preview = self.cached_completion_preview.clone();
+        let prev_picker = self.picker_overlay.is_some();
+
         let (display_buf, cursor_byte) = if editor.is_in_search() {
             editor.search_display()
         } else {
@@ -1686,7 +1744,62 @@ impl Renderer {
             .map(|p| p.overlay())
             .or_else(|| self.rewind_overlay.clone());
 
-        self.tui_redraw()
+        // Mark dirty iff a visible bottom element changed.
+        if prev_status != self.cached_status
+            || prev_running != self.cached_is_running
+            || prev_rows != self.cached_input_rows
+            || prev_cursor != (self.cached_input_cursor_row, self.cached_input_cursor_col)
+            || prev_ghost != self.cached_input_ghost
+            || prev_preview != self.cached_completion_preview
+            || prev_picker != self.picker_overlay.is_some()
+        {
+            self.needs_paint = true;
+        }
+    }
+
+    /// Cache the bottom state and mark the frame dirty on change, WITHOUT
+    /// painting (the #387 model-driven path). The event loop builds the
+    /// status line once from the model, calls this, then [`flush`] paints.
+    /// `draw_bottom` is retained as an alias for the many existing call
+    /// sites; both defer now.
+    pub fn draw_bottom(
+        &mut self,
+        editor: &crate::ui::input::InputEditor,
+        status: &str,
+        is_running: bool,
+    ) -> io::Result<()> {
+        self.cache_bottom(editor, status, is_running);
+        Ok(())
+    }
+
+    /// #387: model-driven bottom update — alias of the deferred `draw_bottom`
+    /// with a `()` return for new call sites.
+    pub fn set_bottom(
+        &mut self,
+        editor: &crate::ui::input::InputEditor,
+        status: &str,
+        is_running: bool,
+    ) {
+        self.cache_bottom(editor, status, is_running);
+    }
+
+    /// #387: mark the frame dirty so the next [`flush`] repaints. Mutators
+    /// that change on-screen content call this instead of painting inline.
+    pub fn request_repaint(&mut self) {
+        self.needs_paint = true;
+    }
+
+    /// #387: the single paint per event. Performs one `tui_redraw` iff the
+    /// frame is dirty, then clears the flag. A no-op when nothing changed,
+    /// which preserves token-stream coalescing (the token handler only
+    /// marks dirty at frame intervals).
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.needs_paint {
+            self.needs_paint = false;
+            self.tui_redraw()
+        } else {
+            Ok(())
+        }
     }
 }
 

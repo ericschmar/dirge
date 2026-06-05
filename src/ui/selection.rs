@@ -23,6 +23,19 @@ pub enum Outcome {
 }
 
 pub fn handle(ev: &UserEvent, renderer: &mut Renderer) -> Outcome {
+    // #387: this module mutates the renderer's selection fields directly and
+    // signals the caller via the Outcome. Any repaint outcome means visible
+    // state changed, so mark the frame dirty here — otherwise the model-driven
+    // render effect (which paints only when dirty) wouldn't repaint a drag
+    // inside the modal sub-loops.
+    let outcome = handle_inner(ev, renderer);
+    if matches!(outcome, Outcome::Repaint | Outcome::RepaintAndCopied) {
+        renderer.request_repaint();
+    }
+    outcome
+}
+
+fn handle_inner(ev: &UserEvent, renderer: &mut Renderer) -> Outcome {
     match ev {
         UserEvent::MouseDown { row, col } => {
             // Double-click → select the word under the cursor. Detected
