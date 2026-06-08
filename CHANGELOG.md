@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-08
+
 ### Fixed
 - The `sandbox-microvm` feature now compiles on non-Linux hosts. The reflink
   fast path (`copy_file_range`) and the `dirge-microvm-runner` libkrun calls
@@ -260,7 +262,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/dirge-code/dirge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dirge-code/dirge/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/dirge-code/dirge/compare/v0.3.0...v0.3.1
 [1.0.0]: https://github.com/dirge-code/dirge/releases/tag/v1.0.0
