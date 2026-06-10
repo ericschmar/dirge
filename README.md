@@ -18,6 +18,30 @@ What sets dirge apart from other agentic editors:
 
 See the full [feature catalog](docs/features.md) for everything else.
 
+## No embeddings, on purpose
+
+dirge ships no vector index: code search is plain grep delivered inline, and
+cross-session memory search is SQLite FTS5. A recent empirical study of agentic
+search — [*Is Grep All You Need? How Agent Harnesses Reshape Agentic
+Search*](https://arxiv.org/abs/2605.15184) (Sen et al., 2026) — supports these
+defaults:
+
+- Inline grep beat vector retrieval for **every** harness/model pair tested on
+  long-term conversational memory QA (LongMemEval) — the same task dirge's
+  session memory and FTS5 session search are built for.
+- The harness mattered as much as the retriever: moving the same model between
+  agent stacks shifted accuracy by ~16 points. In the authors' words, retrieval
+  in an agent loop "is really retrieval-plus-orchestration" — and the
+  orchestration layer is where dirge invests.
+- Weaker models degraded the most under vector search and under file-based
+  result delivery that turns each hit into a multi-step read-and-integrate
+  workflow. Inline lexical search was the most forgiving combination, which
+  fits dirge's goal of keeping cheaper models on the rails.
+
+The study covers conversational memory, not code semantics. For structural
+code questions dirge reaches for tree-sitter [semantic tools](docs/semantic.md)
+and [LSP](docs/lsp.md) rather than embeddings.
+
 ## Installation
 
 > The crate is published as **`dirge-agent`** (the short `dirge` name was
