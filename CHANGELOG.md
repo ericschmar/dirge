@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-06-13
+
+### Fixed
+- **Mouse scroll/select stopped working mid-session.** Mouse capture and
+  bracketed paste were enabled once at startup and never re-asserted, so a
+  child program run through the bash tool (a pager/TUI like `git log` →
+  `less`, `fzf`, `vim`) that reset terminal modes on exit silently turned
+  dirge's off — the wheel then scrolled the whole UI and click-select
+  stopped registering. The paint loop now re-asserts these modes on a 1s
+  throttle so dirge self-heals; non-SGR escapes are also stripped before a
+  chat line reaches a terminal cell so a leaked control sequence can't
+  corrupt terminal state in the first place.
+
+### Added
+- **`Ctrl+O` toggles expand/collapse of the last truncated block** — a
+  thinking burst (live or just completed) or a collapsed tool/command
+  result. Thinking is now retained past the turn boundary, so it stays
+  expandable once the response is showing; a second press collapses.
+- **Bundled workflow skills starter pack** under `skills/` —
+  `systematic-debugging`, `code-review-feedback`, and `writing-skills`,
+  adapted from the superpowers collection (MIT). Opt-in: copy a skill dir
+  into `.dirge/skills/`. See [skills/README.md](skills/README.md).
+- **Short session id in the status bar** for quick reference.
+
 ## [0.6.2] - 2026-06-12
 
 Long-horizon session work, porting ideas from MiMo-Code onto dirge's
