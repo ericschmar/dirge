@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-06-17
+
 ### Added
 - **Storm-breaker graceful failure.** When a run gives up because it's stuck
   repeating the same tool call (the repeat-loop guard's terminal case), it now
@@ -51,6 +53,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of):
   cache discipline is the headline lever for running cheaper models, and now
   you can measure it.
+- **Working memory keeps a slice of the prompt as project facts accumulate.**
+  Memory entries are evicted by kind-derived salience, which drops transient
+  `working` notes before durable facts — so a project with many high-salience
+  invariants could push working memory out of the injected context entirely.
+  The hot-tier budget now reserves a small slice for `working` entries:
+  long-term still uses the full budget when no working notes are present, but it
+  can't evict working below the reserve, and a working note never displaces a
+  long-term fact within its share either.
+- **The memory curator promotes durable working notes and weighs usage.** A
+  `working` note that turns out to be a lasting fact (a build command, a design
+  decision) no longer just decays — the background curator now surfaces working
+  entries that outlived their session and re-classifies the ones whose use count
+  and content prove durable to `procedural`/`semantic`. Its consolidation input
+  also annotates every entry with `[kind | uses | id]`, so keep/merge/remove
+  decisions weigh how load-bearing an entry actually is, not just its text.
+
+### Changed
+- FNV-1a hashing is unified behind one internal module; the `/rewind` snapshot
+  store's process-global scope is documented as intentional (subagent edits are
+  rewindable by the parent). No behavior change.
 
 ## [0.7.2] - 2026-06-15
 
