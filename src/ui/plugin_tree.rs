@@ -484,9 +484,11 @@ mod tests {
     fn agent_with_provider() -> (AnyAgent, Arc<RecordingProvider>) {
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::new("test-key")
-            .expect("openai client")
-            .completions_api();
+        let client = openai::Client::builder()
+            .api_key("test-key")
+            .http_client(crate::provider::codex_http::CodexHttpClient::default())
+            .build()
+            .expect("openai client");
         let model = client.completion_model("gpt-4o");
         let inner = rig::agent::AgentBuilder::new(model).build();
         let provider = Arc::new(RecordingProvider::default());

@@ -36,6 +36,15 @@ pub fn create_client(
     client::create_client(provider_name, api_key, providers)
 }
 
+pub fn create_client_with_auth(
+    provider_name: &str,
+    api_key: Option<&str>,
+    providers: &HashMap<String, ProviderEntry>,
+    default_auth: Option<crate::config::ProviderAuth>,
+) -> anyhow::Result<AnyClient> {
+    client::create_client_with_auth(provider_name, api_key, providers, default_auth)
+}
+
 // Arity matches `build_agent_inner` — explicit DI signature kept
 // grep-able, refactoring into a struct is tracked separately.
 #[allow(clippy::too_many_arguments)]

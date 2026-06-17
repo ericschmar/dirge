@@ -15,11 +15,12 @@ use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 use crate::agent::prompt;
 use crate::session::SessionMessage;
 
+use super::codex_http::CodexHttpClient;
 use super::summarize;
 
 pub enum AnyClient {
     OpenRouter(openrouter::Client),
-    OpenAI(openai::CompletionsClient),
+    OpenAI(openai::Client<CodexHttpClient>),
     Anthropic(anthropic::Client),
     Gemini(gemini::Client),
     DeepSeek(openai::CompletionsClient),
@@ -127,7 +128,7 @@ impl AnyClient {
 #[derive(Clone)]
 pub enum AnyModel {
     OpenRouter(openrouter::completion::CompletionModel),
-    OpenAI(openai::completion::CompletionModel),
+    OpenAI(openai::responses_api::ResponsesCompletionModel<CodexHttpClient>),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
     DeepSeek(openai::completion::CompletionModel),
