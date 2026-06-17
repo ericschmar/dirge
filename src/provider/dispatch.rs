@@ -20,7 +20,8 @@ use super::summarize;
 
 pub enum AnyClient {
     OpenRouter(openrouter::Client),
-    OpenAI(openai::Client<CodexHttpClient>),
+    OpenAI(openai::CompletionsClient),
+    ChatGptOpenAI(openai::Client<CodexHttpClient>),
     Anthropic(anthropic::Client),
     Gemini(gemini::Client),
     DeepSeek(openai::CompletionsClient),
@@ -35,6 +36,7 @@ impl AnyClient {
         match self {
             AnyClient::OpenRouter(c) => AnyModel::OpenRouter(c.completion_model(name)),
             AnyClient::OpenAI(c) => AnyModel::OpenAI(c.completion_model(name)),
+            AnyClient::ChatGptOpenAI(c) => AnyModel::ChatGptOpenAI(c.completion_model(name)),
             AnyClient::Anthropic(c) => AnyModel::Anthropic(c.completion_model(name)),
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::DeepSeek(c) => AnyModel::DeepSeek(c.completion_model(name)),
@@ -128,7 +130,8 @@ impl AnyClient {
 #[derive(Clone)]
 pub enum AnyModel {
     OpenRouter(openrouter::completion::CompletionModel),
-    OpenAI(openai::responses_api::ResponsesCompletionModel<CodexHttpClient>),
+    OpenAI(openai::completion::CompletionModel),
+    ChatGptOpenAI(openai::responses_api::ResponsesCompletionModel<CodexHttpClient>),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
     DeepSeek(openai::completion::CompletionModel),
@@ -181,6 +184,7 @@ impl AnyModel {
         match self {
             AnyModel::OpenRouter(m) => one_shot!(m),
             AnyModel::OpenAI(m) => one_shot!(m),
+            AnyModel::ChatGptOpenAI(m) => one_shot!(m),
             AnyModel::Anthropic(m) => one_shot!(m),
             AnyModel::Gemini(m) => one_shot!(m),
             AnyModel::DeepSeek(m) => one_shot!(m),
@@ -228,6 +232,7 @@ impl AnyModel {
         match self {
             AnyModel::OpenRouter(m) => m.model.clone(),
             AnyModel::OpenAI(m) => m.model.clone(),
+            AnyModel::ChatGptOpenAI(m) => m.model.clone(),
             AnyModel::Anthropic(m) => m.model.clone(),
             AnyModel::Gemini(m) => m.model.clone(),
             AnyModel::DeepSeek(m) => m.model.clone(),

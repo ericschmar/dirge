@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 
 use crate::config::ProviderAuth;
 
@@ -16,47 +15,38 @@ pub fn resolve_auth_headers(auth: ProviderAuth) -> anyhow::Result<Option<Provide
     }
 }
 
-static PROVIDER_AUTH_HEADERS: OnceLock<
-    Mutex<std::collections::HashMap<String, ProviderAuthHeaders>>,
-> = OnceLock::new();
-
-pub fn install_provider_auth_headers(provider: &str, headers: ProviderAuthHeaders) {
-    let map = PROVIDER_AUTH_HEADERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Ok(mut map) = map.lock() {
-        map.insert(provider.to_ascii_lowercase(), headers);
-    }
-}
-
-pub fn provider_auth_headers(provider: &str) -> Option<ProviderAuthHeaders> {
-    let map = PROVIDER_AUTH_HEADERS.get()?;
-    map.lock()
-        .ok()
-        .and_then(|map| map.get(&provider.to_ascii_lowercase()).cloned())
-}
-
 fn resolve_chatgpt_auth() -> anyhow::Result<ProviderAuthHeaders> {
-    if let Ok(token) = std::env::var("CODEX_ACCESS_TOKEN")
+    resolve_chatgpt_auth_from(
+        std::env::var("CODEX_ACCESS_TOKEN").ok(),
+        std::env::var("CHATGPT_ACCOUNT_ID").ok(),
+        codex_auth_file_path(),
+    )
+}
+
+fn resolve_chatgpt_auth_from(
+    codex_access_token: Option<String>,
+    chatgpt_account_id: Option<String>,
+    auth_file_path: PathBuf,
+) -> anyhow::Result<ProviderAuthHeaders> {
+    if let Some(token) = codex_access_token
         && !token.trim().is_empty()
     {
         return Ok(ProviderAuthHeaders {
             bearer_token: token.trim().to_string(),
-            chatgpt_account_id: std::env::var("CHATGPT_ACCOUNT_ID")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
+            chatgpt_account_id: chatgpt_account_id.filter(|v| !v.trim().is_empty()),
         });
     }
 
-    let path = codex_auth_file_path();
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
+    let raw = std::fs::read_to_string(&auth_file_path).map_err(|e| {
         anyhow::anyhow!(
             "ChatGPT auth requested, but CODEX_ACCESS_TOKEN is unset and Codex auth storage could not be read at {}: {e}. Run `codex login` or set CODEX_ACCESS_TOKEN.",
-            path.display()
+            auth_file_path.display()
         )
     })?;
     let json: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
             "ChatGPT auth requested, but Codex auth storage at {} is not valid JSON: {e}",
-            path.display()
+            auth_file_path.display()
         )
     })?;
 
@@ -64,7 +54,7 @@ fn resolve_chatgpt_auth() -> anyhow::Result<ProviderAuthHeaders> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "ChatGPT auth requested, but no access token was found in {}. Run `codex login` again or set CODEX_ACCESS_TOKEN.",
-                path.display()
+                auth_file_path.display()
             )
         })?;
     let chatgpt_account_id = extract_string_by_keys(
@@ -149,32 +139,14 @@ mod tests {
 
     #[test]
     fn codex_access_token_env_wins() {
-        unsafe {
-            std::env::set_var("CODEX_ACCESS_TOKEN", " env-token ");
-            std::env::set_var("CHATGPT_ACCOUNT_ID", "acct-env");
-        }
-        let headers = resolve_chatgpt_auth().unwrap();
-        unsafe {
-            std::env::remove_var("CODEX_ACCESS_TOKEN");
-            std::env::remove_var("CHATGPT_ACCOUNT_ID");
-        }
+        let headers = resolve_chatgpt_auth_from(
+            Some(" env-token ".to_string()),
+            Some("acct-env".to_string()),
+            PathBuf::from("/should/not/be/read"),
+        )
+        .unwrap();
 
         assert_eq!(headers.bearer_token, "env-token");
         assert_eq!(headers.chatgpt_account_id.as_deref(), Some("acct-env"));
-    }
-
-    #[test]
-    fn provider_auth_headers_are_keyed_case_insensitively() {
-        install_provider_auth_headers(
-            "OpenAI-ChatGPT",
-            ProviderAuthHeaders {
-                bearer_token: "token".to_string(),
-                chatgpt_account_id: Some("acct".to_string()),
-            },
-        );
-
-        let headers = provider_auth_headers("openai-chatgpt").unwrap();
-        assert_eq!(headers.bearer_token, "token");
-        assert_eq!(headers.chatgpt_account_id.as_deref(), Some("acct"));
     }
 }

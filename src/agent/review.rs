@@ -743,9 +743,8 @@ mod tests {
     fn agent_with_recording_provider() -> (AnyAgent, Arc<RecordingEndProvider>) {
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::builder()
+        let client = openai::CompletionsClient::builder()
             .api_key("test-key")
-            .http_client(crate::provider::codex_http::CodexHttpClient::default())
             .build()
             .expect("openai client");
         let model = client.completion_model("gpt-4o");
@@ -851,9 +850,8 @@ mod tests {
 
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::builder()
+        let client = openai::CompletionsClient::builder()
             .api_key("test-key")
-            .http_client(crate::provider::codex_http::CodexHttpClient::default())
             .build()
             .unwrap();
         let model = client.completion_model("gpt-4o");
@@ -885,9 +883,8 @@ mod tests {
     fn maybe_fire_session_switch_noop_without_provider() {
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::builder()
+        let client = openai::CompletionsClient::builder()
             .api_key("test-key")
-            .http_client(crate::provider::codex_http::CodexHttpClient::default())
             .build()
             .unwrap();
         let model = client.completion_model("gpt-4o");
@@ -909,9 +906,8 @@ mod tests {
         // Build an agent WITHOUT calling with_memory_provider.
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::builder()
+        let client = openai::CompletionsClient::builder()
             .api_key("test-key")
-            .http_client(crate::provider::codex_http::CodexHttpClient::default())
             .build()
             .unwrap();
         let model = client.completion_model("gpt-4o");

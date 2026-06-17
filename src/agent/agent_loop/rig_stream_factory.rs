@@ -598,7 +598,7 @@ pub fn build_provider_additional_params(
 }
 
 fn merged_request_headers(
-    provider_name: Option<&str>,
+    _provider_name: Option<&str>,
     opts: &super::stream::StreamOptions,
 ) -> std::collections::HashMap<String, String> {
     let mut headers = opts.headers.clone();
@@ -611,18 +611,6 @@ fn merged_request_headers(
         headers
             .entry("Authorization".to_string())
             .or_insert_with(|| format!("Bearer {key}"));
-    }
-    if let Some(provider) = provider_name
-        && let Some(auth) = crate::provider::auth::provider_auth_headers(provider)
-        && let Some(account_id) = auth
-            .chatgpt_account_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-    {
-        headers
-            .entry("ChatGPT-Account-ID".to_string())
-            .or_insert_with(|| account_id.to_string());
     }
     headers
 }
@@ -1144,18 +1132,10 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_provider_auth_adds_account_header() {
-        crate::provider::auth::install_provider_auth_headers(
-            "openai-chatgpt-test",
-            crate::provider::auth::ProviderAuthHeaders {
-                bearer_token: "token".to_string(),
-                chatgpt_account_id: Some("acct-test".to_string()),
-            },
-        );
+    fn chatgpt_provider_auth_does_not_add_account_header_to_body() {
         let opts = StreamOptions::from_signal(AbortSignal::new());
 
-        let v = build_provider_additional_params(Some("openai-chatgpt-test"), &opts).unwrap();
-        assert_eq!(v["headers"]["ChatGPT-Account-ID"], "acct-test");
+        assert!(build_provider_additional_params(Some("openai-chatgpt-test"), &opts).is_none());
     }
 
     /// No reasoning, no headers, no metadata → None (caller

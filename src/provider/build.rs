@@ -183,6 +183,7 @@ pub async fn build_agent(
     let mut agent = match model {
         AnyModel::OpenRouter(m) => build_inner!(m, OpenRouter),
         AnyModel::OpenAI(m) => build_inner!(m, OpenAI),
+        AnyModel::ChatGptOpenAI(m) => build_inner!(m, ChatGptOpenAI),
         AnyModel::Anthropic(m) => build_inner!(m, Anthropic),
         AnyModel::Gemini(m) => build_inner!(m, Gemini),
         AnyModel::DeepSeek(m) => build_inner!(m, DeepSeek),
