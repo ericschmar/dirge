@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-06-17
+
+### Fixed
+- **Destructive git commands no longer run without a prompt (#429).**
+  `git checkout`, `git switch`, and `git restore` were on the default
+  auto-allow list, so they executed silently anywhere the `bash` tool was
+  reachable — and they discard uncommitted work. An agent reverting its own
+  edit with `git checkout -- file` could wipe a user's pending changes. They
+  now require a permission prompt; `git pull`/`fetch` stay auto-allowed and
+  `git reset`/`clean` already prompted.
+
+### Changed
+- **Plan mode is locked down comprehensively.** The plan prompt's tool
+  denylist previously missed `task`, MCP, plugin, debug, and spec tools, so a
+  "read-only" planning session wasn't fully read-only. It now denies every
+  tool that can change the filesystem, run a command, reach the network, or
+  delegate work. (`edit_lines`/`edit_minified` were already covered via the
+  `edit` permission name.)
+
 ## [0.7.5] - 2026-06-17
 
 ### Changed
