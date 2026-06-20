@@ -591,52 +591,103 @@ above is the one exception with richer per-provider precedence;
 
 ## Key bindings
 
-VSCode-style overrides for the global "command" keys. `keybindings` is an
-array of `{ "key": "<chord>", "command": "<command>" }`; each entry is
-layered over the built-in defaults, so you only list what you want to
-change.
+VSCode-style overrides. `keybindings` is an array of
+`{ "key": "<chord>", "command": "<command>" }`; each entry layers over the
+built-in defaults, so you only list what you want to change. One array
+covers BOTH the global "command" keys (scroll, chat nav, …) and the
+input-editor keys (cursor motion, kill-ring, history, …) — each entry
+routes to the right one by its command name.
 
 ```json
 {
   "keybindings": [
-    { "key": "ctrl-t",       "command": "toggle_reasoning" },
-    { "key": "ctrl-shift-k", "command": "kill_subagent" },
-    { "key": "ctrl-r",       "command": "none" }
+    { "key": "ctrl-t",        "command": "toggle_reasoning" },
+    { "key": "ctrl-shift-k",  "command": "kill_subagent" },
+    { "key": "ctrl-r",        "command": "none" },
+    { "key": "alt-a",         "command": "cursor_line_start" },
+    { "key": "ctrl-x ctrl-s", "command": "scroll_to_top" }
   ]
 }
 ```
 
-- **`key`** — a chord: case-insensitive, `-` or `+` separated, modifiers
-  before the key. Modifiers: `ctrl`, `alt` (a.k.a. `meta`/`option`),
-  `shift`. Keys: a single character, `f1`–`f12`, or a named key
-  (`enter`, `esc`, `tab`, `backspace`, `delete`, `insert`, `space`,
-  `up`/`down`/`left`/`right`, `home`, `end`, `pageup`/`pgup`,
-  `pagedown`/`pgdn`). Examples: `ctrl-t`, `pageup`, `ctrl-shift-x`, `f5`.
-- **`command`** — one of the rebindable commands below, or **`none`**
-  (also `unbind`) to disable the default binding on that chord.
+- **`key`** — a chord, or a whitespace-separated *sequence* of chords for
+  an emacs-style binding (e.g. `ctrl-x ctrl-s`). A chord is
+  case-insensitive, `-` or `+` separated, modifiers before the key.
+  Modifiers: `ctrl`, `alt` (a.k.a. `meta`/`option`), `shift`. Keys: a
+  single character, `f1`–`f12`, or a named key (`enter`, `esc`, `tab`,
+  `backspace`, `delete`, `insert`, `space`, `up`/`down`/`left`/`right`,
+  `home`, `end`, `pageup`/`pgup`, `pagedown`/`pgdn`). Examples: `ctrl-t`,
+  `pageup`, `ctrl-shift-x`, `f5`, `ctrl-x ctrl-s`.
+- **`command`** — one of the global or input commands below, or **`none`**
+  (also `unbind`) to disable the default binding on that chord (clears it
+  from both contexts).
 - Binding a command to a new chord **adds** it (the default chord still
   works unless you separately unbind it). Binding a chord that already
   has a default **replaces** it.
 
+### Global commands
+
 | Command | Default | Action |
 |---|---|---|
 | `toggle_reasoning` | `ctrl-r` | Show/hide reasoning tokens |
+| `expand` | `ctrl-o` | Expand buffered thinking / reprint last collapsed tool result |
 | `scroll_page_up` | `pageup` | Scroll chat up one page |
 | `scroll_page_down` | `pagedown` | Scroll chat down one page |
-| `scroll_to_top` | `home` | Jump to top of chat |
-| `scroll_to_bottom` | `end` | Jump to bottom of chat |
+| `scroll_to_top` | `ctrl-home` | Jump to top of chat |
+| `scroll_to_bottom` | `ctrl-end` | Jump to bottom of chat |
 | `next_chat` | `ctrl-n` | Next subagent chat window |
 | `prev_chat` | `ctrl-p` | Previous subagent chat window |
 | `close_chat` | `ctrl-x` | Close the active chat window |
 | `kill_subagent` | `ctrl-k` | Kill the focused subagent |
+| `drop_queue` | `alt-x` | Drop queued interjections (without cancelling the run) |
+
+### Input-editor commands
+
+| Command | Default | Action |
+|---|---|---|
+| `cursor_line_start` | `ctrl-a`, `home` | Cursor to start of line |
+| `cursor_line_end` | `ctrl-e`, `end` | Cursor to end of line |
+| `cursor_left` | `ctrl-b`, `left` | Cursor one character left |
+| `cursor_right` | `right` | Cursor one character right |
+| `word_left` | `alt-b`, `alt-left` | Cursor one word left |
+| `word_right` | `alt-f`, `alt-right` | Cursor one word right |
+| `delete_char_back` | `ctrl-h` | Delete character before cursor |
+| `kill_to_line_end` | `ctrl-k` | Kill to end of line |
+| `kill_to_line_start` | `ctrl-u` | Kill to start of line |
+| `kill_word_back` | `ctrl-w` | Kill word before cursor |
+| `delete_word_back` | `alt-backspace` | Delete word before cursor |
+| `delete_word_forward` | `alt-d` | Delete word after cursor |
+| `yank` | `ctrl-y` | Paste from the kill-ring |
+| `yank_pop` | `alt-y` | Cycle the kill-ring at the last yank |
+| `history_prev` | `ctrl-p` | Previous history entry |
+| `history_next` | `ctrl-n` | Next history entry |
+| `reverse_search` | `ctrl-f` | Reverse-i-search over history |
+| `line_up` | `up` | Up one line (then history) |
+| `line_down` | `down` | Down one line (then history) |
+
+Some chords serve both contexts (e.g. `ctrl-k` is `kill_subagent` *and*
+`kill_to_line_end`, `ctrl-n` is `next_chat` *and* `history_next`). The
+global command only fires in its situation — `kill_subagent` only when the
+input box is empty, chat nav only with more than one chat window — so the
+editor handler gets the key the rest of the time.
+
+### Chord sequences (emacs-style)
+
+A `key` may be a sequence like `ctrl-x ctrl-s`. After the first chord the
+footer shows the pending prefix (`ctrl-x-`) and waits; the next chord
+completes (or aborts) the sequence. **Esc** or **Ctrl+G** cancels a
+pending prefix. Sequences fire for **global commands only**; a sequence
+bound to an input command is rejected with a startup warning. Binding a
+sequence whose first chord is also a single-key command disables that
+single-key binding (the sequence wins) — you'll see a warning.
 
 Notes:
-- **Not rebindable** (kept fixed): the text-editing keys in the input box
-  (Ctrl+A/E/W, kill-ring, word motion, history) and the universal
-  cancel/interrupt gesture (**Ctrl+C / Ctrl+D / Esc**) — the latter must
-  always be available as the panic button.
-- Rebinding a command to a key the input editor uses (e.g. `ctrl-a`)
-  shadows that editing key while the binding is active.
+- **Always fixed** (never rebindable): the cancel/interrupt gesture
+  **Ctrl+C / Ctrl+D / Esc** (the panic button) and intrinsic editing —
+  typing a character, **Backspace**, **Delete**, **Enter** to submit, and
+  **Tab** completion.
+- Plugins can also add and override bindings; user config always wins over
+  a plugin. See [plugins.md](plugins.md#keyboard-shortcuts).
 - Unrecognized chords or unknown commands are skipped with a warning on
   startup; the rest of the config still loads.
 
