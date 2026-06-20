@@ -684,8 +684,10 @@ single-key binding (the sequence wins) — you'll see a warning.
 Notes:
 - **Always fixed** (never rebindable): the cancel/interrupt gesture
   **Ctrl+C / Ctrl+D / Esc** (the panic button) and intrinsic editing —
-  typing a character, **Backspace**, **Delete**, **Enter** to submit, and
-  **Tab** completion.
+  typing a character, **Backspace**, **Delete**, **Enter** to submit,
+  **Ctrl+J** (insert newline), and **Tab** completion. Binding a global
+  command to one of these chords shadows the intrinsic behavior while
+  active.
 - Plugins can also add and override bindings; user config always wins over
   a plugin. See [plugins.md](plugins.md#keyboard-shortcuts).
 - Unrecognized chords or unknown commands are skipped with a warning on

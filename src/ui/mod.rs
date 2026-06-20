@@ -1395,20 +1395,24 @@ pub async fn run_interactive(
                                 }
                                 SeqClass::Exact(a) => {
                                     chord_pending.clear();
+                                    // Clear the footer's pending-prefix echo
+                                    // even if the resolved action doesn't paint.
+                                    renderer.request_repaint();
                                     seq_action = Some(a);
                                 }
                                 SeqClass::NoMatch => {
                                     if !chord_pending.is_empty() {
                                         // Aborted: this key didn't continue the
-                                        // sequence. Drop the prefix, then let
-                                        // the key possibly start a fresh one.
+                                        // sequence. Drop the prefix (clearing the
+                                        // footer echo), then let the key possibly
+                                        // start a fresh one.
                                         chord_pending.clear();
+                                        renderer.request_repaint();
                                         if matches!(
                                             keymap.classify_seq(&[chord]),
                                             SeqClass::Prefix
                                         ) {
                                             chord_pending.push(chord);
-                                            renderer.request_repaint();
                                             continue;
                                         }
                                     }
@@ -1421,9 +1425,17 @@ pub async fn run_interactive(
                         // (typing, input-editor keys, the Ctrl+C/D/Esc cancel
                         // gesture), which flows through unchanged.
                         let action = seq_action.or_else(|| keymap.resolve(&key));
-                        let is_ctrl_c = key.code == KeyCode::Char('c')
+                        // A completed chord sequence consumes its terminal key:
+                        // it must not be read as a panic gesture (a `… ctrl-c`
+                        // sequence) nor leak into the editor below (a `… ctrl-y`
+                        // sequence would yank). The bound action still dispatches
+                        // through the normal `action` path.
+                        let from_sequence = seq_action.is_some();
+                        let is_ctrl_c = !from_sequence
+                            && key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
-                        let is_ctrl_d = key.code == KeyCode::Char('d')
+                        let is_ctrl_d = !from_sequence
+                            && key.code == KeyCode::Char('d')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if is_ctrl_c || is_ctrl_d {
                             if ui.rewind_picker.active {
@@ -1947,6 +1959,14 @@ pub async fn run_interactive(
                             }
                         }
 
+                        // A completed chord sequence whose global action was
+                        // conditional and didn't fire (e.g. `next_chat` with one
+                        // chat) must still be consumed — never hand its terminal
+                        // chord to the editor.
+                        if from_sequence {
+                            renderer.request_repaint();
+                            continue;
+                        }
                         // Keep the editor's wrap width in sync with the
                         // rendered box so Up/Down move by wrapped display
                         // rows (dirge-5w9v).

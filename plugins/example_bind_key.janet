@@ -13,9 +13,12 @@
 # Reserved keys neither form can override: Ctrl+C, Ctrl+D, Esc (the panic
 # gesture) and the search / rewind picker keys.
 
-# Remap chat scrolling to an emacs sequence.
-(harness/bind-key "ctrl-x ctrl-t" "scroll_to_top")
-(harness/bind-key "ctrl-x ctrl-b" "scroll_to_bottom")
+# Remap chat scrolling to an emacs sequence. NOTE: the first chord of a
+# sequence becomes a prefix key, so don't reuse a chord you still want as a
+# single-key command — here `ctrl-z` has no default binding, whereas using
+# e.g. `ctrl-x` (close_chat) as the prefix would disable close_chat.
+(harness/bind-key "ctrl-z ctrl-t" "scroll_to_top")
+(harness/bind-key "ctrl-z ctrl-b" "scroll_to_bottom")
 
 # Add an alternate chord for an input-editor command.
 (harness/bind-key "alt-a" "cursor_line_start")

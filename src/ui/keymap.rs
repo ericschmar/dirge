@@ -208,7 +208,7 @@ pub enum SeqClass {
 /// Render one chord back to the config chord grammar (e.g. `ctrl-x`),
 /// the inverse of [`parse_chord`]. Used for the pending-prefix footer
 /// echo and conflict warnings.
-pub fn chord_label(chord: &Chord) -> String {
+fn chord_label(chord: &Chord) -> String {
     let (code, mods) = chord;
     let mut s = String::new();
     if mods.contains(KeyModifiers::CONTROL) {
@@ -545,9 +545,23 @@ impl InputKeymap {
     }
 
     /// The input action bound to `key` (as a single-key chord), if any.
-    /// Matches modifiers exactly (consistent with [`Keymap::resolve`]).
+    ///
+    /// An exact `(code, modifiers)` match wins. On a miss, Shift is retried
+    /// as insignificant: the historical hardcoded arms this replaced used
+    /// `modifiers.contains(..)` guards and a bare (unguarded) arm for the
+    /// nav keys, so e.g. `Shift+Left` moved the cursor and `Ctrl+Shift+A`
+    /// jumped to line start. No editing chord binds Shift distinctly, so
+    /// dropping it on a miss restores that tolerance without shadowing any
+    /// explicit binding (which the exact pass already caught).
     pub fn resolve(&self, key: &KeyEvent) -> Option<InputAction> {
-        self.map.get(&[(key.code, key.modifiers)][..]).copied()
+        if let Some(action) = self.map.get(&[(key.code, key.modifiers)][..]).copied() {
+            return Some(action);
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            let without_shift = key.modifiers - KeyModifiers::SHIFT;
+            return self.map.get(&[(key.code, without_shift)][..]).copied();
+        }
+        None
     }
 
     /// Bind a single chord to an action, replacing any existing binding.
@@ -809,6 +823,35 @@ mod tests {
         for ((code, mods), want) in cases {
             assert_eq!(km.resolve(&ev(code, mods)), Some(want), "{code:?}+{mods:?}");
         }
+    }
+
+    #[test]
+    fn input_resolve_treats_shift_as_insignificant_on_miss() {
+        // Regression guard: the old hardcoded arms tolerated extra modifiers
+        // (a bare `KeyCode::Left =>` matched Shift+Left). Exact matching alone
+        // would drop those; resolve retries without Shift.
+        let km = InputKeymap::defaults();
+        // Shift+nav still moves.
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Left, KeyModifiers::SHIFT)),
+            Some(InputAction::CursorLeft)
+        );
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Home, KeyModifiers::SHIFT)),
+            Some(InputAction::CursorLineStart)
+        );
+        // Ctrl+Shift+A still jumps to line start (Shift dropped → Ctrl+A).
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            Some(InputAction::CursorLineStart)
+        );
+        // An explicit Shift binding still wins via the exact pass.
+        let mut km2 = InputKeymap::defaults();
+        km2.insert((KeyCode::Left, KeyModifiers::SHIFT), InputAction::WordLeft);
+        assert_eq!(
+            km2.resolve(&ev(KeyCode::Left, KeyModifiers::SHIFT)),
+            Some(InputAction::WordLeft)
+        );
     }
 
     #[test]
