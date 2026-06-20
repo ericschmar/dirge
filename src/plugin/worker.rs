@@ -1921,7 +1921,7 @@ unsafe fn computer_use_exec_body(
         Some(Ok(output)) => {
             // Return a Janet table with :exit_code and :merged.
             let table = unsafe { janet_table(0) };
-            let exit_code = unsafe { janet_wrap_integer(output.exit_code) };
+            let exit_code = unsafe { wrap_int(output.exit_code) };
             let merged = unsafe { wrap_string(&output.merged) };
             unsafe {
                 janet_table_put(
@@ -1940,7 +1940,7 @@ unsafe fn computer_use_exec_body(
         Some(Err(e)) => {
             // Return an error table so Janet can inspect it
             let table = unsafe { janet_table(0) };
-            let exit_code = unsafe { janet_wrap_integer(-1) };
+            let exit_code = unsafe { wrap_int(-1) };
             let merged = unsafe { wrap_string(&e) };
             unsafe {
                 janet_table_put(
@@ -1960,13 +1960,58 @@ unsafe fn computer_use_exec_body(
     }
 }
 
+/// Wrap an `i32` as a Janet value, portably. `janet_wrap_integer` is only
+/// linkable on x86_64 (it's nanbox-specific); Janet numbers are f64-backed
+/// everywhere, so `janet_wrap_number` is the portable wrap and is exactly
+/// what `janetrs::Janet::integer` falls back to off x86_64. Using it on all
+/// arches keeps the plugin linking on aarch64 (macOS) — dirge-... .
+#[cfg(feature = "plugin")]
+unsafe fn wrap_int(value: i32) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::janet_wrap_number;
+    unsafe { janet_wrap_number(value as f64) }
+}
+
+/// True if `v` is Janet nil. Replaces non-portable raw `.pointer.is_null()`
+/// checks — the `Janet` union's field layout differs across Janet's
+/// nanbox/non-nanbox builds and arches, so probing `.pointer` directly
+/// doesn't compile on aarch64.
+#[cfg(feature = "plugin")]
+unsafe fn is_nil(v: janetrs::lowlevel::Janet) -> bool {
+    use janetrs::lowlevel::*;
+    unsafe { janet_checktype(v, JanetType_JANET_NIL) != 0 }
+}
+
+/// Look up `key` in a Janet table or struct, portably. Avoids casting the
+/// raw `Janet` union's `.pointer` field (not portable across arches) by
+/// unwrapping to the concrete container type first. Returns Janet nil when
+/// `v` is neither a table nor a struct, or the key is absent.
+#[cfg(feature = "plugin")]
+unsafe fn dict_get(v: janetrs::lowlevel::Janet, key: &str) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let k = unsafe { janet_ckeywordv(key.as_ptr(), key.len() as i32) };
+    if unsafe { janet_checktype(v, JanetType_JANET_TABLE) != 0 } {
+        let t = unsafe { janet_unwrap_table(v) };
+        if t.is_null() {
+            return unsafe { janet_wrap_nil() };
+        }
+        unsafe { janet_table_get(t, k) }
+    } else if unsafe { janet_checktype(v, JanetType_JANET_STRUCT) != 0 } {
+        let s = unsafe { janet_unwrap_struct(v) };
+        if s.is_null() {
+            return unsafe { janet_wrap_nil() };
+        }
+        unsafe { janet_struct_get(s, k) }
+    } else {
+        unsafe { janet_wrap_nil() }
+    }
+}
+
 /// Read a string value from a Janet dict/struct by key name.
 #[cfg(feature = "plugin")]
 unsafe fn get_dict_string(v: janetrs::lowlevel::Janet, key: &str) -> Option<String> {
     use janetrs::lowlevel::*;
-    let k = unsafe { janet_ckeywordv(key.as_ptr(), key.len() as i32) };
-    let out = unsafe { janet_table_get(v.pointer as *mut JanetTable, k) };
-    if unsafe { out.pointer }.is_null() {
+    let out = unsafe { dict_get(v, key) };
+    if unsafe { is_nil(out) } {
         return None;
     }
     if unsafe { janet_checktype(out, JanetType_JANET_STRING) } == 0
@@ -1987,9 +2032,8 @@ unsafe fn get_dict_string(v: janetrs::lowlevel::Janet, key: &str) -> Option<Stri
 #[cfg(feature = "plugin")]
 unsafe fn get_dict_int(v: janetrs::lowlevel::Janet, key: &str) -> Option<i64> {
     use janetrs::lowlevel::*;
-    let k = unsafe { janet_ckeywordv(key.as_ptr(), key.len() as i32) };
-    let out = unsafe { janet_table_get(v.pointer as *mut JanetTable, k) };
-    if unsafe { out.pointer }.is_null() {
+    let out = unsafe { dict_get(v, key) };
+    if unsafe { is_nil(out) } {
         return None;
     }
     if unsafe { janet_checktype(out, JanetType_JANET_NUMBER) } == 0 {
@@ -2007,9 +2051,8 @@ unsafe fn get_dict_int(v: janetrs::lowlevel::Janet, key: &str) -> Option<i64> {
 #[cfg(feature = "plugin")]
 unsafe fn get_dict_int_array(v: janetrs::lowlevel::Janet, key: &str) -> Option<Vec<i64>> {
     use janetrs::lowlevel::*;
-    let k = unsafe { janet_ckeywordv(key.as_ptr(), key.len() as i32) };
-    let out = unsafe { janet_table_get(v.pointer as *mut JanetTable, k) };
-    if unsafe { out.pointer }.is_null() {
+    let out = unsafe { dict_get(v, key) };
+    if unsafe { is_nil(out) } {
         return None;
     }
     let is_tuple = unsafe { janet_checktype(out, JanetType_JANET_TUPLE) } != 0;
