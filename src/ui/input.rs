@@ -1,6 +1,7 @@
 use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::ui::keymap::{InputAction, InputKeymap};
 use crate::ui::picker::FilePicker;
 #[cfg(feature = "slash-completion")]
 use crate::ui::slash::CompletionResult;
@@ -256,6 +257,10 @@ pub struct InputEditor {
     search_match_idx: Option<usize>,
     /// Buffer + cursor stashed when entering search mode. Restored on cancel.
     search_draft: Option<(CompactString, usize)>,
+    /// Resolves a key chord to a rebindable [`InputAction`]. Built-in
+    /// defaults reproduce the historical text-editing keys; config/plugin
+    /// overrides layer on in later phases (dirge-8fkp).
+    keymap: InputKeymap,
 }
 
 /// Find the marker block `\x01<digits>\x01` containing or starting at
@@ -413,6 +418,7 @@ impl InputEditor {
             search_query: CompactString::new(""),
             search_match_idx: None,
             search_draft: None,
+            keymap: InputKeymap::defaults(),
         }
     }
 
@@ -818,6 +824,250 @@ impl InputEditor {
         }
     }
 
+    /// Apply a resolved rebindable editing command (dirge-8fkp). The
+    /// bodies are the historical hardcoded `handle_key` arms moved behind
+    /// the [`InputAction`] enum unchanged, so the default keymap reproduces
+    /// the old behavior exactly.
+    fn apply_input_action(&mut self, action: InputAction) -> Option<CompactString> {
+        match action {
+            InputAction::CursorLineStart => {
+                self.cursor = cursor_line_start(&self.buffer, self.cursor);
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::CursorLineEnd => {
+                self.cursor = cursor_line_end(&self.buffer, self.cursor);
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::CursorLeft => {
+                if self.cursor > 0 {
+                    self.cursor = prev_pos(&self.buffer, self.cursor);
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::CursorRight => {
+                // At end-of-line with a slash-command ghost completion
+                // showing, Right accepts it (fills in the suffix) instead
+                // of just moving the cursor.
+                #[cfg(feature = "slash-completion")]
+                {
+                    if self.cursor == self.buffer.len()
+                        && let Some(suffix) = crate::ui::slash::ghost_suffix(self.buffer.as_str())
+                    {
+                        self.buffer.push_str(&suffix);
+                        self.cursor = self.buffer.len();
+                        self.reset_kill_accumulation();
+                        return None;
+                    }
+                }
+                if self.cursor < self.buffer.len() {
+                    self.cursor = next_pos(&self.buffer, self.cursor);
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::WordLeft => {
+                if self.cursor > 0 {
+                    self.cursor = prev_word_pos(&self.buffer, self.cursor);
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::WordRight => {
+                if self.cursor < self.buffer.len() {
+                    self.cursor = next_word_pos(&self.buffer, self.cursor);
+                } else {
+                    self.cursor = self.buffer.len();
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::DeleteCharBack => {
+                if let Some((start, end)) = backspace_range(&self.buffer, self.cursor) {
+                    self.remove_range(start, end);
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::KillToLineEnd => {
+                if self.cursor < self.buffer.len() {
+                    let killed: CompactString = self.buffer[self.cursor..].into();
+                    self.buffer.truncate(self.cursor);
+                    self.push_kill(killed, KillDir::Append);
+                }
+                None
+            }
+            InputAction::KillToLineStart => {
+                let line_start = cursor_line_start(&self.buffer, self.cursor);
+                if self.cursor > line_start {
+                    let killed: CompactString = self.buffer[line_start..self.cursor].into();
+                    let after = &self.buffer[self.cursor..];
+                    self.buffer = [&self.buffer[..line_start], after].concat().into();
+                    self.cursor = line_start;
+                    self.push_kill(killed, KillDir::Prepend);
+                }
+                None
+            }
+            InputAction::KillWordBack => {
+                if self.cursor > 0 {
+                    let start = prev_word_pos(&self.buffer, self.cursor);
+                    let killed: CompactString = self.buffer[start..self.cursor].into();
+                    self.buffer.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                    self.push_kill(killed, KillDir::Prepend);
+                }
+                None
+            }
+            InputAction::DeleteWordBack => {
+                if self.cursor > 0 {
+                    let start = prev_word_pos(&self.buffer, self.cursor);
+                    self.buffer.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::DeleteWordForward => {
+                if self.cursor < self.buffer.len() {
+                    let end = next_word_pos(&self.buffer, self.cursor);
+                    self.buffer.replace_range(self.cursor..end, "");
+                }
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::Yank => {
+                if let Some(text) = self.kill_ring.first() {
+                    let text = text.clone();
+                    let len = text.len();
+                    self.buffer.insert_str(self.cursor, &text);
+                    self.yank_state = Some(YankState {
+                        index: 0,
+                        cursor: self.cursor,
+                        len,
+                    });
+                    self.cursor += len;
+                }
+                self.last_action_was_kill = false;
+                None
+            }
+            InputAction::YankPop => {
+                if let Some(ref state) = self.yank_state {
+                    let range_end = state.cursor + state.len;
+                    if self.kill_ring.len() > 1 && range_end <= self.buffer.len() {
+                        let next = (state.index + 1) % self.kill_ring.len();
+                        if let Some(text) = self.kill_ring.get(next) {
+                            let text = text.clone();
+                            self.buffer.replace_range(state.cursor..range_end, "");
+                            self.buffer.insert_str(state.cursor, &text);
+                            self.cursor = state.cursor + text.len();
+                            self.yank_state = Some(YankState {
+                                index: next,
+                                cursor: state.cursor,
+                                len: text.len(),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            InputAction::HistoryPrev => {
+                self.history_up();
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::HistoryNext => {
+                self.history_down();
+                self.reset_kill_accumulation();
+                None
+            }
+            InputAction::ReverseSearch => {
+                self.enter_search();
+                None
+            }
+            InputAction::LineUp => {
+                self.reset_kill_accumulation();
+                // If already navigating history, continue.
+                if self.history_pos.is_some() {
+                    self.history_up();
+                    return None;
+                }
+                // Wrap-aware vertical motion: move by displayed (soft-
+                // wrapped) rows when the width is known and the buffer
+                // has no paste placeholders (display == raw). At the top
+                // display row, fall through to history (dirge-5w9v).
+                if self.wrap_w > 0 && marker_blocks(&self.buffer).is_empty() {
+                    if let Some(pos) =
+                        wrap_vertical_target(&self.buffer, self.cursor, self.wrap_w, true)
+                    {
+                        self.cursor = pos;
+                    } else {
+                        self.history_up();
+                    }
+                    return None;
+                }
+                // Fallback (markers present / width unknown): hard-newline
+                // motion, then history.
+                if let Some(pos) = prev_line_start(&self.buffer, self.cursor) {
+                    let line_start = cursor_line_start(&self.buffer, self.cursor);
+                    // H-batch1-2 (audit fix): map by CHAR column, not
+                    // byte column. Adding `cursor - line_start` (a
+                    // byte distance) to `pos` could land mid-codepoint
+                    // when either line has multi-byte chars — the
+                    // next `replace_range`/slice would panic with
+                    // "byte index N is not a char boundary."
+                    let char_col = self.buffer[line_start..self.cursor].chars().count();
+                    let target_line_end = self.buffer[pos..]
+                        .find('\n')
+                        .map(|p| pos + p)
+                        .unwrap_or(self.buffer.len());
+                    self.cursor = byte_at_char_col(&self.buffer, pos, target_line_end, char_col);
+                    return None;
+                }
+                // At top of buffer → fall through to history.
+                self.history_up();
+                None
+            }
+            InputAction::LineDown => {
+                self.reset_kill_accumulation();
+                // If already navigating history, continue.
+                if self.history_pos.is_some() {
+                    self.history_down();
+                    return None;
+                }
+                // Wrap-aware vertical motion (see InputAction::LineUp). At the
+                // bottom display row, fall through to history (dirge-5w9v).
+                if self.wrap_w > 0 && marker_blocks(&self.buffer).is_empty() {
+                    if let Some(pos) =
+                        wrap_vertical_target(&self.buffer, self.cursor, self.wrap_w, false)
+                    {
+                        self.cursor = pos;
+                    } else {
+                        self.history_down();
+                    }
+                    return None;
+                }
+                // Fallback (markers present / width unknown): hard-newline
+                // motion, then history.
+                if let Some(pos) = next_line_start(&self.buffer, self.cursor) {
+                    let line_start = cursor_line_start(&self.buffer, self.cursor);
+                    // H-batch1-2 (audit fix) — see InputAction::LineUp.
+                    let char_col = self.buffer[line_start..self.cursor].chars().count();
+                    let target_line_end = self.buffer[pos..]
+                        .find('\n')
+                        .map(|p| pos + p)
+                        .unwrap_or(self.buffer.len());
+                    self.cursor = byte_at_char_col(&self.buffer, pos, target_line_end, char_col);
+                    return None;
+                }
+                // At bottom of buffer → fall through to history.
+                self.history_down();
+                None
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -842,6 +1092,14 @@ impl InputEditor {
         // ── search-mode dispatch ───────────────────────────
         if self.search_mode {
             return self.handle_search_key(key);
+        }
+
+        // Rebindable editing commands (cursor/word motion, kill-ring, yank,
+        // history) resolve through the input keymap (dirge-8fkp). Intrinsic
+        // keys — char insertion, Enter, Backspace, Delete, Tab — are NOT
+        // rebindable and fall through to the match below.
+        if let Some(action) = self.keymap.resolve(&key) {
+            return self.apply_input_action(action);
         }
 
         match key.code {
@@ -907,193 +1165,6 @@ impl InputEditor {
                 }
             }
 
-            // Ctrl+A → start of current line
-            KeyCode::Char('a') if ctrl => {
-                self.cursor = cursor_line_start(&self.buffer, self.cursor);
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Ctrl+E → end of current line
-            KeyCode::Char('e') if ctrl => {
-                self.cursor = cursor_line_end(&self.buffer, self.cursor);
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Ctrl+B → left one char
-            KeyCode::Char('b') if ctrl => {
-                if self.cursor > 0 {
-                    self.cursor = prev_pos(&self.buffer, self.cursor);
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Ctrl+F → reverse-i-search
-            KeyCode::Char('f') if ctrl => {
-                self.enter_search();
-                None
-            }
-
-            // Ctrl+K → kill to end of line
-            KeyCode::Char('k') if ctrl => {
-                if self.cursor < self.buffer.len() {
-                    let killed: CompactString = self.buffer[self.cursor..].into();
-                    self.buffer.truncate(self.cursor);
-                    self.push_kill(killed, KillDir::Append);
-                }
-                None
-            }
-
-            // Ctrl+U → kill to start of current line
-            KeyCode::Char('u') if ctrl => {
-                let line_start = cursor_line_start(&self.buffer, self.cursor);
-                if self.cursor > line_start {
-                    let killed: CompactString = self.buffer[line_start..self.cursor].into();
-                    let after = &self.buffer[self.cursor..];
-                    self.buffer = [&self.buffer[..line_start], after].concat().into();
-                    self.cursor = line_start;
-                    self.push_kill(killed, KillDir::Prepend);
-                }
-                None
-            }
-
-            // Ctrl+W → kill word before
-            KeyCode::Char('w') if ctrl => {
-                if self.cursor > 0 {
-                    let start = prev_word_pos(&self.buffer, self.cursor);
-                    let killed: CompactString = self.buffer[start..self.cursor].into();
-                    self.buffer.replace_range(start..self.cursor, "");
-                    self.cursor = start;
-                    self.push_kill(killed, KillDir::Prepend);
-                }
-                None
-            }
-
-            // Ctrl+H or Backspace (plain)
-            KeyCode::Char('h') if ctrl => {
-                if let Some((start, end)) = backspace_range(&self.buffer, self.cursor) {
-                    self.remove_range(start, end);
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Ctrl+Y → yank
-            KeyCode::Char('y') if ctrl => {
-                if let Some(text) = self.kill_ring.first() {
-                    let text = text.clone();
-                    let len = text.len();
-                    self.buffer.insert_str(self.cursor, &text);
-                    self.yank_state = Some(YankState {
-                        index: 0,
-                        cursor: self.cursor,
-                        len,
-                    });
-                    self.cursor += len;
-                }
-                self.last_action_was_kill = false;
-                None
-            }
-
-            // Ctrl+N → history down
-            KeyCode::Char('n') if ctrl => {
-                self.history_down();
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Ctrl+P → history up
-            KeyCode::Char('p') if ctrl => {
-                self.history_up();
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Meta+Y → yank-pop (cycle kill ring)
-            KeyCode::Char('y') if alt => {
-                if let Some(ref state) = self.yank_state {
-                    let range_end = state.cursor + state.len;
-                    if self.kill_ring.len() > 1 && range_end <= self.buffer.len() {
-                        let next = (state.index + 1) % self.kill_ring.len();
-                        if let Some(text) = self.kill_ring.get(next) {
-                            let text = text.clone();
-                            self.buffer.replace_range(state.cursor..range_end, "");
-                            self.buffer.insert_str(state.cursor, &text);
-                            self.cursor = state.cursor + text.len();
-                            self.yank_state = Some(YankState {
-                                index: next,
-                                cursor: state.cursor,
-                                len: text.len(),
-                            });
-                        }
-                    }
-                }
-                None
-            }
-
-            // Meta+D → delete word after
-            KeyCode::Char('d') if alt => {
-                if self.cursor < self.buffer.len() {
-                    let end = next_word_pos(&self.buffer, self.cursor);
-                    self.buffer.replace_range(self.cursor..end, "");
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Meta+B → prev word (Emacs style)
-            KeyCode::Char('b') if alt => {
-                if self.cursor > 0 {
-                    self.cursor = prev_word_pos(&self.buffer, self.cursor);
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Meta+F → next word (Emacs style)
-            KeyCode::Char('f') if alt => {
-                if self.cursor < self.buffer.len() {
-                    self.cursor = next_word_pos(&self.buffer, self.cursor);
-                } else {
-                    self.cursor = self.buffer.len();
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Meta+Left → prev word
-            KeyCode::Left if alt => {
-                if self.cursor > 0 {
-                    self.cursor = prev_word_pos(&self.buffer, self.cursor);
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Meta+Right → next word
-            KeyCode::Right if alt => {
-                if self.cursor < self.buffer.len() {
-                    self.cursor = next_word_pos(&self.buffer, self.cursor);
-                } else {
-                    self.cursor = self.buffer.len();
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            // Meta+Backspace → delete word before
-            KeyCode::Backspace if alt => {
-                if self.cursor > 0 {
-                    let start = prev_word_pos(&self.buffer, self.cursor);
-                    self.buffer.replace_range(start..self.cursor, "");
-                    self.cursor = start;
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
             // Plain char: only if not ctrl/alt-modified
             KeyCode::Char(c) if !ctrl && !alt => {
                 if c == '@' {
@@ -1123,129 +1194,6 @@ impl InputEditor {
                     self.remove_range(start, end);
                 }
                 self.reset_kill_accumulation();
-                None
-            }
-
-            KeyCode::Left => {
-                if self.cursor > 0 {
-                    self.cursor = prev_pos(&self.buffer, self.cursor);
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            KeyCode::Right => {
-                // At end-of-line with a slash-command ghost completion
-                // showing, Right accepts it (fills in the suffix) instead
-                // of just moving the cursor.
-                #[cfg(feature = "slash-completion")]
-                {
-                    if self.cursor == self.buffer.len()
-                        && let Some(suffix) = crate::ui::slash::ghost_suffix(self.buffer.as_str())
-                    {
-                        self.buffer.push_str(&suffix);
-                        self.cursor = self.buffer.len();
-                        self.reset_kill_accumulation();
-                        return None;
-                    }
-                }
-                if self.cursor < self.buffer.len() {
-                    self.cursor = next_pos(&self.buffer, self.cursor);
-                }
-                self.reset_kill_accumulation();
-                None
-            }
-
-            KeyCode::Home => {
-                self.cursor = cursor_line_start(&self.buffer, self.cursor);
-                self.reset_kill_accumulation();
-                None
-            }
-
-            KeyCode::End => {
-                self.cursor = cursor_line_end(&self.buffer, self.cursor);
-                self.reset_kill_accumulation();
-                None
-            }
-
-            KeyCode::Up => {
-                self.reset_kill_accumulation();
-                // If already navigating history, continue.
-                if self.history_pos.is_some() {
-                    self.history_up();
-                    return None;
-                }
-                // Wrap-aware vertical motion: move by displayed (soft-
-                // wrapped) rows when the width is known and the buffer
-                // has no paste placeholders (display == raw). At the top
-                // display row, fall through to history (dirge-5w9v).
-                if self.wrap_w > 0 && marker_blocks(&self.buffer).is_empty() {
-                    if let Some(pos) =
-                        wrap_vertical_target(&self.buffer, self.cursor, self.wrap_w, true)
-                    {
-                        self.cursor = pos;
-                    } else {
-                        self.history_up();
-                    }
-                    return None;
-                }
-                // Fallback (markers present / width unknown): hard-newline
-                // motion, then history.
-                if let Some(pos) = prev_line_start(&self.buffer, self.cursor) {
-                    let line_start = cursor_line_start(&self.buffer, self.cursor);
-                    // H-batch1-2 (audit fix): map by CHAR column, not
-                    // byte column. Adding `cursor - line_start` (a
-                    // byte distance) to `pos` could land mid-codepoint
-                    // when either line has multi-byte chars — the
-                    // next `replace_range`/slice would panic with
-                    // "byte index N is not a char boundary."
-                    let char_col = self.buffer[line_start..self.cursor].chars().count();
-                    let target_line_end = self.buffer[pos..]
-                        .find('\n')
-                        .map(|p| pos + p)
-                        .unwrap_or(self.buffer.len());
-                    self.cursor = byte_at_char_col(&self.buffer, pos, target_line_end, char_col);
-                    return None;
-                }
-                // At top of buffer → fall through to history.
-                self.history_up();
-                None
-            }
-
-            KeyCode::Down => {
-                self.reset_kill_accumulation();
-                // If already navigating history, continue.
-                if self.history_pos.is_some() {
-                    self.history_down();
-                    return None;
-                }
-                // Wrap-aware vertical motion (see KeyCode::Up). At the
-                // bottom display row, fall through to history (dirge-5w9v).
-                if self.wrap_w > 0 && marker_blocks(&self.buffer).is_empty() {
-                    if let Some(pos) =
-                        wrap_vertical_target(&self.buffer, self.cursor, self.wrap_w, false)
-                    {
-                        self.cursor = pos;
-                    } else {
-                        self.history_down();
-                    }
-                    return None;
-                }
-                // Fallback (markers present / width unknown): hard-newline
-                // motion, then history.
-                if let Some(pos) = next_line_start(&self.buffer, self.cursor) {
-                    let line_start = cursor_line_start(&self.buffer, self.cursor);
-                    // H-batch1-2 (audit fix) — see KeyCode::Up.
-                    let char_col = self.buffer[line_start..self.cursor].chars().count();
-                    let target_line_end = self.buffer[pos..]
-                        .find('\n')
-                        .map(|p| pos + p)
-                        .unwrap_or(self.buffer.len());
-                    self.cursor = byte_at_char_col(&self.buffer, pos, target_line_end, char_col);
-                    return None;
-                }
-                // At bottom of buffer → fall through to history.
-                self.history_down();
                 None
             }
 
@@ -1561,6 +1509,66 @@ impl InputEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // dirge-8fkp: input keys now dispatch through the InputKeymap. These
+    // pin that the default chords still drive the historical editing
+    // actions through handle_key, and that remapping the keymap reroutes a
+    // chord (the whole point of the refactor).
+
+    fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn ctrl_a_e_move_to_line_bounds_via_keymap() {
+        let mut e = InputEditor::new();
+        e.insert_str("hello world");
+        e.handle_key(ev(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(e.cursor, 0, "Ctrl+A → line start");
+        e.handle_key(ev(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(e.cursor, e.buffer.len(), "Ctrl+E → line end");
+        // Home/End are the same actions on different chords.
+        e.handle_key(ev(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(e.cursor, 0);
+        e.handle_key(ev(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(e.cursor, e.buffer.len());
+    }
+
+    #[test]
+    fn ctrl_k_w_kill_through_keymap() {
+        let mut e = InputEditor::new();
+        e.insert_str("foo bar baz");
+        e.handle_key(ev(KeyCode::Char('a'), KeyModifiers::CONTROL)); // to start
+        e.handle_key(ev(KeyCode::Char('k'), KeyModifiers::CONTROL)); // kill to end
+        assert_eq!(e.buffer.as_str(), "");
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::CONTROL)); // yank it back
+        assert_eq!(e.buffer.as_str(), "foo bar baz");
+        // Ctrl+W kills the word before the cursor (cursor at end).
+        e.handle_key(ev(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(e.buffer.as_str(), "foo bar ");
+    }
+
+    #[test]
+    fn plain_char_still_inserts_after_refactor() {
+        let mut e = InputEditor::new();
+        // A bare 'a' is intrinsic, not the Ctrl+A action — it must insert.
+        e.handle_key(ev(KeyCode::Char('a'), KeyModifiers::NONE));
+        e.handle_key(ev(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(e.buffer.as_str(), "ab");
+        assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn remapping_the_keymap_reroutes_a_chord() {
+        let mut e = InputEditor::new();
+        e.insert_str("hello world");
+        // Rebind Ctrl+A to move to line END instead of start.
+        e.keymap
+            .insert((KeyCode::Char('a'), KeyModifiers::CONTROL), InputAction::CursorLineEnd);
+        e.cursor = 3;
+        e.handle_key(ev(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(e.cursor, e.buffer.len(), "Ctrl+A now goes to line end");
+    }
 
     // dirge-5w9v: vertical motion moves by SOFT-wrapped display rows.
     // "abcdefghij" at wrap_w=4 wraps to ["abcd","efgh","ij"].

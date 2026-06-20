@@ -7,10 +7,13 @@
 //! `{ key, command }`) overrides them per chord, exactly like a VSCode
 //! `keybindings.json`.
 //!
-//! Out of scope (kept fixed): the input-editor's text-editing keys
-//! (Ctrl+A/E/W, kill-ring, word motion, history) and the universal
-//! cancel/interrupt gesture (Ctrl+C / Ctrl+D / Esc) — the latter must
-//! always be available as the panic button.
+//! The input-editor's text-editing keys (Ctrl+A/E/W, kill-ring, word
+//! motion, history) resolve through the sibling [`InputKeymap`] over
+//! [`InputAction`] — same mechanism, a separate context (it dispatches
+//! inside the text box rather than at the chat level). Kept fixed in both:
+//! the universal cancel/interrupt gesture (Ctrl+C / Ctrl+D / Esc) — the
+//! panic button must always be available — and intrinsic editing (typing a
+//! character, Backspace, Delete, Enter to submit, Tab completion).
 
 use std::collections::HashMap;
 
@@ -184,6 +187,234 @@ impl Keymap {
     /// The action bound to `key`, if any. Matches modifiers exactly.
     pub fn resolve(&self, key: &KeyEvent) -> Option<KeyAction> {
         self.map.get(&(key.code, key.modifiers)).copied()
+    }
+}
+
+/// A rebindable input-editor command (dirge-8fkp). The text box used to
+/// dispatch these from a hardcoded `match` in [`crate::ui::input`]; they
+/// now resolve through an [`InputKeymap`] the same way the global command
+/// keys resolve through [`Keymap`], so they can be remapped from config
+/// (phase 2) and by plugins (phase 3). Only NAMED editing commands are
+/// here — intrinsic editing (typing a character, Backspace, Delete, Enter
+/// to submit, Tab completion) and the Ctrl+C/D/Esc panic gesture stay
+/// fixed and are handled directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAction {
+    /// Cursor to the start of the current (visual) line.
+    CursorLineStart,
+    /// Cursor to the end of the current (visual) line.
+    CursorLineEnd,
+    /// Cursor one character left.
+    CursorLeft,
+    /// Cursor one character right (accepts a slash ghost-completion at EOL).
+    CursorRight,
+    /// Cursor one word left.
+    WordLeft,
+    /// Cursor one word right.
+    WordRight,
+    /// Delete the character before the cursor (Ctrl+H synonym for
+    /// Backspace; the Backspace key itself stays intrinsic).
+    DeleteCharBack,
+    /// Kill (cut to the kill-ring) from the cursor to end of line.
+    KillToLineEnd,
+    /// Kill from the start of the line to the cursor.
+    KillToLineStart,
+    /// Kill the word before the cursor (adds to the kill-ring).
+    KillWordBack,
+    /// Delete the word before the cursor (no kill-ring — distinct from
+    /// [`InputAction::KillWordBack`]).
+    DeleteWordBack,
+    /// Delete the word after the cursor (no kill-ring).
+    DeleteWordForward,
+    /// Yank (paste) the top of the kill-ring.
+    Yank,
+    /// Yank-pop: cycle the kill-ring at the last yank.
+    YankPop,
+    /// Recall the previous history entry.
+    HistoryPrev,
+    /// Recall the next history entry.
+    HistoryNext,
+    /// Enter reverse-i-search over history.
+    ReverseSearch,
+    /// Up: wrap-aware line motion, then history at the top row.
+    LineUp,
+    /// Down: wrap-aware line motion, then history at the bottom row.
+    LineDown,
+}
+
+impl InputAction {
+    /// All input actions, each with its config command name and default
+    /// chords. Single source of truth for the default [`InputKeymap`], the
+    /// command-name lookup, and the docs — mirrors [`KeyAction::ALL`].
+    #[allow(clippy::type_complexity)]
+    pub const ALL: &'static [(InputAction, &'static str, &'static [(KeyCode, KeyModifiers)])] = &[
+        (
+            InputAction::CursorLineStart,
+            "cursor_line_start",
+            &[
+                (KeyCode::Char('a'), KeyModifiers::CONTROL),
+                (KeyCode::Home, KeyModifiers::NONE),
+            ],
+        ),
+        (
+            InputAction::CursorLineEnd,
+            "cursor_line_end",
+            &[
+                (KeyCode::Char('e'), KeyModifiers::CONTROL),
+                (KeyCode::End, KeyModifiers::NONE),
+            ],
+        ),
+        (
+            InputAction::CursorLeft,
+            "cursor_left",
+            &[
+                (KeyCode::Char('b'), KeyModifiers::CONTROL),
+                (KeyCode::Left, KeyModifiers::NONE),
+            ],
+        ),
+        (
+            InputAction::CursorRight,
+            "cursor_right",
+            &[(KeyCode::Right, KeyModifiers::NONE)],
+        ),
+        (
+            InputAction::WordLeft,
+            "word_left",
+            &[
+                (KeyCode::Char('b'), KeyModifiers::ALT),
+                (KeyCode::Left, KeyModifiers::ALT),
+            ],
+        ),
+        (
+            InputAction::WordRight,
+            "word_right",
+            &[
+                (KeyCode::Char('f'), KeyModifiers::ALT),
+                (KeyCode::Right, KeyModifiers::ALT),
+            ],
+        ),
+        (
+            InputAction::DeleteCharBack,
+            "delete_char_back",
+            &[(KeyCode::Char('h'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::KillToLineEnd,
+            "kill_to_line_end",
+            &[(KeyCode::Char('k'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::KillToLineStart,
+            "kill_to_line_start",
+            &[(KeyCode::Char('u'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::KillWordBack,
+            "kill_word_back",
+            &[(KeyCode::Char('w'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::DeleteWordBack,
+            "delete_word_back",
+            &[(KeyCode::Backspace, KeyModifiers::ALT)],
+        ),
+        (
+            InputAction::DeleteWordForward,
+            "delete_word_forward",
+            &[(KeyCode::Char('d'), KeyModifiers::ALT)],
+        ),
+        (
+            InputAction::Yank,
+            "yank",
+            &[(KeyCode::Char('y'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::YankPop,
+            "yank_pop",
+            &[(KeyCode::Char('y'), KeyModifiers::ALT)],
+        ),
+        (
+            InputAction::HistoryPrev,
+            "history_prev",
+            &[(KeyCode::Char('p'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::HistoryNext,
+            "history_next",
+            &[(KeyCode::Char('n'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::ReverseSearch,
+            "reverse_search",
+            &[(KeyCode::Char('f'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::LineUp,
+            "line_up",
+            &[(KeyCode::Up, KeyModifiers::NONE)],
+        ),
+        (
+            InputAction::LineDown,
+            "line_down",
+            &[(KeyCode::Down, KeyModifiers::NONE)],
+        ),
+    ];
+
+    /// Resolve a config command name (case-insensitive, `-`/`_` agnostic)
+    /// to an input action. `None` for unknown commands.
+    // Used by the config/plugin layering in phase 2 (dirge-xv9l); the
+    // default keymap reaches input actions via `ALL` directly until then.
+    #[allow(dead_code)]
+    pub fn from_command(name: &str) -> Option<InputAction> {
+        let norm = name.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL
+            .iter()
+            .find(|(_, cmd, _)| *cmd == norm)
+            .map(|(a, _, _)| *a)
+    }
+
+    /// Comma-separated list of every valid input command name.
+    #[allow(dead_code)] // phase 2 (dirge-xv9l) — see `from_command`.
+    pub fn command_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|(_, c, _)| *c)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Resolves key chords to [`InputAction`]s: built-in defaults reproduce
+/// the historical hardcoded text-editing keys. The config/plugin override
+/// layering arrives in later phases; for now this is defaults-only.
+#[derive(Debug, Clone, Default)]
+pub struct InputKeymap {
+    map: HashMap<(KeyCode, KeyModifiers), InputAction>,
+}
+
+impl InputKeymap {
+    /// The built-in input keymap (no config applied).
+    pub fn defaults() -> Self {
+        let mut map = HashMap::new();
+        for (action, _, chords) in InputAction::ALL {
+            for chord in *chords {
+                map.insert(*chord, *action);
+            }
+        }
+        Self { map }
+    }
+
+    /// The input action bound to `key`, if any. Matches modifiers exactly
+    /// (consistent with [`Keymap::resolve`]).
+    pub fn resolve(&self, key: &KeyEvent) -> Option<InputAction> {
+        self.map.get(&(key.code, key.modifiers)).copied()
+    }
+
+    /// Bind a chord to an action, replacing any existing binding. Test-only
+    /// until the config/plugin layering lands (phase 2, dirge-xv9l).
+    #[cfg(test)]
+    pub fn insert(&mut self, chord: (KeyCode, KeyModifiers), action: InputAction) {
+        self.map.insert(chord, action);
     }
 }
 
@@ -385,5 +616,75 @@ mod tests {
         assert_eq!(warns.len(), 2, "{warns:?}");
         assert!(warns[0].contains("unrecognized key"));
         assert!(warns[1].contains("unknown command"));
+    }
+
+    // --- InputKeymap (dirge-8fkp) ----------------------------------
+
+    #[test]
+    fn input_defaults_resolve_historical_chords() {
+        let km = InputKeymap::defaults();
+        // A representative sweep of the historical text-editing keys.
+        let cases = [
+            ((KeyCode::Char('a'), KeyModifiers::CONTROL), InputAction::CursorLineStart),
+            ((KeyCode::Home, KeyModifiers::NONE), InputAction::CursorLineStart),
+            ((KeyCode::Char('e'), KeyModifiers::CONTROL), InputAction::CursorLineEnd),
+            ((KeyCode::End, KeyModifiers::NONE), InputAction::CursorLineEnd),
+            ((KeyCode::Char('b'), KeyModifiers::CONTROL), InputAction::CursorLeft),
+            ((KeyCode::Left, KeyModifiers::NONE), InputAction::CursorLeft),
+            ((KeyCode::Right, KeyModifiers::NONE), InputAction::CursorRight),
+            ((KeyCode::Char('b'), KeyModifiers::ALT), InputAction::WordLeft),
+            ((KeyCode::Left, KeyModifiers::ALT), InputAction::WordLeft),
+            ((KeyCode::Char('f'), KeyModifiers::ALT), InputAction::WordRight),
+            ((KeyCode::Right, KeyModifiers::ALT), InputAction::WordRight),
+            ((KeyCode::Char('k'), KeyModifiers::CONTROL), InputAction::KillToLineEnd),
+            ((KeyCode::Char('u'), KeyModifiers::CONTROL), InputAction::KillToLineStart),
+            ((KeyCode::Char('w'), KeyModifiers::CONTROL), InputAction::KillWordBack),
+            ((KeyCode::Backspace, KeyModifiers::ALT), InputAction::DeleteWordBack),
+            ((KeyCode::Char('d'), KeyModifiers::ALT), InputAction::DeleteWordForward),
+            ((KeyCode::Char('y'), KeyModifiers::CONTROL), InputAction::Yank),
+            ((KeyCode::Char('y'), KeyModifiers::ALT), InputAction::YankPop),
+            ((KeyCode::Char('p'), KeyModifiers::CONTROL), InputAction::HistoryPrev),
+            ((KeyCode::Char('n'), KeyModifiers::CONTROL), InputAction::HistoryNext),
+            ((KeyCode::Char('f'), KeyModifiers::CONTROL), InputAction::ReverseSearch),
+            ((KeyCode::Up, KeyModifiers::NONE), InputAction::LineUp),
+            ((KeyCode::Down, KeyModifiers::NONE), InputAction::LineDown),
+        ];
+        for ((code, mods), want) in cases {
+            assert_eq!(km.resolve(&ev(code, mods)), Some(want), "{code:?}+{mods:?}");
+        }
+    }
+
+    #[test]
+    fn input_intrinsic_keys_are_unbound() {
+        // Plain chars, Backspace, Delete, Enter, Tab stay intrinsic — they
+        // must NOT resolve to a rebindable action (so handle_key keeps them).
+        let km = InputKeymap::defaults();
+        for (code, mods) in [
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Delete, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            assert_eq!(km.resolve(&ev(code, mods)), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn every_input_command_name_round_trips() {
+        // ALL is the single source of truth: each command name resolves back
+        // to its action, and unknown names don't.
+        for (action, name, _) in InputAction::ALL {
+            assert_eq!(InputAction::from_command(name), Some(*action), "{name}");
+        }
+        assert_eq!(InputAction::from_command("not_a_command"), None);
+        // Global and input command namespaces stay disjoint (phase 2 routes
+        // a single `keybindings` array across both by name).
+        for (_, name, _) in InputAction::ALL {
+            assert_eq!(KeyAction::from_command(name), None, "collision on {name}");
+        }
+        for (_, name, _) in KeyAction::ALL {
+            assert_eq!(InputAction::from_command(name), None, "collision on {name}");
+        }
     }
 }
