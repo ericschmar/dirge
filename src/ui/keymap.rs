@@ -729,7 +729,11 @@ mod tests {
     fn parse_chord_is_the_one_grammar() {
         // dirge-5kkx.2: parse_key_spec (plugin) now delegates here, so the
         // formerly-divergent cases resolve consistently.
-        assert_eq!(parse_chord("f01"), None, "strict f-keys reject leading zero");
+        assert_eq!(
+            parse_chord("f01"),
+            None,
+            "strict f-keys reject leading zero"
+        );
         assert_eq!(
             parse_chord("bs"),
             Some((KeyCode::Backspace, KeyModifiers::NONE)),
