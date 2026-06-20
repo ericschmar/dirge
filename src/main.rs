@@ -1468,7 +1468,6 @@ async fn main() -> anyhow::Result<()> {
                 .display()
                 .to_string();
             let mut pm = pm_arc.lock_ignore_poison();
-            let workspace = sandbox.workspace().display().to_string();
             let sandbox_mode = sandbox.mode_str();
             let auto_confirm = match cli.auto_confirm {
                 Some(crate::cli::AutoConfirmMode::Yes) => "yes",
@@ -1482,7 +1481,7 @@ async fn main() -> anyhow::Result<()> {
                     escape_janet_string(&model),
                     escape_janet_string(&cwd),
                     escape_janet_string(&provider),
-                    escape_janet_string(&workspace),
+                    escape_janet_string(&cwd),
                     escape_janet_string(sandbox_mode),
                     escape_janet_string(auto_confirm),
                 ),
