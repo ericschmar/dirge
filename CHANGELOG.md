@@ -6,7 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-20
+
+### Changed
+- **`/sessions` uses explicit verbs.** `/sessions list | switch <id> | delete <id>`,
+  with bare `/sessions <id>` still switching as a shortcut. The first argument no
+  longer does double duty as both a `delete` sentinel and a session id, so a
+  session can no longer shadow a subcommand. (dirge-aqi3)
+- **The footer token budget reflects the compaction point.** The status line now
+  measures usage against the budget where auto-compaction kicks in
+  (`fold_threshold × min(model_window, context_target)`) instead of the raw
+  advertised model window, so the percentage tracks how close the next fold is —
+  at 100% a fold is imminent. (dirge-l4rp)
+
 ### Fixed
+- **Deleting the current session no longer leaves a zombie.** Deleting the session
+  you're in removed its file but left the in-memory session pointing at it; you're
+  now booted into a fresh session (new id, same model/provider/cwd) with the agent
+  rebuilt. (dirge-0cvk)
+- **The goal gate no longer acts on a stale compaction summary.** After a resume,
+  the merged system prompt carries a `[CONTEXT COMPACTION — REFERENCE ONLY]`
+  summary whose `## Active Task` describes already-completed work; the goal judge
+  now strips it (matching the critic), so it won't re-demand superseded work. It
+  also no longer risks a panic truncating a multi-byte constraints block. (dirge-wp0e)
 - **Pasting while answering a question no longer leaks into the main prompt.**
   When typing a free-form custom answer in the `question` modal, a paste went
   to the compose editor instead of the answer field — the modal dispatcher only
