@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-20
+
+### Added
+- **Configurable key bindings everywhere.** One `keybindings` array now rebinds
+  both the global command keys (scroll, chat nav, …) and the input-editor keys
+  (cursor/word motion, kill-ring, history, …) — the text-box keys used to be
+  hardcoded. Built-in defaults are declarative tables your config merges over;
+  see [docs/config.md](docs/config.md#key-bindings) for the full command list.
+  (#477)
+- **Emacs-style chord sequences.** A binding key may be a sequence like
+  `ctrl-x ctrl-s`; the footer shows the pending prefix and **Esc**/**Ctrl+G**
+  cancels it. Optional `chord_timeout_ms` auto-cancels a pending prefix after a
+  set idle time (default: wait indefinitely). (#477, #478, issue #234)
+- **Plugins can remap built-in bindings.** `(harness/bind-key keys command)`
+  binds a chord (or sequence) to a built-in command, or `"none"` to unbind one,
+  merged under your config (defaults < plugin < user). `register-shortcut`
+  (bind a key to plugin code) is unchanged. (#477, issue #476)
+- **Visual-line cursor motion.** `Ctrl+A`/`Ctrl+E`, `Home`/`End`, and the
+  `Ctrl+U` kill now act on the current soft-wrapped line rather than the whole
+  buffer. (#474)
+
+### Changed
+- **`approval_provider` denials are advisory.** When an LLM approval evaluator
+  denies a tool call, it now escalates to the normal permission prompt (showing
+  *why* it was flagged) instead of hard-failing — so you can still allow it.
+  It's terminal only in non-interactive mode. (#475)
+- **Permission denials aren't treated as fixable failures.** The recovery
+  checkpoint no longer tells the model to "try a different approach" after a
+  permission block (which pushed it to route around the guardrail), and the
+  critic treats a permission-denied capability as out of scope rather than
+  unfinished work. (#475)
+
+### Fixed
+- **`/sessions delete` works when ids collide.** Compacted sessions are named
+  `compacted-<uuid>`, so every one rendered as the identical 8-char stub
+  "compacte" and "be more specific" was impossible. The list/switch/delete
+  views now show ids at the shortest length that keeps them distinct, and never
+  cut the leading marker mid-word. (#478)
+
 ## [0.9.1] - 2026-06-20
 
 ### Changed
