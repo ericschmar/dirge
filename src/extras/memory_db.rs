@@ -907,10 +907,16 @@ impl SqliteMemoryStore {
         kind: Option<MemoryKind>,
     ) -> Result<CompactionOutcome, String> {
         scan_for_threats(content)?;
-        let entry = content.trim().to_string();
-        if entry.is_empty() {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
             return Err("Cannot add empty entry".to_string());
         }
+        // dirge-n3qf: redact secret shapes BEFORE storing, not just in the
+        // FTS projection. `content` is injected verbatim into the system
+        // prompt and shared across projects under global scope, so a key the
+        // agent wrote into a memory would otherwise leak there. The redacted
+        // form is canonical from here on (dedup/budget/insert all see it).
+        let entry = redact_for_fts(trimmed);
 
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
@@ -1034,10 +1040,12 @@ impl SqliteMemoryStore {
         kind: Option<MemoryKind>,
     ) -> Result<(), String> {
         scan_for_threats(new_entry)?;
-        let new_entry = new_entry.trim().to_string();
-        if new_entry.is_empty() {
+        let trimmed = new_entry.trim();
+        if trimmed.is_empty() {
             return Err("Cannot replace with empty entry".to_string());
         }
+        // dirge-n3qf: redact secrets before storing (see add_entry).
+        let new_entry = redact_for_fts(trimmed);
 
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
@@ -1120,10 +1128,12 @@ impl SqliteMemoryStore {
         harsh: bool,
     ) -> Result<CompactionOutcome, String> {
         scan_for_threats(new_entry)?;
-        let new_entry = new_entry.trim().to_string();
-        if new_entry.is_empty() {
+        let trimmed = new_entry.trim();
+        if trimmed.is_empty() {
             return Err("Cannot supersede with an empty entry".to_string());
         }
+        // dirge-n3qf: redact secrets before storing (see add_entry).
+        let new_entry = redact_for_fts(trimmed);
         let char_limit = char_limit_for(target);
         if new_entry.len() > char_limit {
             return Err(format!(
@@ -2106,6 +2116,48 @@ mod tests {
         assert!(view["entries"][0].as_str().unwrap().contains("cargo build"));
         // Snapshot frozen — captured before the write.
         assert!(store.format_for_system_prompt().is_empty());
+    }
+
+    #[test]
+    fn add_redacts_secrets_in_stored_content() {
+        // dirge-n3qf: a key the agent writes into a memory must not survive
+        // verbatim in the stored row (it's injected into the system prompt and
+        // shared under global scope). Redaction happens on write, not just in
+        // the FTS projection.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let secret = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        store
+            .add_entry("memory", &format!("deploy token is {secret}"), None)
+            .unwrap();
+        let view = store.view("memory").to_string();
+        assert!(!view.contains(secret), "raw secret must not be stored");
+        assert!(view.contains("<REDACTED>"), "secret should be redacted");
+
+        // The redacted form is what reaches the system prompt too.
+        store.refresh_snapshot().unwrap();
+        let prompt = store.format_for_system_prompt();
+        assert!(!prompt.contains(secret));
+        assert!(prompt.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn replace_redacts_secrets_in_stored_content() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "placeholder fact", None).unwrap();
+        let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        store
+            .replace_entry(
+                "memory",
+                "placeholder fact",
+                &format!("api key {secret}"),
+                None,
+            )
+            .unwrap();
+        let view = store.view("memory").to_string();
+        assert!(!view.contains(secret), "raw secret must not be stored");
+        assert!(view.contains("<REDACTED>"));
     }
 
     #[test]
