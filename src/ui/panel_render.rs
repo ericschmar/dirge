@@ -9,8 +9,6 @@
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::session::Session;
-#[cfg(feature = "mcp")]
-#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use crate::ui::panel_data::{ContextGauge, GitSnapshot, LeftPanelInfo};
 use crate::ui::renderer::PanelData;
