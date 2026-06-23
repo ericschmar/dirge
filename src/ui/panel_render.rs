@@ -6,6 +6,7 @@
 //! MODIFIED_FILES) under their own mutexes is fine from the UI loop
 //! tick — they're all short-lived locks.
 
+#[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::session::Session;
 #[cfg(feature = "mcp")]

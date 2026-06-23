@@ -93,6 +93,14 @@ const HARNESS_INIT: &str = r#"
 (var harness-mutate-input nil)
 (var harness-replace-result nil)
 
+# Entity/relation record accumulators (experimental-graph-search).
+# Janet compressors call harness/record-entity and harness/record-relation
+# during on-tool-end. The host drains these after dispatch and persists
+# to SQLite. Tab-separated blobs (harness/-escape'd): kind\tname\textra\n
+# and source_kind\tsource_name\ttarget_kind\ttarget_name\trel_type\n.
+(var harness-recorded-entities "")
+(var harness-recorded-relations "")
+
 # harness/log is now a no-op. The return value of plugin commands
 # is what surfaces in chat — that's the supported surface for
 # plugin output.
@@ -125,6 +133,30 @@ const HARNESS_INIT: &str = r#"
   (when (string? json-str) (set harness-mutate-input json-str)))
 (defn harness/replace-result [output]
   (when (string? output) (set harness-replace-result output)))
+
+# Entity/relation recording for graph-search (#393).
+# Compressors call these from `on-tool-end` to persist structured facts.
+# The host drains `harness-recorded-entities` and `harness-recorded-relations`
+# after dispatch and writes them to the SQLite entity/relation tables.
+(defn harness/record-entity [kind name &opt extra]
+  (when (and (string? kind) (string? name))
+    (let [escaped-name (harness/-escape name)
+          escaped-kind (harness/-escape kind)
+          escaped-extra (if (string? extra) (harness/-escape extra) "")]
+      (set harness-recorded-entities
+           (string harness-recorded-entities
+                  escaped-kind "\t" escaped-name "\t" escaped-extra "\n")))))
+(defn harness/record-relation [source-kind source-name target-kind target-name rel-type]
+  (when (and (string? source-kind) (string? source-name)
+             (string? target-kind) (string? target-name)
+             (string? rel-type))
+    (set harness-recorded-relations
+         (string harness-recorded-relations
+                (harness/-escape source-kind) "\t"
+                (harness/-escape source-name) "\t"
+                (harness/-escape target-kind) "\t"
+                (harness/-escape target-name) "\t"
+                (harness/-escape rel-type) "\n"))))
 
 # Run-boundary slots. Plugins call `harness/set-next-model` from
 # inside `prepare-next-run` to swap the active model before the

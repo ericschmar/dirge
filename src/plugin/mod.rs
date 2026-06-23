@@ -454,6 +454,70 @@ impl PluginManager {
         raw.lines().filter_map(parse_custom_message_line).collect()
     }
 
+    /// Drain the `harness-recorded-entities` blob — entity rows
+    /// queued by Janet compressors via `(harness/record-entity ...)`.
+    /// Returns parsed `EntityRecord` entries for persistence.
+    #[cfg(feature = "experimental-graph-search")]
+    pub fn drain_entity_records(&mut self) -> Vec<EntityRecord> {
+        let raw = self
+            .worker
+            .eval("(if (string? harness-recorded-entities) harness-recorded-entities \"\")")
+            .unwrap_or_default();
+        let _ = self.worker.eval(r#"(set harness-recorded-entities "")"#);
+        raw.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    Some(EntityRecord {
+                        kind: unescape_harness_field(parts[0]),
+                        name: unescape_harness_field(parts[1]),
+                        extra: if parts.get(2).map_or(true, |s| s.is_empty()) {
+                            None
+                        } else {
+                            Some(unescape_harness_field(parts[2]))
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Drain the `harness-recorded-relations` blob — relation edges
+    /// queued by Janet compressors via `(harness/record-relation ...)`.
+    /// Returns parsed `RelationRecord` entries for persistence.
+    #[cfg(feature = "experimental-graph-search")]
+    pub fn drain_relation_records(&mut self) -> Vec<RelationRecord> {
+        let raw = self
+            .worker
+            .eval("(if (string? harness-recorded-relations) harness-recorded-relations \"\")")
+            .unwrap_or_default();
+        let _ = self.worker.eval(r#"(set harness-recorded-relations "")"#);
+        raw.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(5, '\t').collect();
+                if parts.len() == 5
+                    && !parts[0].is_empty()
+                    && !parts[1].is_empty()
+                    && !parts[2].is_empty()
+                    && !parts[3].is_empty()
+                    && !parts[4].is_empty()
+                {
+                    Some(RelationRecord {
+                        source_kind: unescape_harness_field(parts[0]),
+                        source_name: unescape_harness_field(parts[1]),
+                        target_kind: unescape_harness_field(parts[2]),
+                        target_name: unescape_harness_field(parts[3]),
+                        rel_type: unescape_harness_field(parts[4]),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Shared body for `drain_*_messages` — read the slot's
     /// string contents, split on newline, filter empty entries,
     /// clear the slot to `""`.
@@ -1304,6 +1368,30 @@ pub struct CustomMessageEntry {
     /// keeps the message in the transcript (where plugin handlers
     /// can still observe it) but suppresses the visible row.
     pub display: bool,
+}
+
+/// One entry drained from `harness-recorded-entities` — produced by
+/// Janet compressors calling `(harness/record-entity kind name extra)`.
+/// The host persists these to the `entities` table at session close.
+#[cfg(feature = "experimental-graph-search")]
+#[derive(Debug, Clone)]
+pub struct EntityRecord {
+    pub kind: String,
+    pub name: String,
+    pub extra: Option<String>,
+}
+
+/// One entry drained from `harness-recorded-relations` — produced by
+/// Janet compressors calling `(harness/record-relation ...)`.
+/// The host persists these to the `relations` table at session close.
+#[cfg(feature = "experimental-graph-search")]
+#[derive(Debug, Clone)]
+pub struct RelationRecord {
+    pub source_kind: String,
+    pub source_name: String,
+    pub target_kind: String,
+    pub target_name: String,
+    pub rel_type: String,
 }
 
 /// Generic last-add-wins deduplicator for plugin registries.

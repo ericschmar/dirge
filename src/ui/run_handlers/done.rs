@@ -565,6 +565,57 @@ pub(crate) async fn handle_done(
             ctx.tool_calls_buf,
         );
 
+        // Persist entity/relation records drained from Janet harness
+        // accumulators (#393). Best-effort: silently skip on DB errors.
+        #[cfg(feature = "experimental-graph-search")]
+        {
+            if let Some(pm) = plugin_manager {
+                let mut mgr = pm.lock_ignore_poison();
+                let entities = mgr.drain_entity_records();
+                let relations = mgr.drain_relation_records();
+                if !entities.is_empty() || !relations.is_empty() {
+                    if let Ok(db) =
+                        crate::extras::session_db::SessionDb::open(&paths.session_db_path())
+                    {
+                        use crate::extras::entity_db;
+                        let sid =
+                            format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+                        for ent in &entities {
+                            let _ = entity_db::upsert_entity(
+                                &db.conn,
+                                &sid,
+                                None,
+                                &ent.kind,
+                                &ent.name,
+                                ent.extra.as_deref(),
+                            );
+                        }
+                        for rel in &relations {
+                            let source_id: Result<i64, _> = db.conn.query_row(
+                                "SELECT id FROM entities WHERE session_id = ?1 AND kind = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1",
+                                rusqlite::params![&sid, rel.source_kind, rel.source_name],
+                                |row| row.get(0),
+                            );
+                            let target_id: Result<i64, _> = db.conn.query_row(
+                                "SELECT id FROM entities WHERE session_id = ?1 AND kind = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1",
+                                rusqlite::params![&sid, rel.target_kind, rel.target_name],
+                                |row| row.get(0),
+                            );
+                            if let (Ok(src_eid), Ok(tgt_eid)) = (source_id, target_id) {
+                                let _ = entity_db::insert_relation(
+                                    &db.conn,
+                                    src_eid,
+                                    tgt_eid,
+                                    &rel.rel_type,
+                                    &sid,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // dirge-a62g: prepend a deterministic, model-free ground-truth
         // digest (files touched, commands run, goal, where we stopped,
         // git diff --stat) so the review ranks/classifies KNOWN facts

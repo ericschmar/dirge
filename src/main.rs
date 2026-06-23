@@ -606,7 +606,16 @@ async fn main() -> anyhow::Result<()> {
     // CheckpointRefresh event, so firing it there would just burn
     // background summary calls. Force it off for --print / --loop.
     crate::agent::agent_loop::context_manager::init_incremental_checkpoint(
-        if cli.print || cli.loop_mode {
+        if cli.print || {
+            #[cfg(feature = "loop")]
+            {
+                cli.loop_mode
+            }
+            #[cfg(not(feature = "loop"))]
+            {
+                false
+            }
+        } {
             Some(false)
         } else {
             cfg.incremental_checkpoint
