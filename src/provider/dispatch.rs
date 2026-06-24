@@ -56,23 +56,6 @@ impl AnyClient {
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
     }
-
-    pub async fn compress_messages(
-        &self,
-        model_name: &str,
-        messages: &[SessionMessage],
-        previous_summary: Option<&str>,
-        instructions: Option<&str>,
-    ) -> anyhow::Result<String> {
-        // dirge-tv3p: split into the two halves a non-blocking compaction needs.
-        // `build_compaction_prompt` is the cheap, synchronous part (serialize +
-        // assemble + injection check) that stays on the UI thread; `run_compaction`
-        // is the slow LLM call that the event loop spawns off-thread. This method
-        // keeps the original behavior by composing both.
-        let prompt = build_compaction_prompt(messages, previous_summary, instructions)?;
-        let model = self.completion_model(model_name.to_string());
-        run_compaction(model, prompt).await
-    }
 }
 
 /// dirge-tv3p: build the compaction summarizer prompt from the to-be-discarded

@@ -21,10 +21,17 @@ pub(crate) enum CompactionThen {
     /// Explicit `/compress` or post-turn auto-compact: nothing follows.
     Nothing,
     /// Preemptive (pre-prompt) and reactive (overflow-recovery) compaction:
-    /// run this prompt as a normal streamed agent turn afterward. `reactive`
-    /// marks the overflow-recovery case, where a compaction FAILURE means the
+    /// run a normal streamed agent turn afterward. `run_prompt` is what the
+    /// runner receives (may be plugin-rewritten); `record_text` is recorded in
+    /// the session as the user message (matching the inline submit path).
+    /// `reactive` marks overflow-recovery, where a compaction FAILURE means the
     /// prompt still won't fit, so we must not blindly resend it.
-    SendPrompt { prompt: String, reactive: bool },
+    /// `last_user_prompt` is already set at submit time, so the arm leaves it.
+    SendPrompt {
+        run_prompt: String,
+        record_text: String,
+        reactive: bool,
+    },
 }
 
 /// Terminal event from the spawned summarizer task. (There's no `Progress` —
