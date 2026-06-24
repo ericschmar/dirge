@@ -667,6 +667,23 @@ const HARNESS_COMPUTER_USE_INIT: &str = r#"
     (when (not result)
       (error "harness/computer-use-exec: sandbox not available"))
     result))
+
+(var harness/computer-use-deny-tools @{})
+
+(defn harness/set-computer-use-deny-tools [tools-vec]
+  "Replace the deny-tools set with a new list (called from Rust)."
+  (let [s @{}]
+    (each t tools-vec (put s (string t) true))
+    (set harness/computer-use-deny-tools s)))
+
+(defn harness/check-computer-action [action]
+  "Query the PDP for a desktop action. Returns :allow, :deny, or :ask.
+   Respects deny_tools: [computer] and deny_tools: [computer:<action>]."
+  (if (in (harness/computer-use-deny-tools) "computer")
+    "deny"
+    (if (in (harness/computer-use-deny-tools) (string "computer:" action))
+      "deny"
+      "ask")))
 "#;
 
 /// Janet wrappers for the LSP bridge. Installed after the C function is

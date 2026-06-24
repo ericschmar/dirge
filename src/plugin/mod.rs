@@ -291,6 +291,22 @@ impl PluginManager {
         let _ = self.worker.eval("(set harness-plugin-config nil)");
     }
 
+    /// Push the active prompt's `deny_tools` list into the computer-use
+    /// Janet environment so `harness/check-computer-action` can gate
+    /// desktop actions against the permission PDP.
+    #[cfg(feature = "experimental-ui-computer-use")]
+    pub fn set_deny_tools_for_computer_use(&mut self, deny: &[String]) {
+        let items: Vec<String> = deny.iter().map(|t| format!("\"{t}\"")).collect();
+        let expr = format!(
+            "(harness/set-computer-use-deny-tools [{}])",
+            items.join(" ")
+        );
+        let _ = self.worker.eval(&expr);
+    }
+
+    #[cfg(not(feature = "experimental-ui-computer-use"))]
+    pub fn set_deny_tools_for_computer_use(&mut self, _deny: &[String]) {}
+
     pub fn dispatch(&mut self, hook: &str, context_janet: &str) -> Result<Vec<String>, String> {
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),
