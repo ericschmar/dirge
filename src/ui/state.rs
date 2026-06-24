@@ -202,6 +202,9 @@ pub(crate) struct UiState {
     /// code on a spawned task); the `review_phase` arm applies the verdict.
     /// dirge-4koy.
     pub(crate) review_phase: Option<crate::agent::plan::runtime::ReviewPhaseHandle>,
+    /// In-flight non-blocking `/btw` side query (one-shot LLM on a spawned task);
+    /// the `btw_phase` arm renders the answer. dirge-nret.
+    pub(crate) btw_phase: Option<crate::ui::btw::BtwPhaseHandle>,
 
     // ── Chats / subagents ────────────────────────────────────────────
     /// Per-chat-tab UI state (response/reasoning/chamber buffers).
@@ -402,6 +405,7 @@ impl UiState {
             plan_phase: None,
             compaction_phase: None,
             review_phase: None,
+            btw_phase: None,
             active_plan: None,
 
             chat_ui_states: vec![ChatUiState::empty()],

@@ -2,6 +2,7 @@ mod agent_io;
 pub(crate) mod ansi;
 pub(crate) mod avatar;
 pub(crate) mod box_render;
+pub(crate) mod btw;
 pub(crate) mod buffer;
 mod chat_state;
 pub(crate) mod colors;
@@ -1500,6 +1501,10 @@ pub async fn run_interactive(
                                 if let Some(ph) = ui.review_phase.take() {
                                     ph.task.abort();
                                 }
+                                // dirge-nret: and an in-flight `/btw` side query.
+                                if let Some(ph) = ui.btw_phase.take() {
+                                    ph.task.abort();
+                                }
                                 // Cooperative cancel first: lets the
                                 // retry loop and rig stream observe
                                 // `signal.is_cancelled()` and exit
@@ -1604,6 +1609,10 @@ pub async fn run_interactive(
                             }
                             // dirge-4koy: and an in-flight `/plan` reviewer.
                             if let Some(ph) = ui.review_phase.take() {
+                                ph.task.abort();
+                            }
+                            // dirge-nret: and an in-flight `/btw` side query.
+                            if let Some(ph) = ui.btw_phase.take() {
                                 ph.task.abort();
                             }
                             if let Some(tx) = ui.agent_cancel.take() {
@@ -2274,6 +2283,25 @@ pub async fn run_interactive(
                                                 renderer.write_line(&format!("compress error: {e}"), c_error())?;
                                             }
                                         }
+                                    }
+                                    Err(e) if e.to_string().starts_with("DEFER_BTW:") => {
+                                        // dirge-nret: run the /btw completion
+                                        // off-thread. Resolve the model on-thread
+                                        // (cheap), then spawn the query as a task
+                                        // the `btw_phase` arm renders; the loop
+                                        // stays responsive and Ctrl+C aborts.
+                                        let err_msg = e.to_string();
+                                        let query = err_msg
+                                            .strip_prefix("DEFER_BTW:")
+                                            .unwrap_or("")
+                                            .to_string();
+                                        renderer.write_line(
+                                            &format!("btw: {}", query),
+                                            crossterm::style::Color::DarkGrey,
+                                        )?;
+                                        let model =
+                                            client.completion_model(session.model.to_string());
+                                        ui.btw_phase = Some(crate::ui::btw::spawn(model, query));
                                     }
                                     #[cfg(feature = "git-worktree")]
                                     Err(e) if e.to_string().starts_with("DEFER_WT_MERGE:") => {
@@ -3357,6 +3385,41 @@ pub async fn run_interactive(
                     &mut ui.is_running,
                 )?;
                 renderer.set_avatar_state(avatar::AvatarState::Idle);
+                renderer.request_repaint();
+            }
+            // dirge-nret: the spawned `/btw` side query streams its answer here,
+            // so the loop stays responsive (and Ctrl+C-able) while the one-shot
+            // LLM call runs. Binds the Option directly so a closed channel
+            // doesn't busy-loop the select.
+            btw_result = async {
+                if let Some(ph) = &mut ui.btw_phase {
+                    ph.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                let _ = ui.btw_phase.take();
+                match btw_result {
+                    Some(Ok(response)) => {
+                        renderer.write_line("", crossterm::style::Color::White)?;
+                        let max_width = renderer.line_width();
+                        let styled = crate::ui::markdown::markdown_to_styled(
+                            &response,
+                            max_width,
+                            crate::ui::theme::agent(),
+                        );
+                        for span in styled {
+                            renderer.write(&span.text, span.color)?;
+                        }
+                        renderer.write_line("", crossterm::style::Color::White)?;
+                    }
+                    Some(Err(e)) => {
+                        renderer.write_line(&format!("btw error: {}", e), c_error())?;
+                    }
+                    None => {
+                        renderer.write_line("btw: task ended unexpectedly", c_error())?;
+                    }
+                }
                 renderer.request_repaint();
             }
             Some(ask_req) = async {
