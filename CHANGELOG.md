@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-24
+
+### Changed
+- **The UI no longer freezes during background work.** Long operations used to
+  be `.await`ed inline in the single-threaded event loop, freezing rendering,
+  input, and Ctrl+C for their whole duration. They now run on spawned tasks
+  drained by dedicated `select!` arms, so the loop stays responsive and
+  Ctrl+C/Esc abort the work. Converted: compaction (the summarizer — explicit
+  `/compress`, preemptive pre-prompt, and reactive overflow recovery), the
+  `/plan` reviewer loop (a write-disabled reviewer that runs the code), `/btw`
+  side queries, `!cmd` shell commands (up to the 120s cap), and `/wt-merge`
+  (the git merge). The post-turn auto-compaction that used to block at every
+  turn end was dropped — the now-async preemptive pass covers the next user
+  prompt and reactive recovery covers automated follow-ups.
+- **`build_agent` no longer re-handshakes MCP servers on every rebuild.** It
+  ran a `tools/list` round-trip per connected server, uncached and with no
+  timeout, on each of ~9 inline sites (down to a prompt-cycle keystroke) — so a
+  rebuild froze the UI for the round-trip, unbounded if a server was wedged.
+  Tool definitions are now cached per server (invalidated on `/mcp reconnect`)
+  and each fetch is bounded by a 5s timeout.
+- **The post-session `git diff --stat` runs off the event loop.** The turn-end
+  review digest shelled out on the loop at every turn; the subprocess now runs
+  inside the already-spawned post-session task.
+
 ## [0.11.3] - 2026-06-22
 
 ### Added
