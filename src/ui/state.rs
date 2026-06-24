@@ -209,6 +209,11 @@ pub(crate) struct UiState {
     /// `shell_phase` arm renders the output and, for a visible command, feeds it
     /// to the agent. dirge-x9a3.
     pub(crate) shell_phase: Option<crate::ui::shell_phase::ShellPhaseHandle>,
+    /// In-flight non-blocking `/wt-merge` (git merge on a blocking thread); the
+    /// `wt_merge_phase` arm runs the post-merge continuation. dirge-iagk.
+    /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
+    /// stays `None` in non-worktree builds.
+    pub(crate) wt_merge_phase: Option<crate::ui::wt_merge_phase::WtMergePhaseHandle>,
 
     // ── Chats / subagents ────────────────────────────────────────────
     /// Per-chat-tab UI state (response/reasoning/chamber buffers).
@@ -411,6 +416,7 @@ impl UiState {
             review_phase: None,
             btw_phase: None,
             shell_phase: None,
+            wt_merge_phase: None,
             active_plan: None,
 
             chat_ui_states: vec![ChatUiState::empty()],
