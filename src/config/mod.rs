@@ -585,6 +585,13 @@ pub struct Config {
     /// arrives within this many milliseconds. Absent = wait indefinitely
     /// (emacs default); Esc/Ctrl+G always cancels regardless.
     pub chord_timeout_ms: Option<u64>,
+    /// User-defined aliases for built-in slash commands: `{alias: command}`.
+    /// `{"exit": "quit"}` makes `/exit` run `/quit`. A leading `/` on either
+    /// side is optional. Targets that aren't known built-ins warn at startup
+    /// (likely typos); plugin-command targets pass through unvalidated.
+    /// Aliases are expanded before dispatch (`ui::slash::aliases`) and are
+    /// NOT built-ins — they don't appear in `slash_command_names()`.
+    pub slash_aliases: Option<HashMap<String, String>>,
     pub tools: Option<ToolsConfig>,
     /// dirge-4hld: long-term memory retrieval tuning (hybrid dense+BM25).
     pub memory: Option<MemoryConfig>,

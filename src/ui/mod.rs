@@ -231,6 +231,17 @@ pub async fn run_interactive(
     }
     let keymap = keymaps.global;
     input.set_keymap(keymaps.input);
+    // User-defined slash-command aliases (`slash_aliases` config): resolve
+    // once at startup and surface bad targets, mirroring the keymap-warning
+    // path above. The map is consulted by `expand_alias` at the single
+    // `handle_slash` call site below.
+    let (aliases, alias_warnings) = crate::ui::slash::aliases::build_alias_map(cfg);
+    for w in &alias_warnings {
+        eprintln!("warning: {w}");
+    }
+    // Surface alias names in tab-completion + ghost suffix.
+    #[cfg(feature = "slash-completion")]
+    crate::ui::slash::register_alias_commands(aliases.names());
     // Pending prefix of an in-progress emacs-style chord sequence (#234).
     // Empty unless the user has pressed the first key(s) of a multi-key
     // global binding (e.g. `ctrl-x` of `ctrl-x ctrl-s`); shown in the
@@ -2229,6 +2240,13 @@ pub async fn run_interactive(
                                 continue;
                             }
                             if text.starts_with('/') {
+                                // Resolve a user-configured slash alias
+                                // (`slash_aliases`) once, before the busy-gate
+                                // and dispatch, so an alias inherits its
+                                // target's safety class and runs as the target.
+                                // The echo below still shows what the user typed.
+                                let expanded =
+                                    crate::ui::slash::aliases::expand_alias(&text, &aliases);
                                 // dirge-nfa: read-only inspection
                                 // commands run during agent activity.
                                 // The busy gate ONLY blocks commands
@@ -2252,7 +2270,7 @@ pub async fn run_interactive(
                                 // matches alone; if there's an
                                 // argument, treat as potentially
                                 // mutating and gate.
-                                let safe_during_agent = is_safe_during_agent(&text);
+                                let safe_during_agent = is_safe_during_agent(&expanded);
                                 if ui.is_running && !safe_during_agent {
                                     write_outside_chamber(
                                         &mut renderer,
@@ -2272,7 +2290,7 @@ pub async fn run_interactive(
                                 // /help) have no UserMessage event, so we keep the echo.
                                 write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut ui.show_reasoning, &mut ui.is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut ui.todo_tools_enabled, &bg_store, &sandbox, #[cfg(unix)] &user_tx, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut ui.plan_phase).await;
+                                let result = handle_slash(&expanded, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut ui.show_reasoning, &mut ui.is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut ui.todo_tools_enabled, &bg_store, &sandbox, #[cfg(unix)] &user_tx, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut ui.plan_phase).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
