@@ -20,6 +20,7 @@ use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::theme;
 
+pub(crate) mod aliases;
 mod cmd;
 #[cfg(feature = "slash-completion")]
 mod completion;
@@ -30,6 +31,9 @@ pub use completion::{CompletionResult, format_completion_preview, ghost_suffix, 
 // plugin-less build (e.g. windows-default) doesn't re-export a dead fn.
 #[cfg(all(feature = "slash-completion", feature = "plugin"))]
 pub use completion::register_plugin_commands;
+
+#[cfg(feature = "slash-completion")]
+pub use completion::register_alias_commands;
 
 #[inline]
 pub(super) fn c_agent() -> Color {

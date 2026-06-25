@@ -65,6 +65,15 @@ pub(crate) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         renderer.write_line(&format!("  {}", cmd), c_result())?;
     }
 
+    let aliases = crate::ui::slash::aliases::display_entries(ctx.cfg);
+    if !aliases.is_empty() {
+        renderer.write_line("", c_agent())?;
+        renderer.write_line("slash aliases (from your config):", c_agent())?;
+        for line in &aliases {
+            renderer.write_line(&format!("  {line}"), c_result())?;
+        }
+    }
+
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = crate::plugin::hook::global() {
         let cmds = {

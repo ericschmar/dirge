@@ -699,6 +699,38 @@ Notes:
 - Unrecognized chords or unknown commands are skipped with a warning on
   startup; the rest of the config still loads.
 
+## Slash-command aliases
+
+Rename a built-in slash command, or give it a short alias, with the
+top-level `slash_aliases` map. The key is what you type (with or without a
+leading `/`); the value is the built-in command it runs (again with or
+without a leading `/`). Arguments you type after the alias are passed
+through to the target.
+
+```json
+{
+  "slash_aliases": {
+    "exit": "quit",
+    "q": "/quit",
+    "cls": "/clear"
+  }
+}
+```
+
+With the above, `/exit`, `/q`, and `/cls` all run `/quit` or `/clear`. The
+alias is resolved once before dispatch, so it inherits its target's
+behavior (e.g. an alias for `/quit` works while the agent is running).
+
+- Aliases don't replace the built-in — both names work unless they
+  collide (an alias key that matches a built-in shadows it).
+- A leading `/` on either side is optional and normalized.
+- A target that isn't a known built-in produces a startup warning (likely
+  a typo) but is still passed through — it may resolve to a plugin
+  command. Plugin-command targets can't be validated ahead of time.
+- An empty alias key is ignored (with a warning); it would otherwise make
+  a bare `/` run the target.
+- Configured aliases are listed under `slash aliases` in `/help`.
+
 ## Environment variables
 
 | Variable | Purpose |
