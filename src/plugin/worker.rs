@@ -2265,7 +2265,10 @@ mod tests {
         ));
         // Past the window → give up.
         assert!(dialog_should_abort(DIALOG_TIMEOUT, false));
-        assert!(dialog_should_abort(DIALOG_TIMEOUT + Duration::from_secs(1), false));
+        assert!(dialog_should_abort(
+            DIALOG_TIMEOUT + Duration::from_secs(1),
+            false
+        ));
         // The dialog window is far more generous than the LSP one — dialogs
         // wait on a human, LSP waits on a server.
         assert!(DIALOG_TIMEOUT > Duration::from_secs(30));
