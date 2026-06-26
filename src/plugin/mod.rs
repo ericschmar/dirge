@@ -249,6 +249,16 @@ impl PluginManager {
             .push(script.to_string());
     }
 
+    /// Whether any plugin function is registered for `hook`. Callers use
+    /// this to skip a worker round-trip entirely when a hook has no
+    /// subscribers — without it, `dispatch_tool_hook` evals on the single
+    /// Janet worker on EVERY tool call even with zero plugins loaded
+    /// (dirge-u5ig), needlessly serializing the headless loop behind the
+    /// worker (and its host-call servicing) per tool call.
+    pub fn has_hook(&self, hook: &str) -> bool {
+        self.hooks.get(hook).is_some_and(|names| !names.is_empty())
+    }
+
     pub fn take_pending_prompt(&mut self) -> Option<String> {
         self.take_string_slot("harness-pending")
     }
@@ -619,11 +629,35 @@ impl PluginManager {
         hook: &str,
         context_janet: &str,
     ) -> Result<ToolHookResult, String> {
+        // Fast path: no plugin subscribes to this hook, so there's nothing
+        // to clear or run. Skip the worker entirely (dirge-u5ig). This
+        // matters because the before/after tool hooks are wired whenever a
+        // PluginManager exists (always, in a plugin build) regardless of
+        // whether any hook is registered — without this guard every tool
+        // call paid two worker round-trips (start + end), serializing the
+        // headless loop behind the single Janet worker and its blocking
+        // host-call servicing for no benefit.
+        if !self.has_hook(hook) {
+            return Ok(ToolHookResult::default());
+        }
+
+        // Audit L6: tighter per-hook timeout than the default EVAL_TIMEOUT
+        // (10 min). A hung `on-tool-start` used to freeze every subsequent
+        // tool call for the full 10 min; 5s is enough headroom for any
+        // reasonable hook (most execute in < 100 ms) while still recovering
+        // quickly from a plugin stuck in `(while true)` or a blocking
+        // syscall. Used for the pre-clear and every hook eval below.
+        const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
         // Pre-clear so a stale (harness/block ...) left by an unrelated
-        // hook can't cause us to mis-block this tool.
-        let _ = self
-            .worker
-            .eval("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
+        // hook can't cause us to mis-block this tool. Bounded like the
+        // hooks below (HOOK_TIMEOUT) rather than the 30s interactive
+        // default — a wedged worker must not stretch the pre-clear out
+        // past the per-hook budget (dirge-u5ig).
+        let _ = self.worker.eval_with_timeout(
+            "(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)",
+            HOOK_TIMEOUT,
+        );
 
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),
@@ -657,14 +691,6 @@ impl PluginManager {
                 ctx = context_janet,
                 fname = name,
             );
-            // Audit L6: tighter per-hook timeout than the default
-            // EVAL_TIMEOUT (10 min). A hung `on-tool-start` used to
-            // freeze every subsequent tool call for the full 10 min;
-            // 5s is enough headroom for any reasonable hook (most
-            // execute in < 100 ms) while still recovering quickly
-            // from a plugin stuck in `(while true)` or a blocking
-            // syscall.
-            const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
             match self.worker.eval_with_timeout(&code, HOOK_TIMEOUT) {
                 Ok(s) => {
                     if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {

@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Headless runs no longer deadlock mid-task on multi-turn agentic work.** In
+  `-p` mode a run could freeze permanently after several tool-call turns (alive,
+  0% CPU, no `result`). Three compounding issues in the plugin worker path are
+  fixed: (1) the before/after tool hooks awaited their `spawn_blocking` dispatch
+  via a `tokio::time::timeout` that, on expiry, *detached* a still-running,
+  uncancellable blocking task — which kept holding the global plugin-manager
+  mutex and the single Janet worker, stalling the next hook; the dispatch is now
+  awaited to completion (it's already bounded internally). (2) `harness/confirm`
+  / `harness/select` (`send_dialog`) was the one host call with no wall-clock
+  bound, so a dialog whose responder never answered pinned the worker forever;
+  it now gives up after a generous timeout. (3) the tool hooks round-tripped to
+  the worker on *every* tool call even with zero plugins registered;
+  `dispatch_tool_hook` now skips the worker entirely when no plugin subscribes.
+  (#523, dirge-u5ig)
+
 ## [0.12.4] - 2026-06-25
 
 ### Added

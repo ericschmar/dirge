@@ -37,6 +37,29 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 const DIALOG_POLL: Duration = Duration::from_millis(50);
 
+/// Wall-clock bound on `send_dialog` (dirge-u5ig). Dialogs were the one
+/// host call with NO timeout — `harness/confirm` / `harness/select` polled
+/// the reply forever, so a dialog whose responder never answers (headless
+/// without `--auto-confirm`, or a starved responder) pinned the single
+/// Janet worker permanently, which in turn wedges every later eval that
+/// serializes behind it. Unlike `LSP_QUERY_TIMEOUT` (30s) this is
+/// deliberately generous: in interactive mode a human answers the dialog,
+/// and a distracted user may take minutes. The bound only exists so a
+/// never-answered dialog can't pin the worker forever — it is not meant to
+/// rush a real human. After it elapses `send_dialog` returns `None` (the
+/// cfn treats that as "no answer", same as a shutdown-cancelled dialog).
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+const DIALOG_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Whether `send_dialog` should stop waiting: either the worker is shutting
+/// down, or the dialog has exceeded [`DIALOG_TIMEOUT`]. Split out so the
+/// give-up policy is unit-testable without a real hung responder (mirrors
+/// `lsp_should_abort`).
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+fn dialog_should_abort(elapsed: Duration, shutting_down: bool) -> bool {
+    shutting_down || elapsed >= DIALOG_TIMEOUT
+}
+
 /// Upper bound on how long a single `Worker::eval` will wait for the
 /// worker's reply. Generous (10 min) because `harness/confirm` /
 /// `harness/select` legitimately block the worker on user input — a
@@ -1519,7 +1542,10 @@ where
     // Poll for the reply. Wake every `DIALOG_POLL` to check the
     // worker-shutdown flag so a UI exit or `Worker::Drop` doesn't pin
     // us forever on `recv()`. The polling overhead is negligible
-    // compared to the time a human takes to answer a dialog.
+    // compared to the time a human takes to answer a dialog. Also bail
+    // after `DIALOG_TIMEOUT` so a dialog whose responder never answers
+    // can't pin the worker forever (dirge-u5ig).
+    let start = std::time::Instant::now();
     loop {
         match reply_rx.recv_timeout(DIALOG_POLL) {
             Ok(r) => return Some(r),
@@ -1531,7 +1557,14 @@ where
                         .map(|f| f.load(Ordering::SeqCst))
                         .unwrap_or(false)
                 });
-                if shutting_down {
+                if dialog_should_abort(start.elapsed(), shutting_down) {
+                    if !shutting_down {
+                        tracing::warn!(
+                            target: "dirge::plugin",
+                            timeout_secs = DIALOG_TIMEOUT.as_secs(),
+                            "harness dialog had no responder within timeout — returning nil",
+                        );
+                    }
                     return None;
                 }
             }
@@ -2214,6 +2247,28 @@ mod tests {
         // `undefined-fn` is genuinely unknown.
         let r = worker.eval("(undefined-fn 1)");
         assert!(r.is_err(), "expected Err, got {r:?}");
+    }
+
+    /// dirge-u5ig: the dialog give-up policy. Shutdown aborts immediately
+    /// regardless of elapsed; otherwise it waits until DIALOG_TIMEOUT so a
+    /// never-answered dialog can't pin the worker forever — but a human
+    /// gets the full (generous) window before then.
+    #[test]
+    fn dialog_should_abort_policy() {
+        // Shutting down → abort now, even at zero elapsed.
+        assert!(dialog_should_abort(Duration::ZERO, true));
+        // Not shutting down, well within the window → keep waiting.
+        assert!(!dialog_should_abort(Duration::from_secs(1), false));
+        assert!(!dialog_should_abort(
+            DIALOG_TIMEOUT - Duration::from_secs(1),
+            false
+        ));
+        // Past the window → give up.
+        assert!(dialog_should_abort(DIALOG_TIMEOUT, false));
+        assert!(dialog_should_abort(DIALOG_TIMEOUT + Duration::from_secs(1), false));
+        // The dialog window is far more generous than the LSP one — dialogs
+        // wait on a human, LSP waits on a server.
+        assert!(DIALOG_TIMEOUT > Duration::from_secs(30));
     }
 
     /// dirge-rj3k / #476: harness/bind-key accumulates tab-separated
