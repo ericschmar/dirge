@@ -8,6 +8,15 @@ folder:
   (for example `$XDG_CONFIG_HOME/dirge/config.json` on Linux)
 - Fallback: `$HOME/.config/dirge/config.json`
 
+A project may also ship a partial `<project>/.dirge/config.json`. It is
+deep-merged on top of the global file: scalar fields override, while maps
+(`providers`, `mcp_servers`, `agents`, `slash_aliases`, `keybindings`) union
+key-by-key, so a project can add or override a single entry without
+redeclaring the whole map. Absent keys fall through to the global file. An
+empty object (e.g. `"providers": {}`) is a no-op, not a wipe — there is no
+syntax to clear a global map from a project config. CLI flags and env vars
+still take precedence over both files.
+
 All config keys are optional. CLI flags and their environment-backed values
 (such as `DIRGE_PROVIDER` and `DIRGE_MODEL`) take precedence where both exist.
 
