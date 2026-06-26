@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-26
+
+### Added
+- **Project-local config overlay.** A project can ship a partial
+  `<project>/.dirge/config.json` that deep-merges on top of the global
+  `~/.config/dirge/config.json` instead of duplicating the whole file. Scalar
+  fields override; map-valued fields (`providers`, `mcp_servers`, `agents`,
+  `slash_aliases`, `keybindings`) union key-by-key, so a project can add or
+  override a single entry without redeclaring the map. An empty object is a
+  no-op, never a wipe. CLI flags and env vars still take precedence over both
+  files. (#526; thanks @nikolap)
+- **Project-local prompts tier with `/prompt` provenance.** Custom prompts can
+  live in `<project>/.dirge/prompts/` and override global or built-in prompts of
+  the same name. `/prompt` now shows a `[global]`/`[project]` badge next to
+  overridden built-ins, mirroring `/agents`. (#526)
+
+### Changed
+- **BREAKING: project-local prompts moved from `./prompts/` to
+  `.dirge/prompts/`.** The old cwd-relative `prompts/` directory is no longer
+  read. If you relied on a project-level `prompts/` directory, move it to
+  `.dirge/prompts/` (matching `.dirge/agents`, `.dirge/plugins`, `.dirge/skills`).
+  Global (`~/.config/dirge/prompts/`) and built-in prompts are unaffected.
+
 ## [0.12.6] - 2026-06-26
 
 ### Fixed
