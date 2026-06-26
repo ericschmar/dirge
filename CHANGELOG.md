@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-06-26
+
 ### Fixed
 - **Headless runs no longer deadlock mid-task on multi-turn agentic work.** In
   `-p` mode a run could freeze permanently after several tool-call turns (alive,
