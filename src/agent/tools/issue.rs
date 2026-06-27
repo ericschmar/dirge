@@ -166,23 +166,43 @@ impl Tool for IssueTool {
             }
             "update" => {
                 let id = need_id(&args)?;
-                let mut changed = Vec::new();
-                if let Some(status) = args.status.as_deref() {
-                    if !store.set_status(id, status).map_err(ToolError::Msg)? {
-                        return Err(ToolError::Msg(format!("no issue #{id}")));
-                    }
-                    changed.push("status");
-                }
-                if let Some(priority) = args.priority.as_deref() {
-                    if !store.set_priority(id, priority).map_err(ToolError::Msg)? {
-                        return Err(ToolError::Msg(format!("no issue #{id}")));
-                    }
-                    changed.push("priority");
-                }
-                if changed.is_empty() {
+                if args.status.is_none() && args.priority.is_none() {
                     return Err(ToolError::Msg(
                         "update needs at least one of: status, priority".to_string(),
                     ));
+                }
+                // Pre-validate BOTH fields before mutating: set_status and
+                // set_priority are two separate writes with no surrounding
+                // transaction, so validating after the first write would let an
+                // invalid second field leave a half-applied update (e.g. status
+                // committed, then an invalid priority returns Err).
+                use crate::extras::issue_db::{normalize_priority, normalize_status};
+                if let Some(status) = args.status.as_deref() {
+                    normalize_status(status).ok_or_else(|| {
+                        ToolError::Msg(format!(
+                            "unknown status '{status}' (use open|in_progress|blocked|done)"
+                        ))
+                    })?;
+                }
+                if let Some(priority) = args.priority.as_deref() {
+                    normalize_priority(priority).ok_or_else(|| {
+                        ToolError::Msg(format!(
+                            "unknown priority '{priority}' (use high|normal|low)"
+                        ))
+                    })?;
+                }
+                // Existence check up front so a missing id fails before any write.
+                if store.get(id).map_err(ToolError::Msg)?.is_none() {
+                    return Err(ToolError::Msg(format!("no issue #{id}")));
+                }
+                let mut changed = Vec::new();
+                if let Some(status) = args.status.as_deref() {
+                    store.set_status(id, status).map_err(ToolError::Msg)?;
+                    changed.push("status");
+                }
+                if let Some(priority) = args.priority.as_deref() {
+                    store.set_priority(id, priority).map_err(ToolError::Msg)?;
+                    changed.push("priority");
                 }
                 Ok(format!("Updated issue #{id} ({})", changed.join(", ")))
             }
@@ -311,5 +331,39 @@ mod tests {
     async fn unknown_action_errors() {
         let t = tool();
         assert!(t.call(args("frobnicate")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_with_invalid_priority_does_not_half_apply_status() {
+        let t = tool();
+        t.call(IssueArgs {
+            title: Some("x".into()),
+            ..args("create")
+        })
+        .await
+        .unwrap();
+        // status valid, priority invalid → must error WITHOUT committing the
+        // status change (no transaction wraps the two writes).
+        let res = t
+            .call(IssueArgs {
+                id: Some(serde_json::json!(1)),
+                status: Some("done".into()),
+                priority: Some("bogus".into()),
+                ..args("update")
+            })
+            .await;
+        assert!(res.is_err(), "invalid priority should error");
+        // The issue must still be open (status not half-applied).
+        let shown = t
+            .call(IssueArgs {
+                id: Some(serde_json::json!(1)),
+                ..args("show")
+            })
+            .await
+            .unwrap();
+        assert!(
+            shown.contains("[open]"),
+            "status must not have been applied: {shown}"
+        );
     }
 }

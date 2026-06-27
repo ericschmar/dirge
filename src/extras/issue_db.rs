@@ -12,10 +12,10 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use super::session_db::SessionDb;
 use crate::sync_util::LockExt;
 
 // Lifecycle states (open / in_progress / blocked / done) and priorities
@@ -113,10 +113,31 @@ impl IssueStore {
 
     /// Open against an explicit DB path (used by tests and callers that
     /// already resolved the path).
+    ///
+    /// Opens a plain connection rather than going through `SessionDb::open`:
+    /// the issues table is self-owned (idempotent `ensure_schema`), so it does
+    /// NOT need the session DB's versioned `migrate()` — and crucially avoids
+    /// the `BEGIN EXCLUSIVE` migration lock that `migrate()` takes on every
+    /// open, which the harness would otherwise pay on every turn + tool call
+    /// on the shared `state.db`. A busy timeout lets a concurrent writer (the
+    /// session-persistence / memory connections share this file) yield a short
+    /// wait instead of an immediate `SQLITE_BUSY`.
     pub fn open_at(path: &Path) -> Result<Self, String> {
-        let db = SessionDb::open(path)?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .map_err(|e| format!("open issue db at {}: {e}", path.display()))?;
+        let _ = conn.busy_timeout(Duration::from_secs(5));
+        // WAL is a persistent property of the file once any opener sets it
+        // (session persistence does); setting it here is a harmless no-op then,
+        // and the right default if issues happen to open the file first.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let store = Self {
-            conn: Mutex::new(db.conn),
+            conn: Mutex::new(conn),
         };
         store.ensure_schema()?;
         Ok(store)
