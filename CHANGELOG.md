@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-06-27
+
+### Fixed
+- **`/model <id>` switches providers, not just the model name.** The `/model`
+  list shows one row per configured provider's pinned model; selecting a model
+  that belongs to a *different* provider now rebuilds the live client for that
+  provider instead of sending its model name to the active provider's endpoint
+  (which 400'd — e.g. an ollama model sent to GLM). Free-form ids and
+  same-provider models keep the current client. (#535)
+- **`--provider` now selects that provider's model.** With no `--model`,
+  `dirge --provider <p>` took the config default provider's model rather than
+  `<p>`'s, so `--provider ollama` switched the endpoint but still loaded the
+  default model. It now reads the overridden provider's pinned model. (#535)
+- **`XDG_CONFIG_HOME` is honored for the config directory.** Resolution is now
+  `DIRGE_CONFIG_DIR` → `$XDG_CONFIG_HOME/dirge` → `~/.config/dirge` (relative
+  `XDG_CONFIG_HOME` ignored per the XDG spec). (#535)
+
+### Changed
+- **Clearer "no API key" error for keyless OpenAI-compatible endpoints.** When
+  a `provider_type: "openai"` provider has no key, the error now points local
+  ollama/vLLM users at `provider_type: "custom"` (or `"ollama"`), which are
+  keyless. (#535)
+
 ## [0.13.6] - 2026-06-27
 
 ### Added
